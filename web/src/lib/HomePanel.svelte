@@ -209,7 +209,7 @@
   .sync-card {
     display: flex;
     flex: 1 1 auto;
-    min-height: 0;
+    min-height: 24rem;
     flex-direction: column;
   }
   .sync-inner {

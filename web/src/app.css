@@ -53,6 +53,12 @@ body,
   min-height: 100%;
 }
 
+/* Everything is sized in rem, so this scales the whole console with the window:
+   16px at 1920x1080 and up, ~14.7px at 1440x900, ~14px at 1366x768, never below 13px. */
+html {
+  font-size: clamp(13px, min(11px + 0.26vw, 9.1px + 0.64vh), 16px);
+}
+
 body {
   margin: 0;
   background: var(--color-bg);
@@ -513,8 +519,8 @@ body {
 }
 .ui-code {
   display: block;
-  overflow-x: auto;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   border: 1px solid var(--color-line);
   border-radius: 0.75rem;
   background: rgb(5 5 5 / 0.8);

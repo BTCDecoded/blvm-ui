@@ -29,7 +29,9 @@
       const w = el.clientWidth;
       // Block size follows window height (the size it has always had);
       // wider windows fit more blocks instead of bigger ones.
-      const target = Math.max(72, window.innerHeight * 0.185);
+      // Below 900px tall they shrink faster so the sync card above keeps its room.
+      const h = window.innerHeight;
+      const target = Math.max(72, h * 0.185 - Math.max(0, 900 - h) * 0.35);
       const n = Math.max(MIN_VISIBLE, Math.round((w - PEEK * target) / (target + GAP)));
       // Resize slightly so n blocks + the half block fill the width exactly.
       visible = n;

@@ -103,7 +103,7 @@
   }
 </script>
 
-<section class="ui-page">
+<section class="ui-page net-page">
   <div class="net-top">
     <article class="panel ui-card">
       <div class="ui-head">
@@ -203,10 +203,10 @@
         <h2 class="ui-title"><Icon name="users" class="h-5 w-5 text-muted" /> Connected Peers</h2>
         <span class="text-[1.1375rem] font-medium">{s.peer_rows?.length ?? 0}</span>
       </div>
-      <div class="ui-table-wrap">
+      <div class="ui-table-wrap peers-wrap">
         <table class="ui-table">
           <thead>
-            <tr><th>Address</th><th>Direction</th><th>Agent</th><th class="text-right">Actions</th></tr>
+            <tr><th>Address</th><th>Direction</th><th class="col-agent">Agent</th><th class="text-right">Actions</th></tr>
           </thead>
           <tbody>
             {#if !s.peer_rows?.length}
@@ -214,13 +214,16 @@
             {:else}
               {#each s.peer_rows as p (p.addr)}
                 <tr>
-                  <td class="font-mono text-[0.85rem]">{p.addr}</td>
+                  <td class="font-mono text-[0.85rem]">
+                    {p.addr}
+                    <span class="agent-inline" title={p.subver}>{p.subver || "—"}</span>
+                  </td>
                   <td>
                     <span class="flex items-center gap-2">
                       <i class="dot {p.inbound ? 'bg-inbound' : 'bg-outbound'}"></i>{p.inbound ? "Inbound" : "Outbound"}
                     </span>
                   </td>
-                  <td class="max-w-[14rem] truncate text-muted" title={p.subver}>{p.subver || "—"}</td>
+                  <td class="col-agent max-w-[14rem] truncate text-muted" title={p.subver}>{p.subver || "—"}</td>
                   <td>
                     <div class="flex justify-end gap-2">
                       <button type="button" class="ui-btn-ghost" onclick={() => peerAct("disconnect", p.addr)}>Disconnect</button>
@@ -270,6 +273,34 @@
 </section>
 
 <style>
+  /* Fill the window; the peer tables scroll inside their cards. */
+  .net-page {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  /* Narrow cards: the agent moves under the address so the actions always fit. */
+  .peers-wrap {
+    container-type: inline-size;
+  }
+  .agent-inline {
+    display: none;
+  }
+  @container (max-width: 48rem) {
+    .col-agent {
+      display: none;
+    }
+    .agent-inline {
+      display: block;
+      max-width: 18rem;
+      margin-top: 0.2rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: var(--font-sans);
+      font-size: 0.8rem;
+      color: var(--color-muted);
+    }
+  }
   .net-top,
   .net-bottom {
     display: grid;
