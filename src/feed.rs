@@ -1,9 +1,9 @@
-//! Live chain feed: 10 newest items. Fast IBD is chunked; slow tip follow is one height at a time.
+//! Live chain feed: newest items (enough to fill a wide block rail). Fast IBD is chunked; slow tip follow is one height at a time.
 
 use serde::Serialize;
 use std::collections::VecDeque;
 
-pub const FEED_CAP: usize = 10;
+pub const FEED_CAP: usize = 24;
 /// If height jumps by this many or more in one sample, collapse into one chunk.
 pub const CHUNK_MIN: u64 = 8;
 
@@ -123,16 +123,16 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_ten_newest() {
+    fn keeps_only_cap_newest() {
         let mut feed = VecDeque::new();
         let mut last = None;
         advance_feed(&mut feed, &mut last, 1);
-        for h in 2..=20 {
+        for h in 2..=40 {
             advance_feed(&mut feed, &mut last, h);
         }
-        assert_eq!(feed.len(), 10);
-        assert_eq!(feed.front().unwrap().label, "20");
-        assert_eq!(feed.back().unwrap().label, "11");
+        assert_eq!(feed.len(), FEED_CAP);
+        assert_eq!(feed.front().unwrap().label, "40");
+        assert_eq!(feed.back().unwrap().label, (40 - FEED_CAP + 1).to_string());
     }
 
     #[test]

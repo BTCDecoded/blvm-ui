@@ -1,130 +1,257 @@
 # blvm-ui
 
-Localhost operator console for a [BLVM](https://thebitcoincommons.org/) node.
+Local operator console for a [BLVM](https://thebitcoincommons.org/) node.
 
-`blvm-ui` is an **optional** process. It is not consensus and not required to sync. A node runs without it. The console talks to an already-running node over JSON-RPC and serves a single-page dashboard in the browser.
+![Home: sync progress, peers on a globe, and the latest blocks](docs/screenshots/home.png)
 
-This repository is the UI crate only. The node, protocol, and consensus live in the rest of the Bitcoin Commons stack.
+`blvm-ui` is an **optional** process. It is not consensus code and the node does not need it to sync. It talks to an
+already-running node over stock JSON-RPC and serves a single-page dashboard in your browser, by default at
+**http://127.0.0.1:3849**.
 
-## What it shows
+It is a Svelte 5 + Tailwind v4 front end served by a small Rust host. The host polls the node once a second, keeps a
+little state of its own (block history, peer locations, node power), and hands the page one JSON snapshot.
 
-| Tab | Contents |
-|-----|----------|
-| **Home** | Sync progress, peer mix (inbound / outbound), last ten blocks |
-| **Insights** | Health, disk footprint, block-arrival bars, node uptime |
-| **Settings** | RPC connection, peers, network, node power |
+This repository is the console only. The node, protocol, and consensus live in the rest of the Bitcoin Commons stack.
 
-Status lights:
+> The crate and binary are still named `blvm-ui-next` from development. Commands below use that name.
 
-- **Green** — RPC up, at tip (or healthy), has peers
-- **Amber** — catch-up, IBD, no peers, or RPC TCP up but not answering (**Frozen**)
-- **Red** — RPC down
+## The console
 
-The console process does **not** die if the node dies. After missed polls it keeps the last heights, marks the node down, and offers a manual connect field.
+### Home
+
+Sync progress for the chain the node is on, local and network height, and a live P2P ring showing the inbound and
+outbound split. Behind it, a globe shows where your peers are (country level, offline lookup) and where you are.
+
+The **Latest Blocks** rail slides a new block in as the node connects it. While the node is catching up, fast
+stretches of blocks show up as ranges instead of one tile per height.
+
+| Synced | Initial block download |
+|---|---|
+| ![Synced at the network tip](docs/screenshots/home.png) | ![Mid-sync, 84% through mainnet](docs/screenshots/ibd-home.png) |
+
+![Latest Blocks rail](docs/screenshots/home-latest-blocks.png)
+
+### Insights
+
+System health (status, uptime, BLVM version, chain, IBD state), inbound vs outbound peers, how much disk the chain
+uses next to the free space on its volume, and how many blocks arrived in each of the last 12 minutes.
+
+![Insights](docs/screenshots/insights.png)
+
+![Block arrival over the last 12 minutes](docs/screenshots/insights-block-arrival.png)
+
+### Network
+
+Everything about peers: the P2P overview with a switch to turn networking off, add a peer, block an address for
+24 hours, and full lists of connected peers (address, direction, user agent) and blocked ones, with disconnect, block
+and unban actions.
+
+![Network](docs/screenshots/network.png)
+
+![Connected peers](docs/screenshots/network-connected-peers.png)
+
+### Settings
+
+Which node RPC the console talks to, a carousel of the usual local RPC ports per chain (Mainnet, Testnet4, Testnet3,
+Signet, Regtest), starting and stopping the node process, and version / uptime details.
+
+![Settings](docs/screenshots/settings.png)
+
+### Mining and Logs
+
+**Mining** introduces the Stratum V2 endpoint and the Commons pool. It is informational for now. **Logs** gives the
+commands to run the node with verbose output, save it, and follow it, plus the log lines worth watching for. The
+console does not stream node logs yet.
+
+### Status lights
+
+- **Green**: RPC up, at the tip, has peers.
+- **Amber**: syncing (IBD), catching up after being synced, no peers, or still looking for the node.
+- **Red**: the node is down or not answering RPC (**Frozen** when the port is open but RPC hangs).
+
+The console does **not** die when the node dies. It keeps the last known numbers, dims them, and offers a manual
+connect field.
 
 ## Requirements
 
-- Rust 1.88+ (edition 2021)
-- A BLVM node with JSON-RPC listening (Testnet4 default `127.0.0.1:48332`)
-- Unix for the Settings **node power** path (`SIGTERM` / `SIGKILL` via `lsof`; RPC `stop` is not used)
-
-The page is HTML, CSS, and JavaScript **embedded in the binary**. There is no Node.js runtime on the machine that runs the console.
+- Rust 1.88 or newer
+- Node.js 20 or newer (to build the front end)
+- A BLVM node with JSON-RPC listening. The default target is Testnet4 at `127.0.0.1:48332`; mainnet is `127.0.0.1:8332`.
+- Unix (Linux or macOS) for starting and stopping the node from Settings. Everything else works on Windows too.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/BTCDecoded/blvm-nodeui.git
-cd blvm-nodeui
-cargo run --release
+git clone https://github.com/BTCDecoded/blvm-ui.git
+cd blvm-ui
+
+# 1. Build the front end (writes web/dist)
+cd web && npm install && npm run build && cd ..
+
+# 2. Run the console against your node
+BLVM_UI_RPC=127.0.0.1:8332 cargo run --release
 ```
 
-Open [http://127.0.0.1:3847](http://127.0.0.1:3847).
+Open **http://127.0.0.1:3849**. The console auto-connects to `BLVM_UI_RPC` and you can switch targets from Settings.
 
-Point at a different RPC (for example Signet on `38332`):
+Optional: download the peer location database so peers show up on the globe (see [Peer locations](#peer-locations)).
+
+## Development
+
+Run the Rust host and the Vite dev server side by side. Vite proxies `/api` to the host, so the page reloads live as
+you edit.
 
 ```bash
-BLVM_UI_RPC=127.0.0.1:38332 cargo run --release
+# terminal 1: host on :3849
+BLVM_UI_RPC=127.0.0.1:48332 cargo run
+
+# terminal 2: live-reloading front end on http://127.0.0.1:5174
+cd web && npm install && npm run dev
 ```
+
+```bash
+cargo test          # host tests (feed, sync %, persistence, geo, process control)
+cd web && npm run build
+```
+
+### Mock mode (no node needed)
+
+`web/mock/server.mjs` serves the built page with a fake `/api/status` that looks like a real mainnet node: the current
+mainnet tip (fetched from mempool.space at start, with a fallback), 8 outbound and 4 inbound peers around the world,
+disk usage, and a new block every minute.
+
+```bash
+cd web
+npm run build
+npm run mock                         # http://127.0.0.1:3850
+MOCK_SCENARIO=ibd npm run mock       # mid initial block download instead
+```
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `MOCK_PORT` | listen port | `3850` |
+| `MOCK_SCENARIO` | `synced` or `ibd` | `synced` |
+| `MOCK_TIP` | tip height; skips the network lookup | live tip |
+| `MOCK_BLOCK_SECS` | seconds between new blocks when synced, `0` to freeze | `60` |
+
+### Screenshots
+
+```bash
+cd web && npm run build && npm run screenshots
+```
+
+Starts its own mock server, then captures every page and the main cards at 1920×1080 (2× pixel density) in both the
+synced and syncing states, into `screenshots/`. It uses a Chromium-family browser already installed on the machine
+(Chrome, Chromium, Brave or Edge). Set `BROWSER_PATH` to choose one, or `SCREENSHOT_DIR` to change the output folder.
+The images in `docs/screenshots/` are picked from that output.
+
+## Running in production
+
+A release build needs the binary and the built front end next to each other:
+
+```bash
+cd web && npm ci && npm run build && cd ..
+cargo build --release
+mkdir -p dist/blvm-ui && cp target/release/blvm-ui-next dist/blvm-ui/ && cp -r web/dist dist/blvm-ui/web
+cp geo/zone.tab dist/blvm-ui/  # optional; the time zone table is also built in
+```
+
+The host looks for the page in `$BLVM_UI_WEB_DIR`, then `web/`, `dist/` or `web/dist/` next to the binary, then this
+crate's `web/dist`.
+
+### Building for other systems
+
+The platform is picked by the Rust build target, so Linux, Docker (Umbrel, Start9) and macOS builds come from the same
+code:
+
+```bash
+cargo build --release                                     # this machine
+cargo build --release --target x86_64-unknown-linux-gnu   # Linux x86_64
+cargo build --release --target aarch64-unknown-linux-gnu  # Linux ARM64
+```
+
+(Install a target once with `rustup target add …`.)
+
+| Piece | Linux (incl. Docker) | macOS / other Unix | Windows |
+|---|---|---|---|
+| Find / stop / restart the node | reads `/proc` (no `lsof`/`ps` needed), falls back to them | `lsof` + `ps` | not supported |
+| Block history file | `$XDG_STATE_HOME` or `~/.local/state/blvm-ui-next` | `~/Library/Application Support/blvm-ui-next` | `%APPDATA%\blvm-ui-next` |
+| Time zone for the "You!" dot | `TZ`, `/etc/localtime`, `/etc/timezone` | `TZ`, `/etc/localtime` | `TZ` |
+
+For Umbrel / Start9 containers, which usually run in UTC, use `BLVM_UI_SELF_GEO=fixed:…` or pass the host's `TZ`, and
+point `BLVM_UI_STATE_DIR` at the app's persistent volume so history survives image updates.
 
 ## Configuration
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `BLVM_UI_LISTEN` | `127.0.0.1:3847` | Dashboard bind address |
-| `BLVM_UI_RPC` | `127.0.0.1:48332` | Node JSON-RPC address |
+Runtime only:
 
-Bind stays loopback by default. Do not expose this HTTP port on a public interface.
+| Variable | Meaning | Default |
+|---|---|---|
+| `BLVM_UI_LISTEN` | address the console listens on | `127.0.0.1:3849` |
+| `BLVM_UI_RPC` | node JSON-RPC address | `127.0.0.1:48332` |
+| `BLVM_UI_WEB_DIR` | folder holding the built page | see above |
+| `BLVM_UI_NODE_BIN` | node binary used by **Turn Node On** | auto-detected |
+| `BLVM_UI_NODE_CWD` | working directory for that node | auto-detected |
+| `RUST_LOG` | host log filter | `blvm_ui_next=info` |
 
-## How it talks to the node
+These can also be baked in **at build time** (`BLVM_UI_SELF_GEO=fixed:52.52,13.405,Berlin cargo build --release`). A
+value set at runtime wins.
 
+| Variable | Values | Default |
+|---|---|---|
+| `BLVM_UI_SELF_GEO` | `auto` (node-reported IP, else time zone), `ip`, `timezone`, `fixed:LAT,LON[,Label]`, `off` | `auto` |
+| `BLVM_UI_STATE_DIR` | folder for `feeds.json` (Latest Blocks history) | per-user folder above |
+| `BLVM_UI_GEO_DB` | path to the `.mmdb` location file | `geo/dbip-country-lite.mmdb` next to the binary, then this crate's `geo/` |
+
+The console only listens on localhost by default. It can start and stop your node and change peer settings, so do not
+expose it to a network you do not trust.
+
+## Peer locations
+
+Offline, country-level IP lookup with the DB-IP Country Lite database (CC BY 4.0). It is a 4 MB download, about 8 MB
+unpacked, and git-ignored. Download it once into `geo/`:
+
+```bash
+curl -L -o geo/dbip-country-lite.mmdb.gz https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.mmdb.gz
+gunzip geo/dbip-country-lite.mmdb.gz
 ```
- browser  ──HTTP──►  blvm-ui (:3847)  ──JSON-RPC batch──►  blvm-node (:48332)
-                         │
-                         └── static UI is compiled in
-                             (index.html, app.css, app.js, fonts, logo)
-```
 
-Every **6 seconds** the console POSTs one JSON-RPC/2.0 **batch**:
+Each country is drawn at the average of its time zone cities (from the built-in tzdb table), and peers in the same
+country get a small fixed offset so their dots do not stack. The larger City Lite file also works; the country file is
+used first when both are present. Without a file, the console runs normally and peers just have no dot on the globe.
 
-`getblockchaininfo`, `getpeerinfo`, `getnetworkinfo`, `listbanned`, `uptime`
+## Latest Blocks history
 
-The node caps **new** RPC TCP connections at 10 per IP per 60 seconds and closes each HTTP response. Polling faster than that (or one socket per method at 1 Hz) hits `Connection rate limit exceeded`. Connect timeout is 800 ms; exchange timeout is 2 s.
+Kept in `feeds.json`, one entry per node RPC address, so it survives page reloads, console restarts, rebuilds and
+network switches. It is only cleared when:
 
-- Connect refused → **Down**
-- TCP up, no RPC reply → **Frozen** (amber); last chain height and peer counts are kept
+- the node's height stays well below the saved height for about 15 seconds (the chain data dir was wiped), or
+- the node reports a different chain on the same RPC address.
 
-`getblockchaininfo.initialblockdownload` is only `true` at height 0 on this node. The console treats `headers − blocks > 0` as still syncing.
+A node that briefly reports height 0 while restarting does not clear it.
 
 ## HTTP API
 
-Served on the console bind address, not on the node.
+The page only uses these; they are handy for scripts too.
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/` | Dashboard |
-| `GET` | `/api/status` | Last poll snapshot (JSON) |
-| `POST` | `/api/connect` | Body `{ "rpc": "host:port" }` — switch RPC target |
-| `POST` | `/api/rpc` | Whitelisted node RPC only (see below) |
-| `POST` | `/api/node` | Body `{ "action": "on" \| "off" \| "toggle" }` — start/stop the node process |
-
-Settings may call **only**:
-
-`addnode`, `disconnectnode`, `setban`, `listbanned`, `clearbanned`, `setnetworkactive`
-
-`stop` is **not** on the whitelist. Node power uses `SIGTERM` (this node’s graceful flush), then `SIGKILL` if needed. The UI process is never killed by that path.
+| Route | Does |
+|---|---|
+| `GET /api/status` | the full snapshot the page renders (sync, peers, disk, feed, health) |
+| `POST /api/connect` `{"rpc":"host:port"}` | point the console at another node |
+| `POST /api/node` `{"action":"toggle"}` | start or stop the node process |
+| `POST /api/rpc` `{"method":…,"params":[…]}` | pass-through for peer settings: `addnode`, `setban`, `clearbanned`, `disconnectnode`, `setnetworkactive` |
 
 ## Layout
 
 ```
-src/
-  main.rs       Bind, 6s poll loop, HTTP server
-  lib.rs        Crate root
-  http.rs       Routes and embedded static assets
-  rpc.rs        JSON-RPC client + settings whitelist
-  state.rs      Live snapshot and connect / frozen / down
-  feed.rs       Latest-blocks tiles (per RPC address)
-  node_ctl.rs   SIGTERM / SIGKILL / spawn remembered blvm
-static/         Source for embedded HTML, CSS, JS, fonts, logos
-module.toml     Pin for a later `blvm load blvm-ui` spawn (not wired yet)
+src/          Rust host: HTTP server, RPC polling, snapshot, block feed, geo lookup, node process control
+web/src/      Svelte front end (App.svelte + one panel per page in lib/)
+web/public/   logo, fonts, globe texture
+web/mock/     mock API server and screenshot script
+geo/          time zone table (+ the optional .mmdb you download)
+docs/         screenshots used in this README
 ```
-
-## Tests
-
-```bash
-cargo test
-```
-
-Coverage includes the settings RPC whitelist, status snapshot lights, and block-feed chunking.
-
-## What this crate is not
-
-- Consensus or chain rules — that is `blvm-consensus` / `blvm-node`
-- A mining server — [blvm-stratum-v2](https://github.com/BTCDecoded)
-- Pool payouts — Commons Pool
-- A replacement for Bitcoin Core’s GUI; it is an operator console for BLVM
-
-BLVM is [Bitcoin Commons](https://thebitcoincommons.org/): same chain, same rules — not a new coin and not a fork.
 
 ## License
 
-[MIT](LICENSE) © BTCDecoded
+MIT. See [LICENSE](LICENSE).

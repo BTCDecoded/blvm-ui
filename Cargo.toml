@@ -1,18 +1,18 @@
 [package]
-name = "blvm-ui"
+name = "blvm-ui-next"
 version = "0.1.0"
 edition = "2021"
 authors = ["Bitcoin Commons Contributors"]
-description = "Optional localhost UI for blvm-node (node status only in this slice)"
+description = "Next localhost UI for a vanilla blvm-node (JSON-RPC console)"
 license = "MIT"
 publish = false
 
 [[bin]]
-name = "blvm-ui"
+name = "blvm-ui-next"
 path = "src/main.rs"
 
 [lib]
-name = "blvm_ui"
+name = "blvm_ui_next"
 path = "src/lib.rs"
 
 [dependencies]
@@ -26,6 +26,8 @@ hyper = { version = "1.8", features = ["server", "http1"] }
 hyper-util = { version = "0.1.18", features = ["server", "http1", "tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+mime_guess = "2"
+maxminddb = { version = "0.32.0", features = ["mmap"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

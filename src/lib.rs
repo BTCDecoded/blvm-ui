@@ -1,5 +1,9 @@
 pub mod feed;
+pub mod geo;
 pub mod http;
 pub mod node_ctl;
+pub mod persist;
+pub mod procinfo;
 pub mod rpc;
+pub mod settings;
 pub mod state;

@@ -1,5 +1,5 @@
-use crate::state::{poll_once, stamp_power, Shared};
 use crate::node_ctl::{self, PowerPhase};
+use crate::state::{poll_once, stamp_power, Shared};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -9,28 +9,35 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const INDEX: &str = include_str!("../static/index.html");
-const CSS: &str = include_str!("../static/app.css");
-const JS: &str = include_str!("../static/app.js");
-const LOGO: &[u8] = include_bytes!("../static/logo.png");
-const ROBOTO_400: &[u8] = include_bytes!("../static/fonts/roboto-400.woff2");
-const ROBOTO_500: &[u8] = include_bytes!("../static/fonts/roboto-500.woff2");
-const ROBOTO_700: &[u8] = include_bytes!("../static/fonts/roboto-700.woff2");
+const MISSING_FRONT: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Commons · Next console</title>
+<style>body{font-family:system-ui;background:#050505;color:#f0e6d0;padding:2rem;max-width:40rem}</style>
+</head><body>
+<h1>Frontend not built</h1>
+<p>From <code>blvm-ui-next/web</code> run <code>npm install && npm run build</code>, then restart this process.</p>
+</body></html>"#;
 
 pub async fn serve(addr: SocketAddr, state: Shared) -> anyhow::Result<()> {
+    let dist = dist_dir();
+    tracing::info!(
+        "blvm-ui-next listening on http://{addr} (web dir {})",
+        dist.display()
+    );
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!("blvm-ui listening on http://{addr}");
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let state = Arc::clone(&state);
+        let dist = dist.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let state = Arc::clone(&state);
-                async move { handle(req, state).await }
+                let dist = dist.clone();
+                async move { handle(req, state, &dist).await }
             });
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                 tracing::debug!("http conn: {e}");
@@ -42,17 +49,11 @@ pub async fn serve(addr: SocketAddr, state: Shared) -> anyhow::Result<()> {
 async fn handle(
     req: Request<Incoming>,
     state: Shared,
+    dist: &Path,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     let resp = match (method, path.as_str()) {
-        (Method::GET, "/") | (Method::GET, "/index.html") => html(INDEX),
-        (Method::GET, "/app.css") => css(CSS),
-        (Method::GET, "/app.js") => js(JS),
-        (Method::GET, "/logo.png") | (Method::GET, "/favicon.png") => png(LOGO),
-        (Method::GET, "/fonts/roboto-400.woff2") => font(ROBOTO_400),
-        (Method::GET, "/fonts/roboto-500.woff2") => font(ROBOTO_500),
-        (Method::GET, "/fonts/roboto-700.woff2") => font(ROBOTO_700),
         (Method::GET, "/api/status") => {
             let snap = state.read().await.snapshot.clone();
             json_ok(&snap)
@@ -80,13 +81,13 @@ async fn handle(
             let body = collected
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .unwrap_or(serde_json::json!({}));
-            let method = body
+            let method_name = body
                 .get("method")
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
             let params = body.get("params").cloned().unwrap_or(serde_json::json!([]));
-            if !crate::rpc::allowed_setting(&method) {
+            if !crate::rpc::allowed_setting(&method_name) {
                 let mut r = json_ok(&serde_json::json!({
                     "ok": false,
                     "error": "method not allowed"
@@ -95,7 +96,7 @@ async fn handle(
                 r
             } else {
                 let rpc_addr = { state.read().await.rpc_addr.clone() };
-                match crate::rpc::call_params(&rpc_addr, &method, params).await {
+                match crate::rpc::call_params(&rpc_addr, &method_name, params).await {
                     Ok(result) => {
                         let state_bg = Arc::clone(&state);
                         tokio::spawn(async move {
@@ -110,6 +111,7 @@ async fn handle(
                 }
             }
         }
+        (Method::GET, _) => serve_web(dist, &path),
         _ => {
             let mut r = Response::new(Full::new(Bytes::from("not found")));
             *r.status_mut() = StatusCode::NOT_FOUND;
@@ -119,10 +121,7 @@ async fn handle(
     Ok(resp)
 }
 
-async fn power_node(
-    req: Request<Incoming>,
-    state: Shared,
-) -> Response<Full<Bytes>> {
+async fn power_node(req: Request<Incoming>, state: Shared) -> Response<Full<Bytes>> {
     let lock = { state.read().await.power_lock.clone() };
     let _busy = lock.lock().await;
     let collected = req.into_body().collect().await.ok().map(|c| c.to_bytes());
@@ -171,34 +170,64 @@ async fn power_node(
     }))
 }
 
-fn html(s: &'static str) -> Response<Full<Bytes>> {
-    typed(s, "text/html; charset=utf-8")
+fn dist_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("BLVM_UI_WEB_DIR") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for cand in [dir.join("web"), dir.join("dist"), dir.join("web/dist")] {
+                if cand.join("index.html").is_file() {
+                    return cand;
+                }
+            }
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web/dist")
 }
-fn css(s: &'static str) -> Response<Full<Bytes>> {
-    typed(s, "text/css; charset=utf-8")
-}
-fn js(s: &'static str) -> Response<Full<Bytes>> {
-    typed(s, "text/javascript; charset=utf-8")
-}
-fn png(b: &'static [u8]) -> Response<Full<Bytes>> {
-    let mut r = Response::new(Full::new(Bytes::from_static(b)));
-    r.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static("image/png"),
-    );
+
+fn serve_web(dist: &Path, url_path: &str) -> Response<Full<Bytes>> {
+    let rel = url_path.trim_start_matches('/');
+    let rel = if rel.is_empty() { "index.html" } else { rel };
+    if let Some(resp) = file_response(dist, rel) {
+        return resp;
+    }
+    if !rel.contains('.') {
+        if let Some(resp) = file_response(dist, "index.html") {
+            return resp;
+        }
+    }
+    if rel == "index.html" || rel.is_empty() {
+        return typed(MISSING_FRONT, "text/html; charset=utf-8");
+    }
+    let mut r = Response::new(Full::new(Bytes::from("not found")));
+    *r.status_mut() = StatusCode::NOT_FOUND;
     r
 }
-fn font(b: &'static [u8]) -> Response<Full<Bytes>> {
-    let mut r = Response::new(Full::new(Bytes::from_static(b)));
-    r.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static("font/woff2"),
-    );
-    r.headers_mut().insert(
-        hyper::header::CACHE_CONTROL,
-        hyper::header::HeaderValue::from_static("public, max-age=31536000"),
-    );
-    r
+
+fn file_response(dist: &Path, rel: &str) -> Option<Response<Full<Bytes>>> {
+    let joined = dist.join(rel);
+    let canon = joined.canonicalize().ok()?;
+    let root = dist.canonicalize().ok()?;
+    if !canon.starts_with(&root) || !canon.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&canon).ok()?;
+    let mime = mime_guess::from_path(&canon)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+    let mut r = Response::new(Full::new(Bytes::from(bytes)));
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&mime) {
+        r.headers_mut().insert(hyper::header::CONTENT_TYPE, v);
+    }
+    if rel.contains("fonts/") || rel.ends_with(".woff2") {
+        r.headers_mut().insert(
+            hyper::header::CACHE_CONTROL,
+            hyper::header::HeaderValue::from_static("public, max-age=31536000"),
+        );
+    }
+    Some(r)
 }
 
 fn typed(s: &'static str, ct: &'static str) -> Response<Full<Bytes>> {
@@ -223,4 +252,3 @@ fn json_ok<T: serde::Serialize>(v: &T) -> Response<Full<Bytes>> {
     );
     r
 }
-

@@ -4,6 +4,19 @@
 *.pdb
 **/*.rmeta
 
+# Web front end
+web/node_modules/
+web/dist/
+web/.svelte-kit/
+web/.vite/
+
+# Peer location database (downloaded, see README)
+geo/*.mmdb
+geo/*.mmdb.gz
+
+# Output of `npm run screenshots` (curated copies live in docs/screenshots)
+/screenshots/
+
 # IDE / editor
 .idea/
 .vscode/
@@ -38,8 +51,3 @@ Desktop.ini
 flamegraph.svg
 perf.data
 perf.data.old
-
-# Kept locally; not published
-src/wallet.rs
-static/qr-logo.png
-static/qr-code-styling.js

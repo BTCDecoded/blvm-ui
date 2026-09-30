@@ -32,6 +32,12 @@ pub struct LaunchSpec {
     pub cwd: PathBuf,
 }
 
+impl LaunchSpec {
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        data_dir_from_args(&self.args, &self.cwd)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PowerResult {
     pub ok: bool,
@@ -175,6 +181,80 @@ pub fn remember_if_running(rpc_addr: &str, launch: &mut Option<LaunchSpec>) {
     }
 }
 
+/// Allocated bytes of the running node's `--data-dir` (`du`, not logical length).
+/// Vanilla RPC `size_on_disk` is a 1 MiB/block guess; this is the on-disk size.
+pub fn datadir_usage(rpc_addr: &str, launch: &Option<LaunchSpec>) -> Option<u64> {
+    let spec = match launch {
+        Some(s) => s.clone(),
+        None => {
+            let pid = listener_pid(rpc_addr)?;
+            capture_launch(pid)?
+        }
+    };
+    let dir = spec.data_dir()?;
+    if !dir.is_dir() {
+        return None;
+    }
+    Some(dir_allocated_bytes(&dir))
+}
+
+fn data_dir_from_args(args: &[String], cwd: &Path) -> Option<PathBuf> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let raw = if a == "--data-dir" || a == "-d" {
+            i += 1;
+            args.get(i).cloned()
+        } else {
+            a.strip_prefix("--data-dir=").map(str::to_string)
+        };
+        if let Some(p) = raw {
+            let path = PathBuf::from(p);
+            return Some(if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            });
+        }
+        i += 1;
+    }
+    None
+}
+
+fn dir_allocated_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            let Ok(meta) = ent.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                total = total.saturating_add(allocated_bytes(&meta));
+            }
+        }
+    }
+    total
+}
+
+fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
 pub fn rpc_port(rpc_addr: &str) -> Option<u16> {
     rpc_addr
         .rsplit_once(':')
@@ -183,21 +263,10 @@ pub fn rpc_port(rpc_addr: &str) -> Option<u16> {
 
 fn listener_pid(rpc_addr: &str) -> Option<u32> {
     let port = rpc_port(rpc_addr)?;
-    let out = std::process::Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
-        .output()
-        .ok()?;
-    if !out.status.success() && out.stdout.is_empty() {
-        return None;
-    }
     let self_pid = std::process::id();
-    parse_pids(&String::from_utf8_lossy(&out.stdout))
+    crate::procinfo::listener_pids(port)
         .into_iter()
         .find(|p| *p != self_pid && is_blvm_node(*p))
-}
-
-fn parse_pids(s: &str) -> Vec<u32> {
-    s.split_whitespace().filter_map(|w| w.parse().ok()).collect()
 }
 
 fn is_blvm_node(pid: u32) -> bool {
@@ -213,32 +282,14 @@ fn is_blvm_node(pid: u32) -> bool {
 }
 
 fn process_comm(pid: u32) -> Option<String> {
-    let out = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    crate::procinfo::comm(pid)
 }
 
 fn capture_launch(pid: u32) -> Option<LaunchSpec> {
     if !is_blvm_node(pid) {
         return None;
     }
-    let out = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-www", "-o", "args="])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let line = String::from_utf8_lossy(&out.stdout);
-    let argv = shell_split(line.trim());
-    if argv.is_empty() {
-        return None;
-    }
+    let argv = crate::procinfo::argv(pid)?;
     let program = PathBuf::from(&argv[0]);
     let args = argv[1..].to_vec();
     let cwd = process_cwd(pid).unwrap_or_else(|| {
@@ -248,24 +299,7 @@ fn capture_launch(pid: u32) -> Option<LaunchSpec> {
 }
 
 fn process_cwd(pid: u32) -> Option<PathBuf> {
-    let out = std::process::Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(rest) = line.strip_prefix('n') {
-            let p = PathBuf::from(rest);
-            if p.is_dir() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-/// Split a `ps` args line. Quoted tokens are not used in our start commands.
-fn shell_split(s: &str) -> Vec<String> {
-    s.split_whitespace().map(|t| t.to_string()).collect()
+    crate::procinfo::cwd(pid)
 }
 
 pub fn infer_launch(rpc_addr: &str) -> Result<LaunchSpec> {
@@ -305,6 +339,9 @@ pub fn infer_launch(rpc_addr: &str) -> Result<LaunchSpec> {
     })
 }
 
+/// `blvm` on Unix, `blvm.exe` on Windows (picked by the build target).
+const NODE_BIN: &str = if cfg!(windows) { "blvm.exe" } else { "blvm" };
+
 fn find_blvm_bin() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("BLVM_UI_NODE_BIN") {
         let path = PathBuf::from(p);
@@ -315,24 +352,24 @@ fn find_blvm_bin() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("blvm"));
+            candidates.push(dir.join(NODE_BIN));
             if let Some(target) = dir.parent() {
-                candidates.push(target.join("release-fast").join("blvm"));
-                candidates.push(target.join("release").join("blvm"));
-                candidates.push(target.join("debug").join("blvm"));
+                candidates.push(target.join("release-fast").join(NODE_BIN));
+                candidates.push(target.join("release").join(NODE_BIN));
+                candidates.push(target.join("debug").join(NODE_BIN));
             }
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         for rel in [
-            "target/release-fast/blvm",
-            "target/release/blvm",
-            "target/debug/blvm",
-            "blvm/target/release-fast/blvm",
-            "blvm/target/release/blvm",
-            "blvm/target/debug/blvm",
+            "target/release-fast",
+            "target/release",
+            "target/debug",
+            "blvm/target/release-fast",
+            "blvm/target/release",
+            "blvm/target/debug",
         ] {
-            candidates.push(cwd.join(rel));
+            candidates.push(cwd.join(rel).join(NODE_BIN));
         }
     }
     candidates.into_iter().find(|p| is_executable(p))
@@ -412,13 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_lsof_pid_lines() {
-        assert_eq!(parse_pids("7777\n"), vec![7777]);
-        assert_eq!(parse_pids("11\n22\n"), vec![11, 22]);
-        assert!(parse_pids("").is_empty());
-    }
-
-    #[test]
     fn self_pid_is_not_a_node() {
         assert!(!is_blvm_node(std::process::id()));
     }
@@ -439,9 +469,28 @@ mod tests {
     }
 
     #[test]
-    fn shell_split_keeps_flags() {
-        let v = shell_split("./target/release-fast/blvm --network testnet4 --data-dir ./data-testnet4");
-        assert_eq!(v[1], "--network");
-        assert_eq!(v[2], "testnet4");
+    fn data_dir_from_args_absolute_and_relative() {
+        let cwd = PathBuf::from("/opt/blvm");
+        let abs = data_dir_from_args(
+            &["--network".into(), "testnet".into(), "--data-dir".into(), "/var/chain".into()],
+            &cwd,
+        );
+        assert_eq!(abs.as_deref(), Some(Path::new("/var/chain")));
+        let rel = data_dir_from_args(
+            &["-d".into(), "./data-testnet".into()],
+            &cwd,
+        );
+        assert_eq!(rel.unwrap(), cwd.join("./data-testnet"));
+    }
+
+    #[test]
+    fn dir_allocated_counts_real_files() {
+        let dir = std::env::temp_dir().join(format!("blvm-ui-du-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 4096]).unwrap();
+        let n = dir_allocated_bytes(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(n >= 4096, "allocated={n}");
     }
 }
