@@ -139,16 +139,52 @@ async fn rpc_exchange(
     payload: &Value,
 ) -> Result<Value> {
     let body = payload.to_string();
+    let auth = auth_header().map(|a| format!("Authorization: {a}\r\n")).unwrap_or_default();
     let req = format!(
-        "POST / HTTP/1.1\r\nHost: {rpc_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {rpc_addr}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes()).await?;
     stream.flush().await?;
-    read_http_json(stream).await
+    read_http_json(stream, rpc_addr).await
 }
 
-async fn read_http_json(stream: &mut TcpStream) -> Result<Value> {
+/// `Basic …` from `BLVM_UI_RPC_USER` + `BLVM_UI_RPC_PASS`, else from the node's
+/// cookie file at `BLVM_UI_RPC_COOKIE`. No auth when neither is set (BLVM default).
+fn auth_header() -> Option<String> {
+    static USER_PASS: OnceLock<Option<String>> = OnceLock::new();
+    let fixed = USER_PASS.get_or_init(|| {
+        let user = std::env::var("BLVM_UI_RPC_USER").ok().filter(|u| !u.is_empty())?;
+        let pass = std::env::var("BLVM_UI_RPC_PASS").unwrap_or_default();
+        Some(basic_auth(&format!("{user}:{pass}")))
+    });
+    if fixed.is_some() {
+        return fixed.clone();
+    }
+    // Re-read each time: the node writes a new cookie on every restart.
+    let path = std::env::var("BLVM_UI_RPC_COOKIE").ok().filter(|p| !p.is_empty())?;
+    let cookie = std::fs::read_to_string(path).ok()?;
+    Some(basic_auth(cookie.trim()))
+}
+
+fn basic_auth(user_pass: &str) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::from("Basic ");
+    for chunk in user_pass.as_bytes().chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+async fn read_http_json(stream: &mut TcpStream, rpc_addr: &str) -> Result<Value> {
     let mut buf = Vec::with_capacity(4096);
     let header_end = loop {
         let mut tmp = [0u8; 2048];
@@ -165,6 +201,11 @@ async fn read_http_json(stream: &mut TcpStream) -> Result<Value> {
         }
     };
     let headers = std::str::from_utf8(&buf[..header_end]).context("RPC headers")?;
+    if http_status(headers) == Some(401) {
+        return Err(anyhow!(
+            "RPC {rpc_addr} rejected the login (set BLVM_UI_RPC_USER/BLVM_UI_RPC_PASS or BLVM_UI_RPC_COOKIE)"
+        ));
+    }
     let leftover = buf[header_end + 4..].to_vec();
     let mut body = leftover;
     if let Some(len) = header_content_length(headers) {
@@ -192,6 +233,10 @@ async fn read_http_json(stream: &mut TcpStream) -> Result<Value> {
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn http_status(headers: &str) -> Option<u16> {
+    headers.split_whitespace().nth(1)?.parse().ok()
 }
 
 fn header_content_length(headers: &str) -> Option<usize> {
@@ -265,5 +310,15 @@ mod tests {
         let h = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n";
         assert_eq!(header_content_length(h), Some(12));
         assert_eq!(find_double_crlf(b"HTTP/1.1 200 OK\r\n\r\n{}"), Some(15));
+        assert_eq!(http_status(h), Some(200));
+        assert_eq!(http_status("HTTP/1.1 401 Unauthorized\r\n"), Some(401));
+    }
+
+    #[test]
+    fn basic_auth_matches_rfc7617() {
+        assert_eq!(basic_auth("Aladdin:open sesame"), "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        assert_eq!(basic_auth("umbrel:pw"), "Basic dW1icmVsOnB3");
+        assert_eq!(basic_auth("a:b"), "Basic YTpi");
+        assert_eq!(basic_auth("ab:c"), "Basic YWI6Yw==");
     }
 }

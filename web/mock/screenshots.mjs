@@ -3,7 +3,8 @@
 //   npm run build && npm run screenshots     # writes ../screenshots/*.png
 //
 // Uses a Chromium-family browser already on this machine (no browser download).
-// Set BROWSER_PATH to pick one explicitly. SCREENSHOT_DIR overrides the output folder.
+// Set BROWSER_PATH to pick one explicitly. SCREENSHOT_DIR overrides the output folder,
+// SCREENSHOT_SIZE the window (default 1920x1080; Umbrel's store gallery uses 1440x900).
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
@@ -88,7 +89,8 @@ const SYNCING = [
   ["ibd-insights-block-arrival", "insights", ".arrival"],
 ];
 
-const VIEWPORTS = [{ tag: "1920", width: 1920, height: 1080 }];
+const [W, H] = (process.env.SCREENSHOT_SIZE || "1920x1080").split("x").map(Number);
+const VIEWPORTS = [{ tag: String(W), width: W, height: H }];
 
 async function shoot(browser, vp, shots) {
   const ctx = await browser.newContext({

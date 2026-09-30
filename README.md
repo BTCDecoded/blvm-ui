@@ -76,7 +76,8 @@ connect field.
 
 - Rust 1.88 or newer
 - Node.js 20 or newer (to build the front end)
-- A BLVM node with JSON-RPC listening. The default target is Testnet4 at `127.0.0.1:48332`; mainnet is `127.0.0.1:8332`.
+- A node with JSON-RPC listening. The default target is a BLVM Testnet4 node at `127.0.0.1:48332`; mainnet is
+  `127.0.0.1:8332`. Bitcoin Core and Knots work too; give the console their RPC login (see [Configuration](#configuration)).
 - Unix (Linux or macOS) for starting and stopping the node from Settings. Everything else works on Windows too.
 
 ## Quick start
@@ -141,7 +142,7 @@ cd web && npm run build && npm run screenshots
 ```
 
 Starts its own mock server, then captures every page and the main cards at 1920×1080 (2× pixel density) in both the
-synced and syncing states, into `screenshots/`. It uses a Chromium-family browser already installed on the machine
+synced and syncing states, into `screenshots/`. `SCREENSHOT_SIZE=1440x900` gives Umbrel store gallery sizes. It uses a Chromium-family browser already installed on the machine
 (Chrome, Chromium, Brave or Edge). Set `BROWSER_PATH` to choose one, or `SCREENSHOT_DIR` to change the output folder.
 The images in `docs/screenshots/` are picked from that output.
 
@@ -158,6 +159,33 @@ cp geo/zone.tab dist/blvm-ui/  # optional; the time zone table is also built in
 
 The host looks for the page in `$BLVM_UI_WEB_DIR`, then `web/`, `dist/` or `web/dist/` next to the binary, then this
 crate's `web/dist`.
+
+### Docker
+
+The `Dockerfile` builds the page, the location database and the binary into a small Debian image that runs as
+UID 1000 and keeps its block history in `/data`. The Rust binary is cross-compiled, so a multi-arch build does not
+need emulation.
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/btcdecoded/blvm-ui:dev .
+
+docker run --rm -p 3849:3849 -v blvm-ui:/data \
+  -e BLVM_UI_RPC=host.docker.internal:8332 \
+  -e BLVM_UI_RPC_USER=user -e BLVM_UI_RPC_PASS=pass \
+  ghcr.io/btcdecoded/blvm-ui:dev
+```
+
+The **Docker image** GitHub workflow (`.github/workflows/docker.yml`) builds both architectures on every push and
+pull request and publishes to `ghcr.io/btcdecoded/blvm-ui`:
+
+| Push | Image tags |
+|---|---|
+| tag `v0.1.0` | `0.1.0`, `latest` |
+| `main` | `main`, `sha-<commit>` |
+| pull request | built, not pushed |
+
+The run summary prints the multi-arch digest to pin in the Umbrel app's `docker-compose.yml`. Starting and stopping
+the node from Settings does not work inside a container, because the node runs in a different one.
 
 ### Building for other systems
 
@@ -189,6 +217,8 @@ Runtime only:
 |---|---|---|
 | `BLVM_UI_LISTEN` | address the console listens on | `127.0.0.1:3849` |
 | `BLVM_UI_RPC` | node JSON-RPC address | `127.0.0.1:48332` |
+| `BLVM_UI_RPC_USER` / `BLVM_UI_RPC_PASS` | RPC login, for nodes that require one (Bitcoin Core, Umbrel) | none |
+| `BLVM_UI_RPC_COOKIE` | path to the node's `.cookie` file, used when no user is set; re-read on every call | none |
 | `BLVM_UI_WEB_DIR` | folder holding the built page | see above |
 | `BLVM_UI_NODE_BIN` | node binary used by **Turn Node On** | auto-detected |
 | `BLVM_UI_NODE_CWD` | working directory for that node | auto-detected |
@@ -250,6 +280,7 @@ web/public/   logo, fonts, globe texture
 web/mock/     mock API server and screenshot script
 geo/          time zone table (+ the optional .mmdb you download)
 docs/         screenshots used in this README
+Dockerfile    multi-arch container image (see Docker)
 ```
 
 ## License
