@@ -153,7 +153,7 @@
           <div><dt>Chain</dt><dd>{s.network && s.network !== "—" ? s.network : "—"}</dd></div>
           <div><dt>Node RPC</dt><dd class="font-mono text-[0.9rem]">{s.rpc_addr}</dd></div>
           <div><dt>BLVM Version</dt><dd>{s.blvm_version}</dd></div>
-          <div><dt>Console</dt><dd>blvm-ui-next {s.ui_version}</dd></div>
+          <div><dt>Console</dt><dd>Commons UI {s.ui_version}</dd></div>
           <div><dt>Console Uptime</dt><dd>{s.ui_uptime}</dd></div>
           <div><dt>Last Check</dt><dd>{s.last_check}</dd></div>
           <div>

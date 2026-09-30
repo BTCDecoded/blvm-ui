@@ -251,7 +251,7 @@ function snapshot() {
     feed_waiting: false,
     arrival: state.arrival,
     last_check: "just now",
-    ui_version: "v0.1.0",
+    ui_version: "v0.1.1",
     ui_uptime: uptime(UI_UP_SECS + elapsed),
     rpc_failures: 0,
     show_manual: false,

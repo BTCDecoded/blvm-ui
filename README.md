@@ -1,10 +1,10 @@
-# blvm-ui
+# Commons UI
 
-Local operator console for a [BLVM](https://thebitcoincommons.org/) node.
+Local operator console for a [BLVM](https://thebitcoincommons.org/) node, from Bitcoin Commons.
 
 ![Home: sync progress, peers on a globe, and the latest blocks](docs/screenshots/home.png)
 
-`blvm-ui` is an **optional** process. It is not consensus code and the node does not need it to sync. It talks to an
+Commons UI is an **optional** process. It is not consensus code and the node does not need it to sync. It talks to an
 already-running node over stock JSON-RPC and serves a single-page dashboard in your browser, by default at
 **http://127.0.0.1:3849**.
 
@@ -13,7 +13,8 @@ little state of its own (block history, peer locations, node power), and hands t
 
 This repository is the console only. The node, protocol, and consensus live in the rest of the Bitcoin Commons stack.
 
-> The crate and binary are still named `blvm-ui-next` from development. Commands below use that name.
+> The repository and image are named `blvm-ui`, and the crate and binary are still `blvm-ui-next` from
+> development. Commands below use those names.
 
 ## The console
 
