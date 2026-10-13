@@ -82,6 +82,9 @@
       <span class="mt-1 block text-[0.72rem] font-medium tracking-wide text-muted uppercase"
         >Chain Size</span
       >
+      {#if s.disk_used_source === "node"}
+        <span class="mt-0.5 block text-[0.7rem] text-faint">reported by the node</span>
+      {/if}
     </div>
     <div class="mt-4">
       <Ring

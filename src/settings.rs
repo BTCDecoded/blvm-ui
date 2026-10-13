@@ -90,6 +90,8 @@ pub struct ConsoleSettings {
     pub modules_selected: Vec<String>,
     /// Stop the node when the console quits (default). `false` leaves it running.
     pub stop_node_on_exit: bool,
+    /// Show the Logs page in the sidebar. Off by default: the page is the node's raw log output.
+    pub show_logs: bool,
     pub modules_disabled: Vec<String>,
     /// `self` | `store` | `off`.
     pub updates: String,
@@ -132,6 +134,7 @@ impl Default for ConsoleSettings {
             rpc_pass: None,
             modules_selected: Vec::new(),
             stop_node_on_exit: true,
+            show_logs: false,
             modules_disabled: Vec::new(),
             updates: "self".into(),
             rpc_overrides: BTreeMap::new(),
@@ -489,7 +492,7 @@ mod console_tests {
     #[test]
     fn setup_done_rules() {
         // Env RPC or mode skips the wizard for standalone installs.
-        let env = EnvOverrides { rpc: Some("127.0.0.1:8332".into()), ..Default::default() };
+        let env = EnvOverrides { rpc: Some("127.0.0.1:4242".into()), ..Default::default() };
         assert!(resolve(&ConsoleSettings::default(), &env, None).setup_done);
         let env = EnvOverrides { mode: Some("standalone".into()), ..Default::default() };
         assert!(resolve(&ConsoleSettings::default(), &env, None).setup_done);
@@ -574,6 +577,7 @@ mod console_tests {
             data_root: Some("/data/x".into()),
             node_bin: Some("/bin/blvm".into()),
             stop_node_on_exit: false,
+            show_logs: true,
             ..Default::default()
         };
         s.rpc_overrides.insert("regtest".into(), "127.0.0.1:19999".into());

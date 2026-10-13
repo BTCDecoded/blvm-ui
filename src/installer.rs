@@ -1188,7 +1188,7 @@ mod tests {
         let ready = Arc::new(AtomicBool::new(true));
         let r2 = Arc::clone(&ready);
         console.agent = None;
-        console.reresolve();
+        crate::agent::testkit::isolate(&mut console); // free ports, never the networks' own (also resolves)
         let agent = Agent::with_ready(console.agent_config(), fast(), Arc::new(move || r2.load(Ordering::Relaxed)));
         agent.skip_login_check(); // the fake node has no RPC server to ask
         console.agent = Some(agent);

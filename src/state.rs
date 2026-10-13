@@ -57,6 +57,9 @@ pub struct Snapshot {
     pub disk_used_unit: String,
     pub disk_used_label: String,
     pub disk_used_bytes: u64,
+    /// Where the chain size comes from: `"folder"` (measured on disk) or `"node"` (what the node reports; the
+    /// official `blvm` computes about 1 MB per block, an estimate).
+    pub disk_used_source: &'static str,
     pub disk_free_num: String,
     pub disk_free_unit: String,
     pub disk_free_label: String,
@@ -88,6 +91,8 @@ pub struct Snapshot {
     pub managed: Option<crate::managed::ManagedView>,
     /// Page ids that installed modules add to the sidebar.
     pub modules_pages: Vec<String>,
+    /// The user turned the Logs page on in Settings (`show_logs`, off by default).
+    pub show_logs: bool,
     /// Last version the node itself reported, while `blvm_version` is `"—"` (design M.1).
     pub blvm_version_seen: Option<VersionSeen>,
     /// A node binary is known to this console, so "run a node for me" is possible.
@@ -133,6 +138,7 @@ impl Snapshot {
             disk_used_unit: "".into(),
             disk_used_label: "—".into(),
             disk_used_bytes: 0,
+            disk_used_source: "node",
             disk_free_num: vol.free_num,
             disk_free_unit: vol.free_unit,
             disk_free_label: vol.free_label,
@@ -156,7 +162,8 @@ impl Snapshot {
             mode: "standalone",
             setup_done: true,
             managed: None,
-            modules_pages: vec!["mining".to_string()],
+            modules_pages: Vec::new(),
+            show_logs: false,
             blvm_version_seen: None,
             bundle_available: false,
         }
@@ -675,7 +682,7 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
     };
     let blvm_version_now = version.clone();
     node_ctl::remember_if_running(rpc_addr, &mut g.launch);
-    let size_on_disk = chain_bytes_on_disk(rpc_addr, &g.launch, size_on_disk, blocks, headers);
+    let (size_on_disk, disk_source) = chain_bytes_on_disk(rpc_addr, &g.launch, size_on_disk, blocks, headers);
     let (disk_num, disk_unit, disk_label) = format_bytes_parts(size_on_disk);
     let vol = disk_volume();
 
@@ -714,6 +721,7 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
         disk_used_unit: disk_unit,
         disk_used_label: disk_label,
         disk_used_bytes: size_on_disk,
+        disk_used_source: disk_source,
         disk_free_num: vol.free_num,
         disk_free_unit: vol.free_unit,
         disk_free_label: vol.free_label,
@@ -738,6 +746,7 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
         setup_done: prev.setup_done,
         managed: None,
         modules_pages: prev.modules_pages.clone(),
+        show_logs: prev.show_logs,
         blvm_version_seen: if blvm_version_now == "—" {
             version_seen.map(|(version, at)| VersionSeen { version, at })
         } else {
@@ -1118,16 +1127,16 @@ fn chain_bytes_on_disk(
     rpc_bytes: u64,
     blocks: u64,
     headers: u64,
-) -> u64 {
+) -> (u64, &'static str) {
     if let Some(n) = node_ctl::datadir_usage(rpc_addr, launch) {
         if n > 0 {
-            return n;
+            return (n, "folder");
         }
     }
     if rpc_size_is_placeholder(rpc_bytes, blocks, headers) {
-        0
+        (0, "node")
     } else {
-        rpc_bytes
+        (rpc_bytes, "node")
     }
 }
 
@@ -1314,7 +1323,7 @@ pub fn volume_space_at(_path: &std::path::Path) -> (u64, u64) {
     (0, 0)
 }
 
-fn format_bytes_parts(n: u64) -> (String, String, String) {
+pub(crate) fn format_bytes_parts(n: u64) -> (String, String, String) {
     const TB: f64 = 1_000_000_000_000.0;
     const GB: f64 = 1_000_000_000.0;
     const MB: f64 = 1_000_000.0;
@@ -2000,7 +2009,7 @@ mod tests {
         ] {
             assert!(v.get(k).is_some(), "status lost field {k}");
         }
-        for k in ["mode", "setup_done", "managed", "modules_pages", "blvm_version_seen", "bundle_available"] {
+        for k in ["mode", "setup_done", "managed", "modules_pages", "show_logs", "blvm_version_seen", "bundle_available"] {
             assert!(v.get(k).is_some(), "status is missing new field {k}");
         }
     }

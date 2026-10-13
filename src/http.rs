@@ -694,7 +694,8 @@ mod tests {
             data_root: Some(dir.join("root").display().to_string()),
             ..Default::default()
         };
-        let console = Console::load(Some(dir.join("state")), env, None);
+        let mut console = Console::load(Some(dir.join("state")), env, None);
+        crate::agent::testkit::isolate(&mut console); // free ports, never the networks' own
         let mut live = LiveState::new(console.initial_rpc());
         live.console = console;
         crate::state::stamp_power(&mut live);
@@ -938,7 +939,7 @@ mod tests {
         }
         let (_, st) = call(s.addr, "GET", "/api/status", &[], None).await;
         assert_eq!(st["managed"]["network"], "signet");
-        assert_eq!(st["rpc_addr"], "127.0.0.1:38332");
+        assert_eq!(st["rpc_addr"], crate::agent::testkit::rpc_of(&s.state, "signet").await.as_str());
         agent.stop_and_wait().await;
         let _ = std::fs::remove_dir_all(&s.dir);
     }
@@ -1081,8 +1082,9 @@ mod tests {
         let (c, _) = call(s.addr, "POST", "/api/connect", &[JSON, UI], Some("")).await;
         assert_eq!(c, 400);
         assert_eq!(s.state.read().await.rpc_addr, before, "a bad body changes nothing");
-        let (c, v) = call(s.addr, "POST", "/api/connect", &[JSON, UI], Some(r#"{"rpc":"127.0.0.1:38332"}"#)).await;
-        assert_eq!((c, v["rpc_addr"].as_str()), (200, Some("127.0.0.1:38332")), "a good body still works");
+        let target = format!("127.0.0.1:{}", crate::agent::testkit::free_port());
+        let (c, v) = call(s.addr, "POST", "/api/connect", &[JSON, UI], Some(&format!(r#"{{"rpc":"{target}"}}"#))).await;
+        assert_eq!((c, v["rpc_addr"].as_str()), (200, Some(target.as_str())), "a good body still works");
         // /api/rpc.
         let (c, _) = call(s.addr, "POST", "/api/rpc", &[JSON, UI], Some("{oops")).await;
         assert_eq!(c, 400);

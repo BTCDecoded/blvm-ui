@@ -495,9 +495,7 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         }
     }
 
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-    }
+    use crate::agent::testkit::free_port;
 
     fn timings() -> Timings {
         Timings {

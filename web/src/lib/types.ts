@@ -59,6 +59,9 @@ export type Snapshot = {
   disk_used_unit: string;
   disk_used_label: string;
   disk_used_bytes: number;
+  /** Where the chain size comes from: "folder" (measured on disk) or "node" (what the node reports, an estimate
+   *  of about 1 MB a block in the official `blvm`). Absent on an older host. */
+  disk_used_source?: "folder" | "node";
   disk_free_num: string;
   disk_free_unit: string;
   disk_free_label: string;
@@ -89,8 +92,10 @@ export type Snapshot = {
   /** Design F. Null or absent in standalone mode. */
   managed?: Managed | null;
   /** Design L. Page ids that installed + enabled modules add to the sidebar (e.g. ["mining"]).
-   *  Absent => the sidebar stays as before (static list, Mining included). */
+   *  Absent => core pages only (no module page without its module). */
   modules_pages?: string[];
+  /** The user turned the Logs page on (Settings > Console). Absent or false => no Logs page in the sidebar. */
+  show_logs?: boolean;
   /** Design M.1. Last version the node itself reported, shown only as muted "last seen". */
   blvm_version_seen?: VersionSeen | null;
   /** Design K step 2 / G: a node binary shipped next to the console exists ("Run a node for me" is possible).
@@ -378,6 +383,8 @@ export type ConsoleSettings = {
   stop_node_on_exit?: boolean;
   /** Host: same fact as `stop_node_on_exit`, inverted (accepted on write, sent on read). */
   keep_node_running_on_exit?: boolean;
+  /** Show the Logs page in the sidebar. Off by default. */
+  show_logs?: boolean;
   modules_disabled?: string[];
   updates?: UpdateChannel;
   /** Host only. Network id to the node's RPC `host:port` when not the network's default. */

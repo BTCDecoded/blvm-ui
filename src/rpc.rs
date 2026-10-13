@@ -405,11 +405,11 @@ mod tests {
 
     #[test]
     fn frozen_vs_connect_errors() {
-        assert!(is_frozen_error("RPC 127.0.0.1:38332 frozen"));
-        assert!(is_frozen_error("RPC 127.0.0.1:38332 timed out"));
-        assert!(!is_frozen_error("connect 127.0.0.1:38332"));
+        assert!(is_frozen_error("RPC 127.0.0.1:4242 frozen"));
+        assert!(is_frozen_error("RPC 127.0.0.1:4242 timed out"));
+        assert!(!is_frozen_error("connect 127.0.0.1:4242"));
         assert!(!is_frozen_error("Connection refused"));
-        assert!(is_connect_refused("connect 127.0.0.1:38332"));
+        assert!(is_connect_refused("connect 127.0.0.1:4242"));
         assert!(is_connect_refused("Connection refused"));
         assert!(!is_connect_refused("Connection reset by peer"));
         assert!(!is_connect_refused("Connection rate limit exceeded"));

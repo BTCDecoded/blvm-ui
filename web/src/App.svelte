@@ -9,6 +9,7 @@
   import SettingsPanel from "./lib/SettingsPanel.svelte";
   import LogsPanel from "./lib/LogsPanel.svelte";
   import MiningPanel from "./lib/MiningPanel.svelte";
+  import LogsGate from "./lib/LogsGate.svelte";
   import ModuleGate from "./lib/ModuleGate.svelte";
   import { MODULE_PAGES } from "./lib/modules";
   import Setup from "./lib/Setup.svelte";
@@ -18,28 +19,27 @@
 
   type Item = { id: Page; label: string; icon: string };
   const home: Item = { id: "home", label: "Home", icon: "home" };
-  const mining: Item = { id: "mining", label: "Mining", icon: "mining" };
-  const core: Item[] = [
-    { id: "network", label: "Network", icon: "network" },
-    { id: "logs", label: "Logs", icon: "logs" },
-    { id: "settings", label: "Settings", icon: "settings" },
-  ];
+  const network: Item = { id: "network", label: "Network", icon: "network" };
+  const logs: Item = { id: "logs", label: "Logs", icon: "logs" };
+  const settings: Item = { id: "settings", label: "Settings", icon: "settings" };
 
   // Design L: core pages plus the pages installed modules add. A host that does not send `modules_pages`
-  // (every host before the managed-node work) keeps the sidebar exactly as it was, Mining included.
+  // (and the moment before the first /api/status answers) shows the core pages only: a module page is never
+  // shown unless the host says its module is installed and on.
   const side = $derived.by<Item[]>(() => {
     const mp = ui.ready ? modulePages(ui.snap) : null;
-    if (mp === null) return [home, mining, ...core];
-    const extra = mp.filter((id) => id in MODULE_PAGES).map((id) => ({ id: id as Page, ...MODULE_PAGES[id] }));
-    return [home, ...extra, ...core];
+    // Logs is off until the user turns it on in Settings (`show_logs`).
+    const showLogs = ui.ready && ui.snap.show_logs === true;
+    const extra = (mp ?? []).filter((id) => id in MODULE_PAGES).map((id) => ({ id: id as Page, ...MODULE_PAGES[id] }));
+    return [home, ...extra, network, ...(showLogs ? [logs] : []), settings];
   });
 
   // A module page whose module is not there (typed URL, or the module was just removed).
   const gated = $derived.by(() => {
     if (!ui.ready || !(ui.page in MODULE_PAGES)) return false;
-    const mp = modulePages(ui.snap);
-    return mp !== null && !mp.includes(ui.page);
+    return !(modulePages(ui.snap) ?? []).includes(ui.page);
   });
+  const logsOff = $derived(ui.ready && ui.page === "logs" && ui.snap.show_logs !== true);
   const wizard = $derived(wizardActive());
   // Umbrel: the node runs under an agent in another container; when its heartbeat is gone the page says so
   // next to the "Console Live" light (the console itself is fine, the node is not being looked after).
@@ -127,6 +127,8 @@
       {/if}
       {#if gated}
         <ModuleGate page={ui.page} />
+      {:else if logsOff}
+        <LogsGate />
       {:else if ui.page === "home"}
         <HomePanel />
       {:else if ui.page === "insights"}

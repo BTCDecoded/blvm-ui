@@ -29,13 +29,13 @@
 // Host parity. /api/node/releases, /api/node/install (GET job, POST start) and /api/node/update exist in every
 // managed scenario. Routes the Rust host does not have yet (/api/modules*; U5) exist in the mock ONLY in the scenarios
 // marked MOCK-ONLY above (or with &future=1). In every other scenario they answer a JSON 404 like the real host, and
-// modules_pages is the host's constant ["mining"].
+// modules_pages is the host's empty list (nothing can be installed yet).
 //
 // Control (used by the screenshot script and for hand-testing):
 //   GET /__mock?scenario=ibd&live=0    switch scenario, freeze or unfreeze
 //   extra knobs: fail_verify=1 / fail_test=1 (the next install or update job fails its checksum check / its test run;
 //                an update then reports rolled_back)  channel=self|store|off  platform_supported=0|1  can_install=0|1  platform=aarch64-macos
-//                future=1|0 (turn the not-yet-in-the-host routes on or off)  port_taken=0|1 (the port-conflict program)
+//                show_logs=1|0 (the Logs page switch; off by default)  future=1|0 (turn the not-yet-in-the-host routes on or off)  port_taken=0|1 (the port-conflict program)
 //                slow=20 (stretch every delay)  free_gb=3  custom=1  fail_start=1 (next start crashes)  stop_stuck=1 (next switch cannot stop the old node)  external=1 (with first-run: Umbrel-style)
 //                agent_alive=0 (external only: the node agent's heartbeat is gone)  offline=1 (GitHub cannot be reached; Try again
 //                asks GET /api/node/releases?force=1, counted in force_checks of this answer)
