@@ -7,5 +7,6 @@ screenshots
 docs
 .git
 .github
+.run
 *.log
 .DS_Store
