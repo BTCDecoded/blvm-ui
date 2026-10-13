@@ -1,6 +1,6 @@
 [package]
 name = "blvm-ui-next"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 authors = ["Bitcoin Commons Contributors"]
 description = "Next localhost UI for a vanilla blvm-node (JSON-RPC console)"
