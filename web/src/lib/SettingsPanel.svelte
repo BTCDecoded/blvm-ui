@@ -2,6 +2,7 @@
   import { connectTo, toggleNode } from "./api";
   import { installedVersion, nodeReports, nodeVersion } from "./format";
   import Icon from "./Icon.svelte";
+  import ConsoleCard from "./ConsoleCard.svelte";
   import Light from "./Light.svelte";
   import ModulesCard from "./ModulesCard.svelte";
   import NetCarousel from "./NetCarousel.svelte";
@@ -187,6 +188,10 @@
           </p>
         {/if}
       </article>
+      {/if}
+
+      {#if s.show_logs !== undefined}
+        <ConsoleCard />
       {/if}
 
       <article class="panel ui-card grow">

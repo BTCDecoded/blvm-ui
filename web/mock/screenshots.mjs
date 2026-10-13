@@ -53,6 +53,11 @@ async function startMock() {
 }
 
 const mock = (q) => fetch(`${BASE}/__mock?${q}`).then((r) => r.json());
+// The Logs page is off by default; the shot of it turns the switch on first.
+const logsOn = async (page) => {
+  await mock("show_logs=1");
+  await page.waitForTimeout(1600);
+};
 const card = (title) => `article.panel:has(h2:text-is("${title}"))`;
 
 // name → [page hash, what to capture]. `null` target = the whole window.
@@ -61,8 +66,7 @@ const SYNCED = [
   ["insights", "insights", null],
   ["network", "network", null],
   ["settings", "settings", null],
-  ["mining", "mining", null],
-  ["logs", "logs", null],
+  ["logs", "logs", null, logsOn],
 
   ["home-network-sync", "home", ".sync-card"],
   ["home-p2p-connections", "home", ".p2p-float"],
@@ -78,7 +82,6 @@ const SYNCED = [
   ["settings-console-target", "settings", card("Console Target")],
   ["settings-node-process", "settings", card("Node Process")],
   ["settings-about", "settings", card("About")],
-  ["mining-stratum-v2", "mining", card("Stratum V2")],
 ];
 
 // Managed-node screens (design G, K, L). The optional 4th item prepares the page (clicks) before the shot.
@@ -106,7 +109,7 @@ const MANAGED_RUNNING = [
   ["managed-node", "settings", card("Node")],
   ["managed-network", "settings", card("Network")],
   // Modules and Updates cards are shown from the MOCK-ONLY scenarios below (the host has no such routes yet).
-  ["managed-logs", "logs", null],
+  ["managed-logs", "logs", null, logsOn],
   ["managed-switch-confirm", "settings", "dialog[open]", pickNet("Signet")],
 ];
 const SWITCHING = [["managed-switching", "settings", card("Network")]];
@@ -124,7 +127,7 @@ const NO_BINARY = [
   ["setup-get-node", "home", ".setup", steps(click("Set up"), pickChoice("Signet"), click("Next"))],
   ["setup-get-node-downloading", "home", ".setup", steps(click("Set up"), pickChoice("Signet"), click("Next"), click("Download"))],
 ];
-const MODULES = [["managed-modules-installed", "settings", card("Modules")], ["managed-mining", "mining", null]];
+const MODULES = [["managed-modules-installed", "settings", card("Modules")], ["managed-mining", "mining", null], ["mining-stratum-v2", "mining", card("Stratum V2")]];
 
 const SYNCING = [
   ["ibd-home", "home", null],

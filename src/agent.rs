@@ -36,8 +36,10 @@ mod external;
 
 const RING_CAP: usize = 2000;
 const CRASH_LOG_LINES: usize = 50;
-/// First read of a log file takes at most this many trailing bytes.
-const PRELOAD_BYTES: u64 = 64 * 1024;
+/// The first read of a log file starts this many lines before its end (the Logs page shows them first).
+const PRELOAD_LINES: usize = 500;
+/// ...but looks back at most this many bytes for them.
+const PRELOAD_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// One tail pass reads at most this much; a bigger backlog skips to the end.
 const TAIL_CHUNK: u64 = 4 * 1024 * 1024;
 const TAIL_MAX_BACKLOG: u64 = 8 * 1024 * 1024;
@@ -1128,6 +1130,10 @@ impl Inner {
                 cmd.env_remove(&k);
             }
         }
+        // `RUST_LOG` is the console's own log filter (the Docker image sets `blvm_ui_next=info`). The node reads
+        // the same variable, and a filter that names only the console's crate silences every line the node
+        // writes: the Logs page stayed empty. The node gets one only through the Child environment setting.
+        cmd.env_remove("RUST_LOG");
         for (k, v) in child_env(&cfg) {
             match v {
                 Some(v) => {
@@ -1696,8 +1702,9 @@ impl Inner {
         let len = meta.len();
         if !r.preloaded {
             r.preloaded = true;
-            r.offset = len.saturating_sub(PRELOAD_BYTES);
-            r.skip_to_newline = r.offset > 0;
+            let (offset, at_line_start) = preload_offset(&mut f, len);
+            r.offset = offset;
+            r.skip_to_newline = offset > 0 && !at_line_start;
         }
         if len < r.offset {
             // Rotated (copy-truncate) or cleared.
@@ -1852,6 +1859,43 @@ async fn port_conflict(cfg: &AgentConfig, net: &'static Network) -> Option<Strin
         }
     }
     None
+}
+
+/// Where to start reading a log file the first time so that its last [`PRELOAD_LINES`] lines are included: the
+/// start of the line that many newlines before the end, or `PRELOAD_MAX_BYTES` back when the lines are long.
+/// The second value says the offset is the start of a line; when it is not (and not 0) the caller skips the
+/// cut line up to the next newline.
+fn preload_offset(f: &mut std::fs::File, len: u64) -> (u64, bool) {
+    let floor = len.saturating_sub(PRELOAD_MAX_BYTES);
+    let mut end = len;
+    let mut newlines = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    // A final newline ends the last line; it does not start another.
+    let mut first = true;
+    while end > floor {
+        let start = end.saturating_sub(buf.len() as u64).max(floor);
+        let n = (end - start) as usize;
+        if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut buf[..n]).is_err() {
+            return (floor, floor == 0);
+        }
+        for i in (0..n).rev() {
+            if buf[i] != b'\n' {
+                continue;
+            }
+            if first && start + i as u64 + 1 == len {
+                first = false;
+                continue;
+            }
+            first = false;
+            newlines += 1;
+            if newlines == PRELOAD_LINES {
+                // The line after this newline is the first of the last PRELOAD_LINES lines.
+                return (start + i as u64 + 1, true);
+            }
+        }
+        end = start;
+    }
+    (floor, floor == 0)
 }
 
 // ---- log rotation ---------------------------------------------------------------------------
@@ -3279,6 +3323,118 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         assert!(v.crash_log.iter().any(|l| l == "boom"), "{:?}", v.crash_log);
         assert!(v.crash_log.iter().all(|l| !l.contains('\u{1b}')), "{:?}", v.crash_log);
         cleanup(&env);
+    }
+
+    fn numbered_lines(from: usize, to: usize) -> String {
+        (from..=to).map(|i| format!("line {i}\n")).collect()
+    }
+
+    #[tokio::test]
+    async fn the_tailer_starts_with_the_last_500_lines_then_follows_appends_and_truncation() {
+        for external in [false, true] {
+            let env = setup(if external { "tail-ext" } else { "tail" });
+            let net = networks::by_id("regtest").unwrap();
+            let log = networks::log_file(&env.root, net);
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            // The file is there before the console starts.
+            std::fs::write(&log, numbered_lines(1, 1000)).unwrap();
+            let agent = if external { Agent::external(cfg(&env, "run"), fast()) } else { Agent::new(cfg(&env, "run"), fast()) };
+            // The very first request already has them (the external client reads on demand).
+            agent.inner.ensure_tailer();
+            wait_for("first 500", || agent.logs(None, 1000).len() == 500).await;
+            let first = agent.logs(None, 1000);
+            assert_eq!((first[0].seq, first[0].text.as_str()), (1, "line 501"));
+            assert_eq!((first[499].seq, first[499].text.as_str()), (500, "line 1000"));
+            assert!(first.windows(2).all(|w| w[1].seq == w[0].seq + 1), "sequence numbers are consecutive");
+
+            // Appended lines follow, after the last sequence number the page saw.
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            f.write_all(numbered_lines(1001, 1003).as_bytes()).unwrap();
+            wait_for("appended lines", || agent.logs(Some(500), 1000).len() == 3).await;
+            let more = agent.logs(Some(500), 1000);
+            assert_eq!(more.iter().map(|l| (l.seq, l.text.as_str())).collect::<Vec<_>>(), [(501, "line 1001"), (502, "line 1002"), (503, "line 1003")]);
+            // A line is not shown before it is finished.
+            f.write_all(b"half a li").unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert_eq!(agent.logs(Some(503), 10).len(), 0);
+            f.write_all(b"ne\n").unwrap();
+            wait_for("finished line", || agent.logs(Some(503), 10).iter().any(|l| l.text == "half a line")).await;
+
+            // Truncation (rotation by copy-truncate, or a cleared file): reading starts again from the top.
+            f.set_len(0).unwrap();
+            drop(f);
+            std::fs::write(&log, "fresh 1\nfresh 2\n").unwrap();
+            wait_for("after truncation", || agent.logs(Some(504), 10).iter().any(|l| l.text == "fresh 2")).await;
+            let after = agent.logs(Some(504), 10);
+            assert_eq!(after.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["fresh 1", "fresh 2"]);
+            assert!(after[0].seq > 504, "sequence numbers keep counting up");
+            cleanup(&env);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_read_of_a_short_or_exact_file_loses_no_line() {
+        for (n, tail_newline) in [(3usize, true), (500, true), (501, true), (500, false), (1, false)] {
+            let env = setup("tail-edge");
+            let net = networks::by_id("regtest").unwrap();
+            let log = networks::log_file(&env.root, net);
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            let mut text = numbered_lines(1, n);
+            if !tail_newline {
+                text.pop();
+            }
+            std::fs::write(&log, text).unwrap();
+            let agent = Agent::new(cfg(&env, "run"), fast());
+            agent.inner.ensure_tailer();
+            let want = if tail_newline { n.min(500) } else { n.min(500) - 1 };
+            wait_for("preload", || agent.logs(None, 1000).len() >= want).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let got = agent.logs(None, 1000);
+            assert_eq!(got.len(), want, "{n} lines, final newline {tail_newline}");
+            if tail_newline {
+                assert_eq!(got.last().unwrap().text, format!("line {n}"));
+                assert_eq!(got[0].text, format!("line {}", n + 1 - want));
+            }
+            cleanup(&env);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_nodes_stdout_and_stderr_reach_node_log_at_once_and_without_the_consoles_log_filter() {
+        // The console's own filter (the Docker image sets one that names only the console's crate) must not reach
+        // the node: it would silence every line the node writes. The Child environment setting still can.
+        std::env::set_var("RUST_LOG", "blvm_ui_next=info");
+        for (child_filter, expect) in [(None, "filter=unset"), (Some("debug"), "filter=debug")] {
+            let env = setup("node-log");
+            // A node that writes to both streams and keeps running; it also says which log filter it got.
+            std::fs::write(
+                &env.bin,
+                "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'blvm 9.9.9'; exit 0; fi\ntrap 'exit 0' TERM\n\
+                 echo \"filter=${RUST_LOG-unset}\"\necho 'to stdout INFO'\necho 'to stderr WARN' >&2\n\
+                 while kill -0 $PPID 2>/dev/null; do sleep 0.1; done\n",
+            )
+            .unwrap();
+            let mut c = cfg(&env, "run");
+            if let Some(f) = child_filter {
+                c.child_env.insert("RUST_LOG".into(), f.into());
+            }
+            let agent = Agent::new(c, fast());
+            agent.start().await.unwrap();
+            let _reap = Reaper(agent.clone());
+            let log = networks::log_file(&env.root, networks::by_id("regtest").unwrap());
+            // Straight from the file, not through the ring: the node's own descriptor, no buffering in between.
+            wait_for("both streams in node.log", || {
+                let t = std::fs::read_to_string(&log).unwrap_or_default();
+                t.contains("to stdout INFO") && t.contains("to stderr WARN")
+            })
+            .await;
+            let t = std::fs::read_to_string(&log).unwrap();
+            assert!(t.lines().any(|l| l == expect), "expected {expect} in {t}");
+            wait_for("the page sees them", || agent.logs(None, 50).iter().any(|l| l.text == "to stderr WARN")).await;
+            agent.stop_and_wait().await;
+            cleanup(&env);
+        }
+        std::env::remove_var("RUST_LOG");
     }
 
     #[tokio::test]

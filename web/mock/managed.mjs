@@ -70,7 +70,7 @@ export function createManaged(chain) {
     installed: [], // {name, version, enabled}
     canInstall: true,
     platform: "x86_64-linux",
-    settings: { version: 1, start_on_boot: true, start_on_launch: true, stop_node_on_exit: true, updates: "self" },
+    settings: { version: 1, start_on_boot: true, start_on_launch: true, stop_node_on_exit: true, show_logs: false, updates: "self" },
     lastRunning: secs(),
     logs: [],
     seq: 0,
@@ -330,8 +330,8 @@ export function createManaged(chain) {
   // ---- modules (design E, L) --------------------------------------------
   const entry = (name) => INDEX.find((e) => e.name === name);
   function modulePages() {
-    // The host sends a constant ["mining"] until the module manager exists (U5).
-    if (!mg.future) return ["mining"];
+    // The host has no module store yet (U5), so it sends an empty list: nothing installed, no module pages.
+    if (!mg.future) return [];
     const out = [];
     for (const m of mg.installed) {
       if (!m.enabled) continue;
@@ -406,8 +406,8 @@ export function createManaged(chain) {
 
   /** Adds (managed/standalone-with-new-host) fields and the "node is not running" overrides to a snapshot. */
   function decorate(snap) {
-    if (mg.mode === undefined) return snap; // old host shape
-    const out = { ...snap, mode: mg.mode, setup_done: mg.setupDone, bundle_available: mg.mode === "managed" ? !!mg.nodeVersion : mg.bundle, modules_pages: modulePages() };
+    if (mg.mode === undefined) return { ...snap, show_logs: mg.settings.show_logs === true, disk_used_source: "node" }; // old host shape: Logs switch only
+    const out = { ...snap, mode: mg.mode, setup_done: mg.setupDone, bundle_available: mg.mode === "managed" ? !!mg.nodeVersion : mg.bundle, modules_pages: modulePages(), show_logs: mg.settings.show_logs === true, disk_used_source: mg.mode === "managed" ? "folder" : "node" };
     if (mg.mode === "managed") {
       out.managed = managedBody();
       const st = mg.proc.state;
@@ -476,7 +476,7 @@ export function createManaged(chain) {
       freeBytes: 1_042_500_000_000, nodeVersion: "0.1.60", custom: false, latest: "0.1.60", channel: "self",
       platformSupported: true, sw: null, installed: [], canInstall: true,
       platform: "x86_64-linux", lastRunning: secs(), logs: [], seq: 0, failNextStart: false, stopStuck: false,
-      settings: { version: 1, start_on_boot: true, start_on_launch: true, stop_node_on_exit: true, updates: "self" },
+      settings: { version: 1, start_on_boot: true, start_on_launch: true, stop_node_on_exit: true, show_logs: false, updates: "self" },
       job: idleJob(), jobEnd: 0, failVerify: false, failTest: false,
     });
   }
@@ -712,8 +712,13 @@ export function createManaged(chain) {
       return true;
     }
     if (p === "/api/settings") {
-      if (mg.mode === undefined) return json(res, { error: "not found" }, 404), true;
+      if (mg.mode === undefined) {
+        // The old-host shape has only the page switch.
+        if (mutating && "show_logs" in (body ?? {})) mg.settings.show_logs = body.show_logs === true;
+        return json(res, { version: 1, show_logs: mg.settings.show_logs === true }), true;
+      }
       if (mutating) {
+        if ("show_logs" in (body ?? {})) mg.settings.show_logs = body.show_logs === true;
         for (const k of ["start_on_launch", "stop_node_on_exit", "updates", "data_root"]) if (k in (body ?? {})) mg.settings[k] = body[k];
         // Skip on Umbrel: only marks setup as done, nothing else moves.
         if ("setup_done" in (body ?? {})) mg.setupDone = !!body.setup_done;
@@ -792,6 +797,7 @@ export function createManaged(chain) {
     if (g("fail_verify") !== null) mg.failVerify = g("fail_verify") !== "0";
     if (g("fail_test") !== null) mg.failTest = g("fail_test") !== "0";
     if (g("stop_stuck") !== null) mg.stopStuck = g("stop_stuck") !== "0";
+    if (g("show_logs") !== null) mg.settings.show_logs = g("show_logs") !== "0";
     if (g("future") !== null) mg.future = g("future") !== "0";
     if (g("port_taken") !== null) mg.portTaken = g("port_taken") !== "0" ? { port: NETS[mg.network ?? "testnet4"].rpc, pid: 4242, name: "blvm" } : null;
     if (g("agent_alive") !== null) mg.agentAlive = g("agent_alive") !== "0";

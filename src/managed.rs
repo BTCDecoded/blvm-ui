@@ -547,6 +547,24 @@ fn managed_view(c: &Console, view: ProcessView, agent: &Agent, live_height: Opti
     }
 }
 
+/// The sidebar pages that installed and enabled modules add (design L). `enabled_modules` are module ids, with or
+/// without the `blvm-` prefix. A module that adds no page, or one this console does not know, adds nothing.
+pub fn modules_pages_for<S: AsRef<str>>(enabled_modules: &[S]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in enabled_modules {
+        let id = m.as_ref();
+        let id = id.strip_prefix("blvm-").unwrap_or(id);
+        let page = match id {
+            "stratum-v2" | "datum" | "gridpool" => "mining",
+            _ => continue,
+        };
+        if !out.iter().any(|p| p == page) {
+            out.push(page.to_string());
+        }
+    }
+    out
+}
+
 fn stamp_console_fields(snap: &mut Snapshot, c: &Console) {
     snap.mode = c.eff.mode.as_str();
     snap.setup_done = c.eff.setup_done;
@@ -554,7 +572,35 @@ fn stamp_console_fields(snap: &mut Snapshot, c: &Console) {
     // it has, for instance the one baked into its image.
     snap.bundle_available = c.eff.node_bin.as_deref().is_some_and(|p| p.is_file())
         || (c.is_external() && c.agent.as_ref().is_some_and(|a| a.binary_found() == Some(true)));
-    snap.modules_pages = vec!["mining".to_string()];
+    // This host has no module store yet, so nothing can be installed: no module pages, in either mode.
+    snap.modules_pages = modules_pages_for::<String>(&[]);
+    snap.show_logs = c.settings.show_logs;
+    stamp_disk(snap, c);
+}
+
+/// Managed mode: the chain size is what the network's folder takes on disk (the cached measurement behind
+/// `managed.networks[].bytes`), never the node's `size_on_disk`: the official `blvm` computes that as about 1 MB
+/// per block, an estimate that was off by a factor of 2 to 8 on real chains. The free space is that of the
+/// volume holding the data root. Before the first measurement the figure is empty rather than the estimate.
+fn stamp_disk(snap: &mut Snapshot, c: &Console) {
+    if !c.is_managed() {
+        return;
+    }
+    let bytes = c.network().map_or(0, |n| c.disk.lock().unwrap().net(n.id).bytes);
+    let (num, unit, label) = crate::state::format_bytes_parts(bytes);
+    snap.disk_used_num = num;
+    snap.disk_used_unit = unit;
+    snap.disk_used_label = label;
+    snap.disk_used_bytes = bytes;
+    snap.disk_used_source = "folder";
+    let (total, free) = crate::state::volume_space_at(&c.eff.data_root);
+    let (free_num, free_unit, free_label) = crate::state::format_bytes_parts(free);
+    snap.disk_free_num = free_num;
+    snap.disk_free_unit = free_unit;
+    snap.disk_free_label = free_label;
+    snap.disk_free_bytes = free;
+    snap.disk_total_bytes = total;
+    snap.disk_vol_used_label = crate::state::format_bytes_parts(total.saturating_sub(free)).2;
 }
 
 /// Fill the console-level fields of the snapshot and, in managed mode, let the agent's state decide
@@ -883,6 +929,7 @@ pub fn settings_json(c: &Console) -> Value {
         "modules_selected": s.modules_selected,
         "stop_node_on_exit": s.stop_node_on_exit,
         "keep_node_running_on_exit": !s.stop_node_on_exit,
+        "show_logs": s.show_logs,
         "modules_disabled": s.modules_disabled,
         "updates": c.updates_channel(),
         "rpc_overrides": s.rpc_overrides,
@@ -990,6 +1037,10 @@ pub async fn patch_settings(state: &Shared, body: &Value) -> (u16, Value) {
             "stop_node_on_exit" => match v.as_bool() {
                 Some(b) => s.stop_node_on_exit = b,
                 None => return err(400, "stop_node_on_exit must be true or false."),
+            },
+            "show_logs" => match v.as_bool() {
+                Some(b) => s.show_logs = b,
+                None => return err(400, "show_logs must be true or false."),
             },
             "keep_node_running_on_exit" => match v.as_bool() {
                 Some(b) => s.stop_node_on_exit = !b,
@@ -1723,6 +1774,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&f2.dir);
     }
 
+    #[test]
+    fn modules_pages_follow_enabled_modules() {
+        assert!(modules_pages_for::<String>(&[]).is_empty());
+        assert_eq!(modules_pages_for(&["blvm-stratum-v2"]), vec!["mining"]);
+        assert_eq!(modules_pages_for(&["blvm-datum", "blvm-stratum-v2", "blvm-gridpool"]), vec!["mining"], "one page, once");
+        assert!(modules_pages_for(&["blvm-zmq", "blvm-fibre", "something-else"]).is_empty());
+    }
+
     #[tokio::test]
     async fn status_carries_mode_setup_and_managed_fields() {
         // Standalone: managed is null, setup_done follows the rules, everything else stays.
@@ -1735,7 +1794,7 @@ mod tests {
         assert_eq!(v["mode"], "standalone");
         assert_eq!(v["setup_done"], true, "no node program to offer: nothing to set up beyond the RPC target");
         assert_eq!(v["managed"], Value::Null);
-        assert_eq!(v["modules_pages"], json!(["mining"]));
+        assert_eq!(v["modules_pages"], json!([]));
         assert_eq!(v["bundle_available"], false);
         assert!(v.get("connected").is_some() && v.get("blvm_version").is_some(), "old fields still there");
 
@@ -2332,6 +2391,92 @@ mod tests {
         assert_eq!(c, 400);
         let _ = std::fs::remove_dir_all(&f.dir);
         let _ = std::fs::remove_dir_all(&g.dir);
+    }
+
+    #[tokio::test]
+    async fn the_logs_page_is_off_until_the_user_turns_it_on_and_that_is_remembered() {
+        assert!(!ConsoleSettings::default().show_logs, "off by default");
+        let old: ConsoleSettings = serde_json::from_str(r#"{"setup_done":true}"#).unwrap();
+        assert!(!old.show_logs, "an older file without the field: off");
+        let f = fixture("show-logs", managed_env(), true);
+        assert_eq!(settings_json(&f.state.read().await.console)["show_logs"], false);
+        {
+            let mut g = f.state.write().await;
+            stamp_power(&mut g);
+        }
+        let v = serde_json::to_value(&f.state.read().await.snapshot).unwrap();
+        assert_eq!(v["show_logs"], false, "status carries it, off");
+        let (c, v) = patch_settings(&f.state, &json!({"show_logs": "yes"})).await;
+        assert_eq!(c, 400, "{v}");
+        let (c, v) = patch_settings(&f.state, &json!({"show_logs": true})).await;
+        assert_eq!((c, v["show_logs"].clone()), (200, json!(true)));
+        assert!(settings::load_console(&f.dir.join("state")).show_logs, "saved to console.json");
+        let v = serde_json::to_value(&f.state.read().await.snapshot).unwrap();
+        assert_eq!(v["show_logs"], true, "status follows the switch at once");
+        let (_, v) = patch_settings(&f.state, &json!({"show_logs": false})).await;
+        assert_eq!(v["show_logs"], false);
+        assert!(!settings::load_console(&f.dir.join("state")).show_logs);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn managed_chain_size_is_the_measured_folder_not_the_nodes_estimate() {
+        let f = fixture("disk-measured", managed_env(), true);
+        let (code, _) = patch_settings(&f.state, &json!({"network":"regtest"})).await;
+        assert_eq!(code, 200);
+        // Real bytes in the network's folder: 3 MB of chain data.
+        let data = f.dir.join("root/networks/regtest/data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("blocks.bin"), vec![7u8; 3 * 1024 * 1024]).unwrap();
+        let (cache, root) = f.state.read().await.console.disk_job().expect("a measurement is due");
+        run_disk_job(cache, root);
+        let measured = f.state.read().await.console.disk_snapshot().lock().unwrap().net("regtest").bytes;
+        assert!(measured >= 3 * 1024 * 1024, "{measured}");
+        // The node says 27 GB (about 1 MB a block at 27 000 blocks), a made-up figure.
+        {
+            let mut g = f.state.write().await;
+            g.snapshot.disk_used_bytes = 27_000_000_000;
+            g.snapshot.disk_used_num = "27.0".into();
+            g.snapshot.disk_used_unit = "GB".into();
+            g.snapshot.disk_used_label = "27.0 GB".into();
+            stamp_power(&mut g);
+        }
+        let s = f.state.read().await.snapshot.clone();
+        assert_eq!(s.disk_used_bytes, measured, "the folder, not the node's number");
+        assert_eq!(s.disk_used_source, "folder");
+        assert_ne!(s.disk_used_label, "27.0 GB");
+        let (total, free) = crate::state::volume_space_at(&f.dir.join("root"));
+        assert!(total > 0);
+        assert_eq!(s.disk_total_bytes, total, "the volume that holds the data root");
+        assert!(s.disk_free_bytes.abs_diff(free) < 1 << 30);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["disk_used_source"], "folder");
+        let _ = std::fs::remove_dir_all(&f.dir);
+
+        // Before the first measurement: no figure, and never the node's.
+        let g = fixture("disk-unmeasured", managed_env(), true);
+        let (code, _) = patch_settings(&g.state, &json!({"network":"regtest"})).await;
+        assert_eq!(code, 200);
+        {
+            let mut w = g.state.write().await;
+            w.snapshot.disk_used_bytes = 27_000_000_000;
+            stamp_power(&mut w);
+        }
+        assert_eq!(g.state.read().await.snapshot.disk_used_bytes, 0);
+        let _ = std::fs::remove_dir_all(&g.dir);
+    }
+
+    #[tokio::test]
+    async fn standalone_keeps_the_nodes_figure_and_says_so() {
+        let f = fixture("disk-standalone", EnvOverrides::default(), false);
+        {
+            let mut g = f.state.write().await;
+            g.snapshot.disk_used_bytes = 5_000_000_000;
+            stamp_power(&mut g);
+        }
+        let s = f.state.read().await.snapshot.clone();
+        assert_eq!((s.disk_used_bytes, s.disk_used_source), (5_000_000_000, "node"));
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 
     #[tokio::test]

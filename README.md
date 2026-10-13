@@ -81,7 +81,11 @@ show as ranges instead of one tile per height.
 
 **Insights** has system health (status, uptime, node version, chain, initial-download state), inbound against outbound
 peers, how much disk the chain uses next to the free space on its volume, and how many blocks arrived in each of the last
-12 minutes.
+12 minutes. With a managed node the chain size is **measured**: what the network's folder takes on disk (refreshed about
+once a minute), and the free space is that of the volume holding the data root. The node's own `size_on_disk` is not used
+there: the official `blvm` release computes it as an estimate of about 1 MB per block, which was off by a factor of 2 to 8
+on real chains (102 GB reported against 12 GB on disk at 99 000 blocks). With a standalone node the console measures the
+node's data folder when it can find it, and otherwise shows the node's figure, labelled "reported by the node".
 
 ![Insights](docs/screenshots/insights.png)
 
@@ -114,7 +118,9 @@ What you see depends on the mode.
   one does not come up. On Linux only (see below). When updates are turned off, or left to an app store (`BLVM_UI_UPDATES`), the card says
   so.
 * **Modules.** Add-ons that run next to the node. Installing them is not available yet; the screenshot of this card is
-  mock data.
+  mock data. Mining appears in the sidebar only once a mining module is installed and on.
+* **Console.** *Show the Logs page* (off by default; `show_logs` in `console.json`). Part of the sidebar rules: Home, Network,
+  Settings are always there, Logs when the switch is on, and a module's page (Mining) when that module is installed and on.
 * **About.** Chain, node RPC, versions, uptime, and a per-network **Storage** list with free disk and the data folder.
   *Run setup again* is here.
 
@@ -134,18 +140,24 @@ computer (Unix only), and version and uptime details.
 
 ### Logs
 
-With a managed node the Logs page **tails the node's log live**, next to a short guide to the lines worth watching. The
+The Logs page is **off by default**: *Show the Logs page* in Settings (the *Console* card) puts it in the sidebar, and a
+typed `#logs` while it is off shows a note with a button to turn it on. With a managed node the page **tails the node's
+log live**, starting with the last 500 lines of the file (also those written before the console started), next to a short guide to the lines worth watching. The
 full file is `networks/<network>/logs/node.log` in the data folder (copy-truncated at 50 MB, one older file kept), and
 the page has a button to copy its path. With a standalone node the console cannot see the node's output, so the page
 shows the commands to run your node with verbose output, save it and follow it. A line such as "RPC authentication is
 required but no tokens or certificates are configured" in the node's log is an upstream wording issue: with the login
 this console gives the node, Basic authentication is in effect (a call without it gets `401`).
 
+The node does not inherit the console's own `RUST_LOG` (the container image sets one that names only the console, which
+silenced every line the node wrote); give the node one with *Child environment* (`child_env`) if you want a different level.
+
 ![Logs](docs/screenshots/logs.png)
 
 ### Mining
 
-An information page about the Stratum V2 endpoint and the Commons pool: commands to run, no live numbers. Nothing live is
+Shown in the sidebar only once a mining module is installed and on (the sidebar is otherwise Home, Network, Logs, Settings;
+a typed `#mining` without a module shows a note pointing to Settings). An information page about the Stratum V2 endpoint and the Commons pool: commands to run, no live numbers. Nothing live is
 wired to it yet.
 
 ### Status lights
@@ -160,10 +172,10 @@ field.
 ## Umbrel
 
 Commons Node View is in the **Bitcoin Commons community app store**:
-[`BTCDecoded/blvm-umbrel-store`](https://github.com/BTCDecoded/blvm-umbrel-store).
+[`BTCDecoded/commons-umbrel-store`](https://github.com/BTCDecoded/commons-umbrel-store).
 
 1. In umbrelOS open the **App Store**, then **⋯** (top right), then **Community App Stores**.
-2. Add `https://github.com/BTCDecoded/blvm-umbrel-store`.
+2. Add `https://github.com/BTCDecoded/commons-umbrel-store`.
 3. Open **Bitcoin Commons App Store** and install **Commons Node View**.
 
 What you get:
@@ -707,11 +719,11 @@ The page only uses these; they are handy for scripts too.
 
 | Route | Does |
 |---|---|
-| `GET /api/status` | the full snapshot the page renders (sync, peers, disk, feed, health) |
+| `GET /api/status` | the full snapshot the page renders (sync, peers, disk, feed, health). `disk_used_*` is the chain size and `disk_used_source` says where it comes from: `"folder"` (measured, always in managed mode) or `"node"` (the node's own figure, an estimate in the official release) |
 | `POST /api/connect` `{"rpc":"host:port"}` | point the console at another node |
 | `POST /api/node` `{"action":"toggle"}` | start or stop the node process |
 | `POST /api/rpc` `{"method":…,"params":[…]}` | pass-through for peer settings: `addnode`, `setban`, `clearbanned`, `disconnectnode`, `setnetworkactive` |
-| `GET /api/status` (more) | adds `mode`, `setup_done`, `managed` (process state, pid, network or `null` before one is chosen, data root, free disk, `networks[]` with `bytes`, `has_data`, `last_height`, `last_used`, `switch`, node version, crash log; `null` when standalone), `modules_pages`, `bundle_available`, `blvm_version_seen` |
+| `GET /api/status` (more) | adds `mode`, `setup_done`, `managed` (process state, pid, network or `null` before one is chosen, data root, free disk, `networks[]` with `bytes`, `has_data`, `last_height`, `last_used`, `switch`, node version, crash log; `null` when standalone), `modules_pages` (page ids of installed and enabled modules; `[]` while nothing can be installed), `show_logs`, `bundle_available`, `blvm_version_seen` |
 | `POST /api/node` `{"action":"start"\|"stop"\|"restart"\|"toggle"}` | managed: returns at once, watch `managed.process.state`. Also `POST /api/node/start`, `/stop`, `/restart` |
 | `GET /api/node/logs?after=<seq>&limit=200` | managed: `{lines:[{seq,text}],file}` from the in-memory tail of `node.log` (`lines=` also works); 404 when standalone |
 | `GET /api/settings` | `console.json` as the console sees it (effective values, `env_locked`) |
@@ -719,7 +731,7 @@ The page only uses these; they are handy for scripts too.
 | `POST /api/node/install` `{"tag"?:"v0.1.60","version"?:"0.1.60","downgrade"?:false}` | start the first install (newest release when no tag): `202 {ok:true,job}`; `409 {ok:false,error:"busy"}` while a job runs; `400 {ok:false,error}` in plain words (unsupported platform, nothing to install, already installed, `BLVM_UI_NODE_BIN` set, bad tag, offline, a tag GitHub does not know: `code:"no_such_release"`, an older tag than the installed one without `downgrade:true`: `code:"downgrade"`) |
 | `POST /api/node/update` same body | update an installed release; also `400` when nothing was installed by the console, or the channel is `off`/`store` |
 | `GET /api/node/install` (also `/api/node/update`) | the last job until a new one starts: `{phase:"idle"\|"download"\|"verify"\|"test"\|"install"\|"restart"\|"done"\|"failed", tag, bytes, total, error, rolled_back}` (also under `job`, with `kind`, `started`, `finished`). The same fields are in `managed.update` (with `available`, `latest`, `channel`) while a job runs and for 30 s after |
-| `PUT` or `POST /api/settings` | patch: `mode`, `network`, `data_root`, `node_bin`, `rpc`, `rpc_overrides`, `start_on_boot` (alias `start_on_launch`; default on in managed mode), `stop_node_on_exit` (`keep_node_running_on_exit` is its inverse), `modules_disabled`, `updates`, `assume_valid`, `child_env`. `setup_done: true` alone just marks the setup as done (what *Skip* sends on Umbrel). Mode, network, data root and binary can only change while the node is stopped (409), and not while an install or update runs and not when an environment variable pins them (409) |
+| `PUT` or `POST /api/settings` | patch: `mode`, `network`, `data_root`, `node_bin`, `rpc`, `rpc_overrides`, `start_on_boot` (alias `start_on_launch`; default on in managed mode), `stop_node_on_exit` (`keep_node_running_on_exit` is its inverse), `show_logs` (the Logs page switch, default `false`), `modules_disabled`, `updates`, `assume_valid`, `child_env`. `setup_done: true` alone just marks the setup as done (what *Skip* sends on Umbrel). Mode, network, data root and binary can only change while the node is stopped (409), and not while an install or update runs and not when an environment variable pins them (409) |
 | `POST /api/setup` `{"mode":"managed","network":"regtest","data_root"?,"node_bin"?,"start":bool,"stop_on_exit":bool}` | the wizard's result: validates (managed needs a network; a binary only when `start` is true, so a setup that only records the choice works before a program is downloaded; standalone may carry `rpc`), writes `console.json`, creates the folders, starts the node only when `start` is true, and remembers whether the node was to run. Refused with 409 while an install or update runs |
 | `POST /api/setup/test` `{"rpc":"host:port","user"?,"pass"?}` | one RPC check: `{ok,chain,height,version,error}` |
 | `GET /api/network/preview?to=signet` (or `POST` with `{"to":"signet"}` / `{"network":"signet"}`) | managed: what the switch dialog shows: `{from,to,from_bytes,to_bytes,from_height,to_height,to_last_used,from_ibd_pct,free_bytes,estimate_bytes,blocked,warnings[],allowed,reason}`. `allowed:false` carries the plain reason (same network, a switch running, under 5 GB free, no network chosen). 404 when standalone, 400 for an unknown network |

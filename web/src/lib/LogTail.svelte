@@ -21,7 +21,9 @@
 
   async function poll() {
     try {
-      const d = await fetchLogs(lastSeq);
+      // The first request asks for the last 500 lines (what was written before the page opened); later ones for
+      // everything new since the last line seen.
+      const d = await fetchLogs(lastSeq, lastSeq === undefined ? 500 : 1000);
       err = "";
       file = d.file || file;
       if (d.lines.length) {
