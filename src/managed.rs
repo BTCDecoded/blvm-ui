@@ -1509,7 +1509,8 @@ mod tests {
         if env.data_root.is_none() {
             env.data_root = Some(dir.join("root").display().to_string());
         }
-        let console = Console::load(Some(dir.join("state")), env, None);
+        let mut console = Console::load(Some(dir.join("state")), env, None);
+        crate::agent::testkit::isolate(&mut console); // free ports, never the networks' own
         let mut live = LiveState::new(console.initial_rpc());
         live.console = console;
         let _reap = crate::agent::testkit::ReapNodes::under(&dir);
@@ -1536,7 +1537,7 @@ mod tests {
         // Once a network is chosen, polling follows it.
         let (code, _) = patch_settings(&f.state, &json!({"network":"regtest"})).await;
         assert_eq!(code, 200);
-        assert_eq!(f.state.read().await.rpc_addr, "127.0.0.1:18443");
+        assert_eq!(f.state.read().await.rpc_addr, crate::agent::testkit::rpc_of(&f.state, "regtest").await);
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
@@ -1594,7 +1595,7 @@ mod tests {
         assert_eq!(v["status"]["managed"]["process"]["state"], "stopped");
         assert_eq!(v["status"]["managed"]["network"], "regtest");
         assert_eq!(v["status"]["setup_done"], true);
-        assert_eq!(v["status"]["rpc_addr"], "127.0.0.1:18443");
+        assert_eq!(v["status"]["rpc_addr"], crate::agent::testkit::rpc_of(&f.state, "regtest").await);
         assert!(f.dir.join("root/networks/regtest/logs").is_dir());
         let saved = settings::load_console(&f.dir.join("state"));
         assert!(saved.setup_done);
@@ -1619,12 +1620,13 @@ mod tests {
         let f = fixture("sa", EnvOverrides::default(), false);
         let (code, v) = setup(&f.state, &json!({"mode":"standalone","rpc":"nonsense"})).await;
         assert_eq!(code, 400, "{v}");
-        let (code, v) = setup(&f.state, &json!({"mode":"standalone","rpc":"127.0.0.1:8332"})).await;
+        let target = format!("127.0.0.1:{}", crate::agent::testkit::free_port());
+        let (code, v) = setup(&f.state, &json!({"mode":"standalone","rpc":target})).await;
         assert_eq!(code, 200, "{v}");
         assert_eq!(v["status"]["mode"], "standalone");
         assert_eq!(v["status"]["managed"], Value::Null);
-        assert_eq!(v["status"]["rpc_addr"], "127.0.0.1:8332");
-        assert_eq!(settings::load_console(&f.dir.join("state")).rpc.as_deref(), Some("127.0.0.1:8332"));
+        assert_eq!(v["status"]["rpc_addr"], target.as_str());
+        assert_eq!(settings::load_console(&f.dir.join("state")).rpc.as_deref(), Some(target.as_str()));
         // Skip: standalone with the current target.
         let (code, v) = setup(&f.state, &json!({"mode":"standalone"})).await;
         assert_eq!(code, 200, "{v}");
@@ -1694,7 +1696,11 @@ mod tests {
         agent.stop_and_wait().await;
         let (code, v) = patch_settings(&f.state, &json!({"network":"signet"})).await;
         assert_eq!(code, 200, "{v}");
-        assert_eq!(f.state.read().await.rpc_addr, "127.0.0.1:38332", "polling follows the network");
+        assert_eq!(
+            f.state.read().await.rpc_addr,
+            crate::agent::testkit::rpc_of(&f.state, "signet").await,
+            "polling follows the network"
+        );
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
@@ -1937,10 +1943,10 @@ mod tests {
 
     #[test]
     fn rpc_address_validation() {
-        for ok in ["127.0.0.1:8332", "localhost:48332", "my-node.local:1", "[::1]:8332", "host_name:65535"] {
+        for ok in ["127.0.0.1:4242", "localhost:4243", "my-node.local:1", "[::1]:4242", "host_name:65535"] {
             assert!(valid_rpc_addr(ok), "{ok}");
         }
-        for bad in ["", "8332", "host", "host:", "host:0", "host:70000", ":8332", "http://h:1", "a b:1", "h:1/x", "[::1:8332"] {
+        for bad in ["", "4242", "host", "host:", "host:0", "host:70000", ":4242", "http://h:1", "a b:1", "h:1/x", "[::1:4242"] {
             assert!(!valid_rpc_addr(bad), "{bad}");
         }
     }
@@ -2009,7 +2015,7 @@ mod tests {
         let (code, _) = patch_settings(&f.state, &json!({"network":"regtest"})).await;
         assert_eq!(code, 200);
         {
-            // Something answers on 127.0.0.1:18443 (another node), so the last poll was live.
+            // Something answers on regtest's RPC address (another node), so the last poll was live.
             let mut g = f.state.write().await;
             g.snapshot.connected = true;
             g.snapshot.blvm_version = "v0.1.13".into();
@@ -2232,8 +2238,20 @@ mod tests {
         };
         settings::save_console(&dir.join("state"), &saved).unwrap();
         // No env mode: the saved file alone says "managed", as after a restart of the app.
-        let c = Console::load(Some(dir.join("state")), env, None);
+        // An external agent (another container) is not started from here: its tests keep the network's own port.
+        let c = load_in(&dir, env);
         (dir, c)
+    }
+
+    /// A console on `dir`'s saved state, as the next run of the app loads it: on free ports (the networks' own
+    /// stay free for the person running the tests), unless its agent is another container's.
+    fn load_in(dir: &Path, env: EnvOverrides) -> Console {
+        let external = env.agent_external;
+        let mut c = Console::load(Some(dir.join("state")), env, None);
+        if !external {
+            crate::agent::testkit::isolate(&mut c);
+        }
+        c
     }
 
     fn shared(c: Console) -> Shared {
@@ -2250,7 +2268,8 @@ mod tests {
         assert!(c.eff.setup_done, "no wizard on a configured console");
         assert!(c.settings.start_on_boot_effective(true), "start on boot is the managed default");
         assert_eq!(c.network().map(|n| n.id), Some("regtest"));
-        assert_eq!(c.initial_rpc(), "127.0.0.1:18443");
+        assert_eq!(c.initial_rpc(), c.rpc_for(networks::by_id("regtest").unwrap()));
+        assert!(c.initial_rpc().starts_with("127.0.0.1:"));
         let state = shared(c);
         {
             let mut g = state.write().await;
@@ -2277,7 +2296,7 @@ mod tests {
             node_bin: Some(dir.join("fake-blvm.sh").display().to_string()),
             ..Default::default()
         };
-        let state2 = shared(Console::load(Some(dir.join("state")), env, None));
+        let state2 = shared(load_in(&dir, env));
         boot(&state2).await;
         let agent2 = state2.read().await.console.agent.clone().unwrap();
         assert_eq!(agent2.state(), ProcState::Stopped);
@@ -2295,7 +2314,7 @@ mod tests {
             data_root: Some(dir.join("root").display().to_string()),
             ..Default::default()
         };
-        let state = shared(Console::load(Some(dir.join("state")), env, None));
+        let state = shared(load_in(&dir, env));
         boot(&state).await;
         let agent = state.read().await.console.agent.clone().unwrap();
         assert_eq!(agent.state(), ProcState::Stopped, "no crash banner for a node that was never installed");
@@ -2309,7 +2328,7 @@ mod tests {
         let (dir, c) = saved_console("ext", env);
         assert!(c.is_external());
         // The poll target is the other container, on the network's own RPC port.
-        assert_eq!(c.initial_rpc(), "node.internal:18443");
+        assert_eq!(c.initial_rpc(), format!("node.internal:{}", networks::by_id("regtest").unwrap().rpc_port));
         let state = shared(c);
         let root = dir.join("root");
         // The agent already runs the node (what it wrote before the console restarted): adopt, write nothing.
@@ -2353,11 +2372,12 @@ mod tests {
         let base = EnvOverrides { mode: Some("managed".into()), ..Default::default() };
         let regtest = networks::by_id("regtest").unwrap();
         let c = Console::load(None, base.clone(), None);
-        assert_eq!(c.rpc_for(regtest), "127.0.0.1:18443", "in-process: loopback");
+        let port = regtest.rpc_port;
+        assert_eq!(c.rpc_for(regtest), format!("127.0.0.1:{port}"), "in-process: loopback");
         let c = Console::load(None, EnvOverrides { agent_external: true, ..base.clone() }, None);
-        assert_eq!(c.rpc_for(regtest), "btc-commons-node-view_agent_1:18443");
+        assert_eq!(c.rpc_for(regtest), format!("btc-commons-node-view_agent_1:{port}"));
         let c = Console::load(None, EnvOverrides { agent_external: true, node_host: Some("agent.local".into()), ..base.clone() }, None);
-        assert_eq!(c.rpc_for(regtest), "agent.local:18443");
+        assert_eq!(c.rpc_for(regtest), format!("agent.local:{port}"));
         // An override in the settings still wins.
         let mut c = Console::load(None, EnvOverrides { agent_external: true, ..base.clone() }, None);
         c.settings.rpc_overrides.insert("regtest".into(), "10.0.0.7:1234".into());
@@ -2519,7 +2539,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blvm-review-skip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let env = EnvOverrides { mode: Some("managed".into()), agent_external: true, data_root: Some(dir.join("root").display().to_string()), ..Default::default() };
-        let state = shared(Console::load(Some(dir.join("state")), env, None));
+        let state = shared(load_in(&dir, env));
         let (code, v) = setup(&state, &json!({"mode": "standalone", "start": false, "stop_on_exit": true, "modules": []})).await;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(code, 409);
@@ -2555,7 +2575,7 @@ mod tests {
         assert_eq!(console_json(&dir).await.node_wanted, Some(false), "saved at once");
 
         // The app starts again: "start when the console opens" is on (the default) but the node stays off.
-        let state2 = shared(Console::load(Some(dir.join("state")), reload_env(&dir), None));
+        let state2 = shared(load_in(&dir, reload_env(&dir)));
         assert!(state2.read().await.console.settings.start_on_boot_effective(true));
         boot(&state2).await;
         let agent2 = state2.read().await.console.agent.clone().unwrap();
@@ -2566,7 +2586,7 @@ mod tests {
         assert!(out.ok, "{out:?}");
         assert_eq!(console_json(&dir).await.node_wanted, Some(true));
         agent2.stop_and_wait().await; // (the process goes, the wish stays: a quit is not a Stop)
-        let state3 = shared(Console::load(Some(dir.join("state")), reload_env(&dir), None));
+        let state3 = shared(load_in(&dir, reload_env(&dir)));
         boot(&state3).await;
         let agent3 = state3.read().await.console.agent.clone().unwrap();
         assert_eq!(agent3.state(), ProcState::Starting, "start -> restart -> running");
@@ -2578,7 +2598,7 @@ mod tests {
             g.console.settings.start_on_boot = Some(false);
             g.console.save().unwrap();
         }
-        let state4 = shared(Console::load(Some(dir.join("state")), reload_env(&dir), None));
+        let state4 = shared(load_in(&dir, reload_env(&dir)));
         boot(&state4).await;
         assert_eq!(state4.read().await.console.agent.clone().unwrap().state(), ProcState::Stopped);
         let _ = std::fs::remove_dir_all(dir);
@@ -2651,8 +2671,8 @@ mod tests {
     /// `console.json` holds no login; the new console generates one at load.
     #[tokio::test]
     async fn an_old_install_gets_its_open_node_restarted_with_a_password_and_the_login_saved() {
-        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let rpc = free().to_string();
+        let (rpc_port, p2p) = crate::agent::testkit::free_port_pair();
+        let rpc = format!("127.0.0.1:{rpc_port}");
         let dir = std::env::temp_dir().join(format!("blvm-managed-r2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2675,7 +2695,6 @@ mod tests {
         settings::save_console(&dir.join("state"), &old).unwrap();
         assert_eq!(settings::load_console(&dir.join("state")).rpc_pass, None);
         // The node the old console started (it has no login) and that outlived it.
-        let p2p = free().port();
         let old_cfg = AgentConfig {
             bin: Some(bin.clone()),
             root: root.clone(),
@@ -2777,7 +2796,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blvm-skip-umbrel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let env = EnvOverrides { mode: Some("managed".into()), agent_external: true, data_root: Some(dir.join("root").display().to_string()), ..Default::default() };
-        let state = shared(Console::load(Some(dir.join("state")), env, None));
+        let state = shared(load_in(&dir, env));
         assert!(!state.read().await.console.eff.setup_done, "fresh Umbrel install: the wizard shows");
         let (code, v) = patch_settings(&state, &json!({"setup_done": true})).await;
         assert_eq!(code, 200, "{v}");
@@ -2829,7 +2848,7 @@ mod tests {
         let mode = std::fs::metadata(dir.join("state/console.json")).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the file holds a password");
         // ... and the next run of the console finds the same one (a node it adopts keeps working).
-        let again = Console::load(Some(dir.join("state")), reload_env(&dir), None);
+        let again = load_in(&dir, reload_env(&dir));
         assert_eq!(again.rpc_auth(), Some(auth.clone()));
         // The page never sees it.
         let shown = settings_json(&again).to_string();

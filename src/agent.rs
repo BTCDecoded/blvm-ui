@@ -2113,6 +2113,42 @@ pub(crate) mod testkit {
         script
     }
 
+    /// A free loopback port, picked by the system (bind to port 0, read it back, let go). Every test that
+    /// starts a node or binds a listener takes its ports from here: the networks' own ports may be held by a
+    /// node of the person running the tests, and a test must not depend on them being free.
+    pub(crate) fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// Two different free loopback ports (the RPC and the peer-to-peer port of one node).
+    pub(crate) fn free_port_pair() -> (u16, u16) {
+        // Hold both listeners until both are known, so the two cannot be the same port.
+        let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        (a.local_addr().unwrap().port(), b.local_addr().unwrap().port())
+    }
+
+    /// Point a test console at free ports only: every network's RPC address is an override on a free loopback
+    /// port (an override already there stays), and the node's peer-to-peer port is a free one. Without this a
+    /// test would start a node on the network's own ports (regtest: 18443 and 18444).
+    pub(crate) fn isolate(console: &mut crate::managed::Console) {
+        for n in crate::networks::ALL {
+            console
+                .settings
+                .rpc_overrides
+                .entry(n.id.to_string())
+                .or_insert_with(|| format!("127.0.0.1:{}", free_port()));
+        }
+        console.p2p_port = Some(free_port());
+        console.reresolve();
+    }
+
+    /// Where a test console polls `net` (its override, which `isolate` put there).
+    pub(crate) async fn rpc_of(state: &crate::state::Shared, net: &str) -> String {
+        let g = state.read().await;
+        g.console.rpc_for(crate::networks::by_id(net).unwrap())
+    }
+
     /// Put one in the fixture of a test: kills the nodes started under `dir` when it is dropped.
     pub(crate) struct ReapNodes(PathBuf);
 
@@ -2747,16 +2783,16 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
 
     #[test]
     fn exposed_addresses_are_everything_but_loopback() {
-        for open in ["0.0.0.0:8332", "10.0.0.7:8332", "node.internal:8332", "[::]:8332", "btc-commons-node-view_agent_1:48332"] {
+        for open in ["0.0.0.0:4242", "10.0.0.7:4242", "node.internal:4242", "[::]:4242", "btc-commons-node-view_agent_1:4243"] {
             assert!(rpc_exposed(open), "{open}");
         }
-        for local in ["127.0.0.1:8332", "127.5.5.5:1", "localhost:8332", "[::1]:8332"] {
+        for local in ["127.0.0.1:4242", "127.5.5.5:1", "localhost:4242", "[::1]:4242"] {
             assert!(!rpc_exposed(local), "{local}");
         }
-        assert_eq!(probe_addr("0.0.0.0:48332"), "127.0.0.1:48332");
-        assert_eq!(probe_addr("[::]:48332"), "127.0.0.1:48332");
-        assert_eq!(probe_addr("10.0.0.7:48332"), "10.0.0.7:48332", "a specific bind address is dialled as it is");
-        assert_eq!(probe_addr("127.0.0.1:18443"), "127.0.0.1:18443");
+        assert_eq!(probe_addr("0.0.0.0:4243"), "127.0.0.1:4243");
+        assert_eq!(probe_addr("[::]:4243"), "127.0.0.1:4243");
+        assert_eq!(probe_addr("10.0.0.7:4243"), "10.0.0.7:4243", "a specific bind address is dialled as it is");
+        assert_eq!(probe_addr("127.0.0.1:4244"), "127.0.0.1:4244");
     }
 
     #[tokio::test]
@@ -2864,14 +2900,10 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         c
     }
 
-    fn free_addr() -> String {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().to_string()
-    }
+    use testkit::free_port;
 
-    fn free_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
+    fn free_addr() -> String {
+        format!("127.0.0.1:{}", free_port())
     }
 
     #[tokio::test]

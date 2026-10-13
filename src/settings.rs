@@ -492,7 +492,7 @@ mod console_tests {
     #[test]
     fn setup_done_rules() {
         // Env RPC or mode skips the wizard for standalone installs.
-        let env = EnvOverrides { rpc: Some("127.0.0.1:8332".into()), ..Default::default() };
+        let env = EnvOverrides { rpc: Some("127.0.0.1:4242".into()), ..Default::default() };
         assert!(resolve(&ConsoleSettings::default(), &env, None).setup_done);
         let env = EnvOverrides { mode: Some("standalone".into()), ..Default::default() };
         assert!(resolve(&ConsoleSettings::default(), &env, None).setup_done);
