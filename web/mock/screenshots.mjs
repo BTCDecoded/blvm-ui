@@ -4,7 +4,7 @@
 //
 // Uses a Chromium-family browser already on this machine (no browser download).
 // Set BROWSER_PATH to pick one explicitly. SCREENSHOT_DIR overrides the output folder,
-// SCREENSHOT_SIZE the window (default 1920x1080; Umbrel's store gallery uses 1440x900).
+// SCREENSHOT_ONLY=a,b limits the run to those scenarios, SCREENSHOT_SIZE the window (default 1920x1080; Umbrel's store gallery uses 1440x900).
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
@@ -81,6 +81,51 @@ const SYNCED = [
   ["mining-stratum-v2", "mining", card("Stratum V2")],
 ];
 
+// Managed-node screens (design G, K, L). The optional 4th item prepares the page (clicks) before the shot.
+const click = (text) => async (page) => {
+  await page.getByRole("button", { name: text }).first().click();
+  await page.waitForTimeout(400);
+};
+const steps = (...fns) => async (page) => {
+  for (const f of fns) await f(page);
+};
+const pickNet = (label) => async (page) => {
+  // Neighbouring cards overlap, so a pointer click lands on the front one: click the element itself.
+  await page.locator(".net", { hasText: label }).first().evaluate((el) => el.click());
+  await page.waitForTimeout(1600);
+};
+
+const FIRST_RUN = [
+  ["setup-welcome", "home", null],
+  ["setup-network", "home", null, steps(click("Set up"), click("Run a node for me"), click("Next"))],
+  ["setup-network-picked", "home", null, steps(click("Set up"), click("Next"), click("Signet"))],
+  ["setup-existing-node", "home", null, steps(click("Set up"), click("Connect to my existing node"))],
+];
+const MANAGED_RUNNING = [
+  ["managed-settings", "settings", null],
+  ["managed-node", "settings", card("Node")],
+  ["managed-network", "settings", card("Network")],
+  // Modules and Updates cards are shown from the MOCK-ONLY scenarios below (the host has no such routes yet).
+  ["managed-logs", "logs", null],
+  ["managed-switch-confirm", "settings", "dialog[open]", pickNet("Signet")],
+];
+const SWITCHING = [["managed-switching", "settings", card("Network")]];
+const STOPPED = [["managed-stopped", "settings", null]];
+const CRASHED = [["managed-crashed", "settings", card("Node")]];
+const CONFLICT = [["managed-port-conflict", "settings", card("Node")]];
+const UPDATE = [["managed-update-available", "settings", card("Updates")]];
+const UPDATES_OFF = [["managed-updates-store", "settings", card("Updates")]];
+// Umbrel-style first run with no node program: welcome, network, then the "Get the node" step (design K).
+const pickChoice = (label) => async (page) => {
+  await page.locator(".choice", { hasText: label }).first().click();
+  await page.waitForTimeout(300);
+};
+const NO_BINARY = [
+  ["setup-get-node", "home", ".setup", steps(click("Set up"), pickChoice("Signet"), click("Next"))],
+  ["setup-get-node-downloading", "home", ".setup", steps(click("Set up"), pickChoice("Signet"), click("Next"), click("Download"))],
+];
+const MODULES = [["managed-modules-installed", "settings", card("Modules")], ["managed-mining", "mining", null]];
+
 const SYNCING = [
   ["ibd-home", "home", null],
   ["ibd-insights", "insights", null],
@@ -89,6 +134,7 @@ const SYNCING = [
   ["ibd-insights-block-arrival", "insights", ".arrival"],
 ];
 
+const ONLY = process.env.SCREENSHOT_ONLY ? process.env.SCREENSHOT_ONLY.split(",") : null;
 const [W, H] = (process.env.SCREENSHOT_SIZE || "1920x1080").split("x").map(Number);
 const VIEWPORTS = [{ tag: String(W), width: W, height: H }];
 
@@ -101,15 +147,18 @@ async function shoot(browser, vp, shots) {
   });
   const page = await ctx.newPage();
   let at = "";
-  for (const [name, hash, target] of shots) {
-    if (at !== hash) {
+  for (const [name, hash, target, prepare] of shots) {
+    // A shot that clicks around starts from a fresh load of its page.
+    const key = prepare ? `${hash}:${name}` : hash;
+    if (at !== key) {
       await page.goto(`${BASE}/#${hash}`);
       await page.reload();
       await page.evaluate(() => document.fonts.ready);
       // Globe texture, block tiles and entry animations settle.
       await page.waitForTimeout(hash === "home" ? 3500 : 1500);
-      at = hash;
+      at = key;
     }
+    if (prepare) await prepare(page);
     await page.mouse.move(0, vp.height - 1);
     const file = join(OUT, `${name}-${vp.tag}.png`);
     if (target) {
@@ -127,18 +176,30 @@ async function shoot(browser, vp, shots) {
 const server = await startMock();
 let browser;
 try {
-  rmSync(OUT, { recursive: true, force: true });
+  // SCREENSHOT_ONLY=managed-running,modules limits the run to those scenarios and keeps the other images.
+  if (!ONLY) rmSync(OUT, { recursive: true, force: true });
   mkdirSync(OUT, { recursive: true });
   browser = await chromium.launch({
     executablePath: findBrowser(),
     headless: true,
     args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--hide-scrollbars"],
   });
-  for (const [scenario, shots] of [
+  for (const [scenario, shots, extra = "&slow=1"] of [
     ["synced", SYNCED],
     ["ibd", SYNCING],
+    ["first-run", FIRST_RUN],
+    ["managed-running", MANAGED_RUNNING],
+    ["managed-switching", SWITCHING, "&slow=20"],
+    ["managed-stopped", STOPPED],
+    ["managed-crashed", CRASHED],
+    ["port-conflict", CONFLICT],
+    ["update-available", UPDATE],
+    ["updates-off", UPDATES_OFF],
+    ["managed-no-binary", NO_BINARY, "&slow=1&external=1"],
+    ["modules", MODULES],
   ]) {
-    const st = await mock(`scenario=${scenario}&live=0`);
+    if (ONLY && !ONLY.includes(scenario)) continue;
+    const st = await mock(`scenario=${scenario}&live=0${extra}`);
     console.log(`${scenario}: height ${st.height.toLocaleString("en-US")} / tip ${st.tip.toLocaleString("en-US")}`);
     for (const vp of VIEWPORTS) await shoot(browser, vp, shots);
   }

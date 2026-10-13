@@ -1,11 +1,25 @@
 <script lang="ts">
   import { connectTo, toggleNode } from "./api";
+  import { installedVersion, nodeReports, nodeVersion } from "./format";
   import Icon from "./Icon.svelte";
   import Light from "./Light.svelte";
+  import ModulesCard from "./ModulesCard.svelte";
   import NetCarousel from "./NetCarousel.svelte";
-  import { setPage, ui } from "./status.svelte";
+  import NetworkCard from "./NetworkCard.svelte";
+  import NodeCard from "./NodeCard.svelte";
+  import { fmtBytes, networkLabel } from "./networks";
+  import { isManaged, setPage, ui } from "./status.svelte";
+  import UpdatesCard from "./UpdatesCard.svelte";
 
   const s = $derived(ui.snap);
+  // Managed mode (design A): only when the host says so. An older host never does.
+  const managed = $derived(isManaged(s));
+  const ver = $derived(nodeVersion(s));
+  // Managed: one version for the node program, the same as the Node card (design M.3). What the node says
+  // over RPC is a second, muted line while it answers (M.5); standalone keeps the old single line.
+  const installed = $derived(installedVersion(s.managed));
+  const reports = $derived(nodeReports(s, installed));
+  const stored = $derived((s.managed?.networks ?? []).filter((n) => n.bytes > 0 || n.has_data));
   const presets = [
     { rpc: "127.0.0.1:8332", chain: "main", label: "Mainnet" },
     { rpc: "127.0.0.1:48332", chain: "testnet4", label: "Testnet4" },
@@ -25,6 +39,7 @@
   });
 
   const connectHint = $derived.by(() => {
+    if (managed && s.managed?.network === null) return "No network chosen yet, so there is nothing to connect to.";
     if (s.connected || s.node_running) return `Using ${s.rpc_addr}.`;
     if (s.frozen) {
       return s.network && s.network !== "—"
@@ -94,19 +109,36 @@
           <span class="ui-chip"><Light health={s.health} /> {connectLabel}</span>
         </div>
         <p class="ui-lead">
-          This console talks to a local BLVM node over stock JSON-RPC. It auto-connects. Point it at another
-          address if your node runs on a different port.
+          {#if managed}
+            This console talks to the node it runs over stock JSON-RPC. The address follows the network you pick below.
+          {:else}
+            This console talks to a local BLVM node over stock JSON-RPC. It auto-connects. Point it at another
+            address if your node runs on a different port.
+          {/if}
         </p>
         <form class="pt-5" onsubmit={onConnect}>
           <label class="ui-label" for="rpc-addr">RPC Address</label>
           <div class="flex flex-wrap gap-2">
-            <input id="rpc-addr" class="ui-input font-mono" bind:value={rpcInput} spellcheck="false" autocomplete="off" />
-            <button type="submit" class="ui-btn" disabled={connecting || !rpcInput.trim()}>Connect</button>
+            <input
+              id="rpc-addr"
+              class="ui-input font-mono"
+              bind:value={rpcInput}
+              spellcheck="false"
+              autocomplete="off"
+              readonly={managed}
+            />
+            {#if !managed}
+              <button type="submit" class="ui-btn" disabled={connecting || !rpcInput.trim()}>Connect</button>
+            {/if}
           </div>
           <p class="ui-note mt-3">{connectMsg || connectHint}</p>
         </form>
       </article>
 
+      {#if managed}
+        <NetworkCard />
+        <ModulesCard />
+      {:else}
       <article class="panel ui-card grow">
         <div class="ui-head">
           <h2 class="ui-title"><Icon name="network" class="h-5 w-5 text-muted" /> Console Target</h2>
@@ -119,9 +151,14 @@
           <NetCarousel nets={presets} current={s.rpc_addr} busy={connecting} onpick={(rpc) => target(rpc)} />
         </div>
       </article>
+      {/if}
     </div>
 
     <div class="settings-col">
+      {#if managed}
+        <NodeCard />
+        <UpdatesCard />
+      {:else}
       <article class="panel ui-card">
         <div class="ui-head">
           <h2 class="ui-title"><Icon name="power" class="h-5 w-5 text-muted" /> Node Process</h2>
@@ -143,7 +180,14 @@
             {s.node_power_label}
           </button>
         </div>
+        {#if s.bundle_available}
+          <p class="ui-note mt-4">
+            A node program came with this console.
+            <button type="button" class="ui-link" onclick={() => (ui.setupOpen = true)}>Use a managed node</button>
+          </p>
+        {/if}
       </article>
+      {/if}
 
       <article class="panel ui-card grow">
         <div class="ui-head">
@@ -152,8 +196,21 @@
         <dl class="about">
           <div><dt>Chain</dt><dd>{s.network && s.network !== "—" ? s.network : "—"}</dd></div>
           <div><dt>Node RPC</dt><dd class="font-mono text-[0.9rem]">{s.rpc_addr}</dd></div>
-          <div><dt>BLVM Version</dt><dd>{s.blvm_version}</dd></div>
-          <div><dt>Console</dt><dd>Commons UI {s.ui_version}</dd></div>
+          <div>
+            <dt>BLVM Version</dt>
+            <dd>
+              {#if managed && s.managed}
+                {installed.text}
+                {#if installed.custom}<span class="ui-chip">Custom build</span>{/if}
+                {#if reports}<span class="ui-seen ml-2">{reports}</span>
+                {:else if ver.seen}<span class="ui-seen ml-2">{ver.seen}</span>{/if}
+              {:else}
+                {ver.text}
+                {#if ver.seen}<span class="ui-seen ml-2">{ver.seen}</span>{/if}
+              {/if}
+            </dd>
+          </div>
+          <div><dt>Console</dt><dd>Commons Node View {s.ui_version}</dd></div>
           <div><dt>Console Uptime</dt><dd>{s.ui_uptime}</dd></div>
           <div><dt>Last Check</dt><dd>{s.last_check}</dd></div>
           <div>
@@ -165,11 +222,31 @@
             </dd>
           </div>
         </dl>
+        {#if managed && s.managed}
+          <p class="ui-sub mt-4">Storage</p>
+          <dl class="about">
+            {#each stored as n (n.id)}
+              <div><dt>{networkLabel(n.id)}</dt><dd>{fmtBytes(n.bytes)}</dd></div>
+            {:else}
+              <div><dt>Networks</dt><dd>No data yet</dd></div>
+            {/each}
+            <div><dt>Free disk</dt><dd>{fmtBytes(s.managed.free_bytes)}</dd></div>
+            <div><dt>Data folder</dt><dd class="font-mono text-[0.9rem]" title={s.managed.data_root}>{s.managed.data_root}</dd></div>
+          </dl>
+        {/if}
         <p class="ui-note mt-auto pt-4">
-          Changing the node's chain means restarting it with a different network. This console never rewrites the
-          datadir. Peers and bans live on the
+          {#if managed}
+            Switching networks keeps each one's data on disk. This console never deletes a network's data.
+          {:else}
+            Changing the node's chain means restarting it with a different network. This console never rewrites the
+            datadir.
+          {/if}
+          Peers and bans live on the
           <button type="button" class="text-orange hover:underline" onclick={() => setPage("network")}>Network</button>
           page.
+          {#if s.mode !== undefined}
+            <button type="button" class="ui-link" onclick={() => (ui.setupOpen = true)}>Run setup again</button>
+          {/if}
         </p>
       </article>
     </div>
@@ -181,6 +258,9 @@
     display: grid;
     flex: 1 1 auto;
     gap: 0.75rem;
+    /* One column that may shrink below its content (an implicit "auto" track grows to the widest card). */
+    grid-template-columns: minmax(0, 1fr);
+    min-width: 0;
   }
   @media (min-width: 1024px) {
     .settings-grid {
@@ -188,6 +268,7 @@
     }
   }
   .settings-col {
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
@@ -206,31 +287,6 @@
     align-items: center;
     justify-content: space-between;
     gap: 1rem;
-  }
-  .power-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    border-radius: 0.65rem;
-    padding: 0.65rem 1.1rem;
-    font-size: 0.95rem;
-    font-weight: 500;
-    transition: opacity 0.15s, background 0.15s;
-  }
-  .power-btn.is-start {
-    background: var(--color-good);
-    color: var(--color-bg);
-  }
-  .power-btn.is-stop {
-    border: 1px solid rgb(224 91 85 / 0.6);
-    color: var(--color-dead);
-  }
-  .power-btn.is-stop:hover {
-    background: rgb(224 91 85 / 0.1);
-  }
-  .power-btn:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
   }
   .about {
     font-size: 1.02rem;
@@ -254,5 +310,23 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  @media (max-width: 767px) {
+    .settings-col > :global(.ui-card) {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+    }
+    .about > div {
+      flex-wrap: wrap;
+      gap: 0.15rem 1rem;
+    }
+    /* Long values (data folder, versions) wrap instead of being cut off. */
+    .about dd {
+      max-width: 100%;
+      overflow: visible;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
   }
 </style>

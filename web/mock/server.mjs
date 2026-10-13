@@ -5,24 +5,52 @@
 //
 // Env:
 //   MOCK_PORT        listen port (default 3850)
-//   MOCK_SCENARIO    "synced" (default) or "ibd"
+//   MOCK_DIST        folder with the built page (default web/dist)
+//   MOCK_SCENARIO    one of the scenarios below (default "synced")
 //   MOCK_TIP         mainnet tip height; skips the mempool.space lookup
 //   MOCK_BLOCK_SECS  seconds between new blocks when synced (default 60, 0 = frozen)
 //
-// Control (used by the screenshot script):
+// Scenarios. synced and ibd answer like a host from before the managed-node work (no new fields at all);
+// the rest are the managed-node screens with in-memory state,
+// so every button works (see managed.mjs):
+//   first-run          setup wizard (host not set up, a bundled node program exists)
+//   managed-stopped    managed node stopped, NO network chosen yet (the host sends managed.network = null)
+//   port-conflict      managed Testnet4 refused to start: another program (pid 4242, "blvm") holds port 48332
+//   managed-running    managed Mainnet node mid-sync
+//   managed-switching  Mainnet -> Signet switch in progress (phases advance every 3 s; done/failed stay 30 s)
+//   managed-crashed    Testnet4 node crashed, last log lines shown
+//   managed-no-binary  Umbrel-style first run with NO node program on disk: the wizard has a "Get the node" step; the
+//                      mock simulates download, check, test, install over ~6 s, then bundle_available is true
+//                      (external=0 shows the desktop flow, platform_supported=0 the unsupported-platform message)
+//   update-available   running 0.1.59, 0.1.60 is out; Update runs the same job (download, check, test, install, restart)
+//   updates-off        running 0.1.59, channel "store" (Umbrel, BLVM_UI_UPDATES=0): the card says where to update
+//   modules            Stratum V2 installed (Mining appears in the sidebar), ZMQ installed but off   (MOCK-ONLY routes)
+//
+// Host parity. /api/node/releases, /api/node/install (GET job, POST start) and /api/node/update exist in every
+// managed scenario. Routes the Rust host does not have yet (/api/modules*; U5) exist in the mock ONLY in the scenarios
+// marked MOCK-ONLY above (or with &future=1). In every other scenario they answer a JSON 404 like the real host, and
+// modules_pages is the host's constant ["mining"].
+//
+// Control (used by the screenshot script and for hand-testing):
 //   GET /__mock?scenario=ibd&live=0    switch scenario, freeze or unfreeze
+//   extra knobs: fail_verify=1 / fail_test=1 (the next install or update job fails its checksum check / its test run;
+//                an update then reports rolled_back)  channel=self|store|off  platform_supported=0|1  can_install=0|1  platform=aarch64-macos
+//                future=1|0 (turn the not-yet-in-the-host routes on or off)  port_taken=0|1 (the port-conflict program)
+//                slow=20 (stretch every delay)  free_gb=3  custom=1  fail_start=1 (next start crashes)  stop_stuck=1 (next switch cannot stop the old node)  external=1 (with first-run: Umbrel-style)
+//                agent_alive=0 (external only: the node agent's heartbeat is gone)  offline=1 (GitHub cannot be reached; Try again
+//                asks GET /api/node/releases?force=1, counted in force_checks of this answer)
 
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createManaged, NETS } from "./managed.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DIST = join(HERE, "..", "dist");
+const DIST = process.env.MOCK_DIST ? normalize(process.env.MOCK_DIST) : join(HERE, "..", "dist");
 const PORT = Number(process.env.MOCK_PORT || 3850);
 const FALLBACK_TIP = 969_322; // mainnet tip on 2026-09-30
 const BLOCK_SECS = Number(process.env.MOCK_BLOCK_SECS ?? 60);
-const RPC = "127.0.0.1:8332";
 
 // Deterministic randomness so every run (and every screenshot) looks the same.
 function rng(seed) {
@@ -116,9 +144,14 @@ const started = Date.now();
 const NODE_UP_SECS = 12 * 86400 + 7 * 3600 + 41 * 60; // node has been up ~12 days
 const UI_UP_SECS = 3 * 86400 + 2 * 3600 + 18 * 60;
 
+// Tip heights of the networks other than mainnet are invented; mainnet's comes from mempool.space at start.
+const TIPS = { mainnet: FALLBACK_TIP, testnet4: 126_500, testnet: 4_890_000, signet: 288_000, regtest: 150 };
+
 const state = {
-  scenario: process.env.MOCK_SCENARIO === "ibd" ? "ibd" : "synced",
+  scenario: process.env.MOCK_SCENARIO || "synced",
   live: true,
+  net: "mainnet",
+  chainMode: "synced", // "synced" | "ibd": the shape of the chain data below
   tip: FALLBACK_TIP,
   height: FALLBACK_TIP,
   feed: [],
@@ -129,20 +162,24 @@ const state = {
 const block = (h) => ({ kind: "block", start: h, end: h, label: String(h), key: `block:${h}` });
 const chunk = (a, b) => ({ kind: "chunk", start: a, end: b, label: `${a}–${b}`, key: `chunk:${a}:${b}` });
 
-function reset() {
-  if (state.scenario === "synced") {
-    state.height = state.tip;
-    state.feed = Array.from({ length: 24 }, (_, i) => block(state.tip - i));
+/** Loads a network's chain view at `height`: synced when it is at the tip, else mid-IBD. */
+function loadChain(net, height) {
+  state.net = net;
+  state.tip = TIPS[net];
+  state.height = Math.min(height, state.tip);
+  state.chainMode = state.tip - state.height <= 2 ? "synced" : "ibd";
+  state.arrival = Array(12).fill(0);
+  state.feed = [];
+  if (state.chainMode === "synced") {
+    state.feed = Array.from({ length: Math.min(24, state.height + 1) }, (_, i) => block(state.height - i));
     // Blocks per minute over the last 12 minutes: sparse, like the real chain.
     state.arrival = [0, 1, 0, 0, 1, 0, 2, 0, 0, 1, 0, 1];
-  } else {
-    // Mid-IBD: ~84% through, connecting ~40 blocks a second.
-    state.height = Math.round(state.tip * 0.8412);
+  } else if (state.height > 0) {
+    // Mid-IBD: connecting ~40 blocks a second.
     const r = rng(8333);
-    state.feed = [];
     let hi = state.height;
-    for (let i = 0; i < 24; i++) {
-      const n = 32 + Math.floor(r() * 18);
+    for (let i = 0; i < 24 && hi > 0; i++) {
+      const n = Math.min(hi, 32 + Math.floor(r() * 18));
       state.feed.push(chunk(hi - n + 1, hi));
       hi -= n;
     }
@@ -151,12 +188,18 @@ function reset() {
   state.lastStep = Date.now();
 }
 
+function reset() {
+  if (state.scenario === "ibd") loadChain("mainnet", Math.round(FALLBACK_TIP * 0.8412));
+  else loadChain("mainnet", FALLBACK_TIP);
+}
+
 function step() {
-  if (!state.live) return;
+  if (!state.live || !managed.isRunning()) return;
   const now = Date.now();
-  if (state.scenario === "synced") {
+  if (state.chainMode === "synced") {
     if (!BLOCK_SECS || now - state.lastStep < BLOCK_SECS * 1000) return;
     state.tip += 1;
+    TIPS[state.net] = state.tip;
     state.height = state.tip;
     state.feed = [block(state.height), ...state.feed].slice(0, 24);
     state.arrival[state.arrival.length - 1] += 1;
@@ -166,7 +209,8 @@ function step() {
     const lo = state.height + 1;
     state.height = Math.min(state.tip, state.height + n);
     state.feed = [chunk(lo, state.height), ...state.feed].slice(0, 24);
-    state.arrival[state.arrival.length - 1] += n;
+    state.arrival[state.arrival.length - 1] += state.height - lo + 1;
+    if (state.tip - state.height <= 2) state.chainMode = "synced";
   }
   state.lastStep = now;
 }
@@ -191,33 +235,36 @@ function bytes(n) {
   return [num, "GB", `${num} GB`];
 }
 
-function snapshot() {
+function baseSnapshot() {
   step();
-  const ibd = state.scenario === "ibd";
+  const ibd = state.chainMode === "ibd";
   const behind = state.tip - state.height;
   const pct = (state.height / state.tip) * 100;
   const pctNum = behind === 0 ? "100" : pct >= 99 ? pct.toFixed(3) : pct.toFixed(1);
   const elapsed = (Date.now() - started) / 1000;
+  const mg = managed.mg;
+  const isManaged = managed.managedMode();
 
   // Chain size on disk (blocks + chainstate) and the 2 TB volume it lives on.
-  const chainBytes = ibd ? 612_400_000_000 : 784_600_000_000;
+  const legacyMainnet = state.net === "mainnet" && !isManaged;
+  const chainBytes = legacyMainnet ? (ibd ? 612_400_000_000 : 784_600_000_000) : Math.round(NET_SIZE[state.net] * Math.min(1, state.height / state.tip));
   const totalBytes = 2_000_000_000_000;
-  const freeBytes = ibd ? 1_214_700_000_000 : 1_042_500_000_000;
+  const freeBytes = isManaged || mg.mode === "standalone" ? mg.freeBytes : ibd ? 1_214_700_000_000 : 1_042_500_000_000;
   const [usedNum, usedUnit, usedLabel] = bytes(chainBytes);
   const [freeNum, freeUnit, freeLabel] = bytes(freeBytes);
 
-  const peers = PEERS;
+  const peers = PEERS.slice(0, state.net === "mainnet" ? PEERS.length : NET_PEERS[state.net]);
   const inbound = peers.filter((p) => p.inbound).length;
 
   return {
     connected: true,
-    rpc_addr: RPC,
+    rpc_addr: `127.0.0.1:${NET_RPC[state.net]}`,
     health: ibd ? "heal" : "good",
     health_label: ibd ? "Syncing" : "Healthy",
     node_status: ibd ? "Syncing" : "Online",
     uptime: uptime(ibd ? 5 * 3600 + 12 * 60 + elapsed : NODE_UP_SECS + elapsed),
     blvm_version: "v0.1.13",
-    network: "main",
+    network: NET_CHAIN[state.net],
     sync_pct: `${pctNum}%`,
     sync_pct_num: pctNum,
     syncing: ibd,
@@ -251,7 +298,7 @@ function snapshot() {
     feed_waiting: false,
     arrival: state.arrival,
     last_check: "just now",
-    ui_version: "v0.1.1",
+    ui_version: "v0.2.0",
     ui_uptime: uptime(UI_UP_SECS + elapsed),
     rpc_failures: 0,
     show_manual: false,
@@ -263,6 +310,24 @@ function snapshot() {
     last_seen: Math.floor(Date.now() / 1000),
   };
 }
+
+// Legacy scenarios (synced, ibd) get exactly the old payload: no managed-node fields at all.
+const snapshot = () => managed.decorate(baseSnapshot());
+
+const NET_SIZE = Object.fromEntries(Object.entries(NETS).map(([k, v]) => [k, v.size]));
+const NET_RPC = Object.fromEntries(Object.entries(NETS).map(([k, v]) => [k, v.rpc]));
+const NET_CHAIN = Object.fromEntries(Object.entries(NETS).map(([k, v]) => [k, v.chain]));
+const NET_PEERS = Object.fromEntries(Object.entries(NETS).map(([k, v]) => [k, v.peers]));
+
+const managed = createManaged({
+  tip: (id) => TIPS[id],
+  height: () => state.height,
+  mode: () => state.chainMode,
+  peers: () => (state.net === "mainnet" ? PEERS.length : NET_PEERS[state.net]),
+  load: loadChain,
+  step,
+  snapshot: () => snapshot(),
+});
 
 // ---- http ------------------------------------------------------------------
 
@@ -289,22 +354,43 @@ function serveFile(res, path) {
   createReadStream(path).pipe(res);
 }
 
-const server = createServer((req, res) => {
+const SCENARIOS = ["synced", "ibd", "first-run", "managed-stopped", "managed-running", "managed-switching", "managed-crashed", "port-conflict", "update-available", "updates-off", "managed-no-binary", "modules"];
+
+function setScenario(name) {
+  state.scenario = name;
+  if (!managed.applyScenario(name)) reset();
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString() || "{}");
+  } catch {
+    return {};
+  }
+}
+
+const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const p = url.pathname;
 
-  if (p === "/api/status") return json(res, snapshot());
-  if (p === "/api/connect" || p === "/api/node") return json(res, { ok: true, message: "Mock node.", status: snapshot() });
-  if (p === "/api/rpc") return json(res, { ok: true });
   if (p === "/__mock") {
     const sc = url.searchParams.get("scenario");
-    if (sc === "synced" || sc === "ibd") {
-      state.scenario = sc;
-      reset();
-    }
+    if (url.searchParams.get("slow")) managed.mg.slow = Number(url.searchParams.get("slow")) || 1;
+    if (SCENARIOS.includes(sc)) setScenario(sc);
+    managed.knobs(url.searchParams);
     const live = url.searchParams.get("live");
     if (live !== null) state.live = live !== "0";
-    return json(res, { scenario: state.scenario, live: state.live, tip: state.tip, height: state.height });
+    return json(res, { scenario: state.scenario, live: state.live, tip: state.tip, height: state.height, scenarios: SCENARIOS, force_checks: managed.mg.forceChecks });
+  }
+  if (p.startsWith("/api/")) {
+    const body = req.method === "POST" ? await readBody(req) : undefined;
+    if (managed.route(req, res, url, body, json)) return;
+    if (p === "/api/status") return json(res, snapshot());
+    if (p === "/api/connect" || p === "/api/node") return json(res, { ok: true, message: "Mock node.", status: snapshot() });
+    if (p === "/api/rpc") return json(res, { ok: true });
+    return json(res, { error: "not found" }, 404);
   }
 
   const file = normalize(join(DIST, decodeURIComponent(p)));
@@ -327,8 +413,9 @@ if (!existsSync(join(DIST, "index.html"))) {
   process.exit(1);
 }
 
-state.tip = await liveTip();
-reset();
+TIPS.mainnet = await liveTip();
+state.tip = TIPS.mainnet;
+setScenario(SCENARIOS.includes(state.scenario) ? state.scenario : "synced");
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`mock console on http://127.0.0.1:${PORT}  (${state.scenario}, tip ${state.tip.toLocaleString("en-US")})`);
 });

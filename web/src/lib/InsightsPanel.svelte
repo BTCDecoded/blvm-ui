@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { nodeVersion } from "./format";
   import Icon from "./Icon.svelte";
   import Light from "./Light.svelte";
   import Ring from "./Ring.svelte";
@@ -6,6 +7,7 @@
 
   const s = $derived(ui.snap);
   const health = $derived(s.health || "dead");
+  const ver = $derived(nodeVersion(s));
   const arrival = $derived(s.arrival?.length ? s.arrival : Array(12).fill(0));
   const maxBar = $derived(Math.max(1, ...arrival));
   const inPeak = $derived(Math.max(1, s.inbound, s.outbound));
@@ -53,7 +55,10 @@
         </div>
         <div>
           <dt>BLVM</dt>
-          <dd>{s.blvm_version}</dd>
+          <dd>
+            {ver.text}
+            {#if ver.seen}<span class="ui-seen ml-2">{ver.seen}</span>{/if}
+          </dd>
         </div>
         <div>
           <dt>Network</dt>

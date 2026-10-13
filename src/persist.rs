@@ -91,10 +91,56 @@ struct Stored {
     views: BTreeMap<String, StoredView>,
 }
 
+static STATE_DIR_CHOICE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Where this console keeps its state (`console.json`, `feeds.json`, `releases.json`).
+///
+/// `BLVM_UI_STATE_DIR` wins. A managed console (by environment) with no such variable keeps it next to the
+/// data it manages, in `<data root>/console/`, so one folder holds everything and survives a reinstall of the
+/// app; but a console that already has a `console.json` in the old per-user folder keeps using that one until
+/// it has a `console.json` in the new place. The choice is made once at startup ([`choose_state_dir`]).
 pub fn state_dir() -> Option<PathBuf> {
     if let Some(p) = setting("BLVM_UI_STATE_DIR", option_env!("BLVM_UI_STATE_DIR")) {
         return Some(PathBuf::from(p));
     }
+    if let Some(p) = STATE_DIR_CHOICE.get() {
+        return Some(p.clone());
+    }
+    default_state_dir()
+}
+
+/// Decide the state folder from the environment and remember it for [`state_dir`].
+pub fn choose_state_dir(env: &crate::settings::EnvOverrides) -> Option<PathBuf> {
+    let explicit = setting("BLVM_UI_STATE_DIR", option_env!("BLVM_UI_STATE_DIR")).is_some();
+    let managed = env.mode.as_deref().and_then(crate::settings::Mode::parse) == Some(crate::settings::Mode::Managed);
+    if explicit || !managed {
+        return state_dir();
+    }
+    let root = env
+        .data_root
+        .as_deref()
+        .map(crate::settings::expand_home)
+        .unwrap_or_else(crate::settings::default_data_root);
+    let chosen = pick_managed_state_dir(&root, default_state_dir());
+    let _ = STATE_DIR_CHOICE.set(chosen.clone());
+    Some(chosen)
+}
+
+/// `<root>/console`, unless the old per-user folder already holds this console's files (settings or block
+/// history) and the new one holds none yet: moving house must not lose them.
+pub fn pick_managed_state_dir(root: &std::path::Path, legacy: Option<PathBuf>) -> PathBuf {
+    let has_any = |d: &std::path::Path| d.join(crate::settings::CONSOLE_FILE).is_file() || d.join(FILE).is_file();
+    let new = root.join("console");
+    if has_any(&new) {
+        return new;
+    }
+    match legacy {
+        Some(l) if has_any(&l) => l,
+        _ => new,
+    }
+}
+
+fn default_state_dir() -> Option<PathBuf> {
     let home = || std::env::var_os("HOME").map(PathBuf::from);
     #[cfg(target_os = "macos")]
     let dir = home().map(|h| h.join("Library/Application Support/blvm-ui-next"));
@@ -207,5 +253,30 @@ mod tests {
         assert_eq!(back.version, VERSION);
         assert_eq!(back.views, views);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod state_dir_tests {
+    use super::*;
+
+    #[test]
+    fn a_managed_console_keeps_its_state_next_to_its_data_unless_it_already_lives_elsewhere() {
+        let base = std::env::temp_dir().join(format!("blvm-statedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, legacy) = (base.join("root"), base.join("legacy"));
+        std::fs::create_dir_all(&legacy).unwrap();
+        // A fresh install: <root>/console.
+        assert_eq!(pick_managed_state_dir(&root, Some(legacy.clone())), root.join("console"));
+        // An existing console in the old folder keeps working until the new place has files of its own.
+        std::fs::write(legacy.join(FILE), "{}").unwrap();
+        assert_eq!(pick_managed_state_dir(&root, Some(legacy.clone())), legacy, "block history alone counts");
+        std::fs::write(legacy.join(crate::settings::CONSOLE_FILE), "{}").unwrap();
+        assert_eq!(pick_managed_state_dir(&root, Some(legacy.clone())), legacy);
+        std::fs::create_dir_all(root.join("console")).unwrap();
+        std::fs::write(root.join("console").join(crate::settings::CONSOLE_FILE), "{}").unwrap();
+        assert_eq!(pick_managed_state_dir(&root, Some(legacy)), root.join("console"));
+        assert_eq!(pick_managed_state_dir(&root, None), root.join("console"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

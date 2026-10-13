@@ -1,6 +1,6 @@
 [package]
 name = "blvm-ui-next"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["Bitcoin Commons Contributors"]
 description = "Next localhost UI for a vanilla blvm-node (JSON-RPC console)"
@@ -28,6 +28,9 @@ http-body-util = "0.1"
 bytes = "1"
 mime_guess = "2"
 maxminddb = { version = "0.32.0", features = ["mmap"] }
+# In-app node downloads (GitHub releases). rustls with bundled roots: no OpenSSL, nothing from the OS.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

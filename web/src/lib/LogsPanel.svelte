@@ -1,9 +1,12 @@
 <script lang="ts">
   import CmdBlock from "./CmdBlock.svelte";
   import Icon from "./Icon.svelte";
-  import { ui } from "./status.svelte";
+  import LogTail from "./LogTail.svelte";
+  import { isManaged, ui } from "./status.svelte";
 
   const s = $derived(ui.snap);
+  // Design G: a managed node's log is captured, so the page tails it; otherwise the command cards stay.
+  const managed = $derived(isManaged(s));
   const flag = $derived.by(() => {
     const n = s.network;
     if (n === "testnet4" || !n || n === "—") return "--config testnet4-dev.toml";
@@ -20,6 +23,9 @@
   ];
 </script>
 
+{#if managed}
+  <LogTail />
+{:else}
 <section class="ui-page">
   <div class="logs-grid">
     <article class="panel ui-card">
@@ -60,6 +66,7 @@
     </article>
   </div>
 </section>
+{/if}
 
 <style>
   .logs-grid {

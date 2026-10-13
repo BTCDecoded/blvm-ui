@@ -138,8 +138,17 @@ async fn rpc_exchange(
     rpc_addr: &str,
     payload: &Value,
 ) -> Result<Value> {
+    rpc_exchange_with(stream, rpc_addr, payload, auth_header()).await
+}
+
+async fn rpc_exchange_with(
+    stream: &mut TcpStream,
+    rpc_addr: &str,
+    payload: &Value,
+    auth: Option<String>,
+) -> Result<Value> {
     let body = payload.to_string();
-    let auth = auth_header().map(|a| format!("Authorization: {a}\r\n")).unwrap_or_default();
+    let auth = auth.map(|a| format!("Authorization: {a}\r\n")).unwrap_or_default();
     let req = format!(
         "POST / HTTP/1.1\r\nHost: {rpc_addr}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
         body.len()
@@ -149,9 +158,24 @@ async fn rpc_exchange(
     read_http_json(stream, rpc_addr).await
 }
 
-/// `Basic …` from `BLVM_UI_RPC_USER` + `BLVM_UI_RPC_PASS`, else from the node's
-/// cookie file at `BLVM_UI_RPC_COOKIE`. No auth when neither is set (BLVM default).
+/// The login the console itself chose for a node it starts (see `managed::Console::rpc_auth`). Wins over the
+/// environment, which it already includes when the environment names a login.
+fn login_override() -> &'static std::sync::Mutex<Option<String>> {
+    static LOGIN: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
+    LOGIN.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Send this user and password with every RPC request (`None`: back to the environment).
+pub fn set_login(creds: Option<(String, String)>) {
+    *login_override().lock().unwrap() = creds.map(|(u, p)| basic_auth(&format!("{u}:{p}")));
+}
+
+/// `Basic …` from the console's own login for the node it runs, else `BLVM_UI_RPC_USER` +
+/// `BLVM_UI_RPC_PASS`, else the node's cookie file at `BLVM_UI_RPC_COOKIE`. No auth when none is set.
 fn auth_header() -> Option<String> {
+    if let Some(h) = login_override().lock().unwrap().clone() {
+        return Some(h);
+    }
     static USER_PASS: OnceLock<Option<String>> = OnceLock::new();
     let fixed = USER_PASS.get_or_init(|| {
         let user = std::env::var("BLVM_UI_RPC_USER").ok().filter(|u| !u.is_empty())?;
@@ -165,6 +189,92 @@ fn auth_header() -> Option<String> {
     let path = std::env::var("BLVM_UI_RPC_COOKIE").ok().filter(|p| !p.is_empty())?;
     let cookie = std::fs::read_to_string(path).ok()?;
     Some(basic_auth(cookie.trim()))
+}
+
+/// One-off connectivity check for the setup wizard: a fresh connection (not the shared one), its own
+/// login if given (else the console's), `getblockchaininfo` + `getnetworkinfo` in one batch.
+pub async fn probe_once(rpc_addr: &str, creds: Option<(&str, &str)>) -> Result<Vec<Option<Value>>> {
+    let calls = [RpcCall::method("getblockchaininfo"), RpcCall::method("getnetworkinfo")];
+    let payload = Value::Array(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| json!({"jsonrpc": "2.0", "id": i, "method": c.method, "params": c.params}))
+            .collect(),
+    );
+    let mut stream = connect(rpc_addr).await?;
+    let auth = creds.map(|(u, p)| basic_auth(&format!("{u}:{p}"))).or_else(auth_header);
+    let v = tokio::time::timeout(
+        Duration::from_secs(4),
+        rpc_exchange_with(&mut stream, rpc_addr, &payload, auth),
+    )
+    .await
+    .map_err(|_| anyhow!("RPC {rpc_addr} frozen"))??;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow!("RPC batch response was not an array"))?;
+    let mut out = vec![None; calls.len()];
+    for item in arr {
+        let id = item.get("id").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        if id < out.len() {
+            out[id] = result_of(item);
+        }
+    }
+    Ok(out)
+}
+
+/// What a node said to a caller with no login (see [`probe_login`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginProbe {
+    /// A clean `200`: the node serves RPC calls to anybody.
+    Open,
+    /// An explicit `401` or `403`: the node asks for a login.
+    Locked,
+    /// No usable answer (refused, dropped, timed out, `429`, a server error ...). The node limits the
+    /// connections of one address (10 per minute), so silence says nothing either way: ask again later.
+    Unknown,
+}
+
+/// Ask the node at `addr` for `getblockcount` without a login. Used right after a node that was given a
+/// password came up, to make sure the password was really applied. Only an explicit refusal counts as
+/// [`LoginProbe::Locked`]; a dropped connection or a timeout is [`LoginProbe::Unknown`], never "safe".
+pub async fn probe_login(addr: &str) -> LoginProbe {
+    let body = r#"{"jsonrpc":"2.0","id":0,"method":"getblockcount","params":[]}"#;
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let attempt = async {
+        let mut s = TcpStream::connect(addr).await.ok()?;
+        s.write_all(req.as_bytes()).await.ok()?;
+        let mut head = Vec::new();
+        let mut tmp = [0u8; 256];
+        while head.len() < 12 {
+            let n = s.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            head.extend_from_slice(&tmp[..n]);
+        }
+        let code = head
+            .strip_prefix(b"HTTP/1.1 ")
+            .or_else(|| head.strip_prefix(b"HTTP/1.0 "))
+            .map(|rest| &rest[..rest.len().min(3)])?;
+        Some(match code {
+            b"200" => LoginProbe::Open,
+            b"401" | b"403" => LoginProbe::Locked,
+            _ => LoginProbe::Unknown,
+        })
+    };
+    match tokio::time::timeout(Duration::from_secs(2), attempt).await {
+        Ok(Some(p)) => p,
+        _ => LoginProbe::Unknown,
+    }
+}
+
+/// `Basic …` for a user and password.
+pub fn basic_auth_header(user: &str, pass: &str) -> String {
+    basic_auth(&format!("{user}:{pass}"))
 }
 
 fn basic_auth(user_pass: &str) -> String {
@@ -320,5 +430,69 @@ mod tests {
         assert_eq!(basic_auth("umbrel:pw"), "Basic dW1icmVsOnB3");
         assert_eq!(basic_auth("a:b"), "Basic YTpi");
         assert_eq!(basic_auth("ab:c"), "Basic YWI6Yw==");
+    }
+
+    #[test]
+    fn the_consoles_own_login_is_sent_until_it_is_withdrawn() {
+        assert_eq!(basic_auth_header("commons", "s3cret"), "Basic Y29tbW9uczpzM2NyZXQ=");
+        set_login(Some(("commons".into(), "s3cret".into())));
+        let sent = auth_header();
+        set_login(None);
+        assert_eq!(sent.as_deref(), Some("Basic Y29tbW9uczpzM2NyZXQ="));
+        // (With nothing set and no environment, no header: the node's default.)
+        if std::env::var_os("BLVM_UI_RPC_USER").is_none() && std::env::var_os("BLVM_UI_RPC_COOKIE").is_none() {
+            assert_eq!(auth_header(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_that_answers_a_caller_with_no_login_is_told_apart_from_one_that_asks() {
+        async fn stub(status: &'static str) -> String {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = l.accept().await else { return };
+                    tokio::spawn(async move {
+                        let mut b = [0u8; 1024];
+                        let _ = s.read(&mut b).await;
+                        let _ = s.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes()).await;
+                    });
+                }
+            });
+            addr
+        }
+        assert_eq!(probe_login(&stub("200 OK").await).await, LoginProbe::Open);
+        for refusal in ["401 Unauthorized", "403 Forbidden"] {
+            assert_eq!(probe_login(&stub(refusal).await).await, LoginProbe::Locked, "{refusal}");
+        }
+        // Anything else is no answer to the question: the node's connection limit answers 429 or just hangs up.
+        for other in ["429 Too Many Requests", "500 Internal Server Error", "404 Not Found"] {
+            assert_eq!(probe_login(&stub(other).await).await, LoginProbe::Unknown, "{other}");
+        }
+        let free = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        assert_eq!(probe_login(&free).await, LoginProbe::Unknown, "nothing listening is not a locked node");
+        // A peer that accepts and drops the connection (the per-address limit) is not a locked node either.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dropper = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                drop(s);
+            }
+        });
+        assert_eq!(probe_login(&dropper).await, LoginProbe::Unknown, "a dropped connection is not a locked node");
+        // ... and one that stays silent until the check gives up.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+        assert_eq!(probe_login(&silent).await, LoginProbe::Unknown, "a timeout is not a locked node");
     }
 }

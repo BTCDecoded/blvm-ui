@@ -1,11 +1,13 @@
 <script lang="ts">
   import { toggleNode } from "./api";
+  import { nodeVersion } from "./format";
   import Light from "./Light.svelte";
   import Ring from "./Ring.svelte";
   import { ui } from "./status.svelte";
 
   const s = $derived(ui.snap);
   const health = $derived(s.health || "dead");
+  const ver = $derived(nodeVersion(s));
   const haveVol = $derived(Number(s.disk_total_bytes) > 0);
   let powerBusy = $state(false);
   let powerHint = $state("Starts a stopped node, or stops a running one.");
@@ -41,7 +43,10 @@
       </div>
       <div class="flex items-center justify-between py-2.5">
         <dt class="text-muted">BLVM</dt>
-        <dd>{s.blvm_version}</dd>
+        <dd>
+          {ver.text}
+          {#if ver.seen}<span class="ui-seen ml-2">{ver.seen}</span>{/if}
+        </dd>
       </div>
       <div class="flex items-center justify-between py-2.5">
         <dt class="text-muted">Network</dt>

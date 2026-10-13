@@ -8,7 +8,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::sleep;
 
-const TERM_WAIT: Duration = Duration::from_secs(20);
+/// The node drains for up to 30 s after SIGTERM before it exits, so wait longer than that.
+const TERM_WAIT: Duration = Duration::from_secs(40);
 const KILL_WAIT: Duration = Duration::from_secs(3);
 const START_WAIT: Duration = Duration::from_secs(45);
 
@@ -221,7 +222,7 @@ fn data_dir_from_args(args: &[String], cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-fn dir_allocated_bytes(root: &Path) -> u64 {
+pub(crate) fn dir_allocated_bytes(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

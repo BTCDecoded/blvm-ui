@@ -560,3 +560,145 @@ body {
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* Power buttons (moved here from SettingsPanel so the managed Node card shares them). */
+.power-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: 0.65rem;
+  padding: 0.65rem 1.1rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  transition: opacity 0.15s, background 0.15s;
+}
+.power-btn.is-start {
+  background: var(--color-good);
+  color: var(--color-bg);
+}
+.power-btn.is-stop {
+  border: 1px solid rgb(224 91 85 / 0.6);
+  color: var(--color-dead);
+}
+.power-btn.is-stop:hover {
+  background: rgb(224 91 85 / 0.1);
+}
+.power-btn.is-neutral {
+  border: 1px solid var(--color-line);
+  color: var(--color-cream);
+}
+.power-btn.is-neutral:hover {
+  border-color: rgb(240 230 208 / 0.25);
+  background: rgb(240 230 208 / 0.04);
+}
+.power-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Managed-node kit: key/value rows, status pills, list rows, small text controls. */
+.kv {
+  font-size: 1.02rem;
+}
+.kv > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.65rem 0;
+  border-top: 1px solid var(--color-line);
+}
+.kv > div:first-child {
+  border-top: 0;
+}
+.kv dt {
+  color: var(--color-muted);
+}
+.kv dd {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  text-align: right;
+}
+.ui-seen {
+  font-size: 0.8rem;
+  color: var(--color-faint);
+}
+.ui-link {
+  color: var(--color-orange);
+}
+.ui-link:hover {
+  text-decoration: underline;
+}
+.ui-warn {
+  color: var(--color-heal);
+}
+.ui-bad {
+  color: var(--color-dead);
+}
+.ui-list > li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 0;
+  border-top: 1px solid var(--color-line);
+}
+.ui-list > li:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.ui-sub {
+  margin-top: 0.4rem;
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-faint);
+}
+.ui-log {
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+/* Phone width: cards stay inside the column, rows wrap, long values break instead of widening the page. */
+@media (max-width: 767px) {
+  .ui-card {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    padding: 1.25rem;
+  }
+  .ui-head {
+    flex-wrap: wrap;
+  }
+  .ui-title,
+  .ui-chip {
+    min-width: 0;
+    max-width: 100%;
+  }
+  .kv > div {
+    flex-wrap: wrap;
+    gap: 0.15rem 1rem;
+  }
+  .kv dd {
+    max-width: 100%;
+    flex-wrap: wrap;
+    overflow-wrap: anywhere;
+  }
+  .ui-list > li {
+    flex-wrap: wrap;
+  }
+  .ui-lead,
+  .ui-note {
+    overflow-wrap: anywhere;
+  }
+  .ui-log {
+    max-width: 100%;
+  }
+}

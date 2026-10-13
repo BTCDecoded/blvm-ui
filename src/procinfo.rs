@@ -59,6 +59,47 @@ pub fn cwd(pid: u32) -> Option<PathBuf> {
         .find(|p| p.is_dir())
 }
 
+/// Parent process id.
+pub fn ppid(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    if let Some(p) = linux::ppid(pid) {
+        return Some(p);
+    }
+    let out = Command::new("ps").args(["-p", &pid.to_string(), "-o", "ppid="]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// `pid` is `root` or one of its descendants (walks parents, at most 16 levels).
+pub fn is_same_or_descendant(pid: u32, root: u32) -> bool {
+    let mut cur = pid;
+    for _ in 0..16 {
+        if cur == root {
+            return true;
+        }
+        match ppid(cur) {
+            Some(p) if p > 1 && p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// `Some((pid, name))` for the first process listening on `port` that is not `ours` (nor a child of it).
+/// `ours: None` means any listener counts. `name` is the executable's file name, or `?`.
+pub fn foreign_listener(port: u16, ours: Option<u32>) -> Option<(u32, String)> {
+    let pid = listener_pids(port)
+        .into_iter()
+        .find(|p| ours.is_none_or(|o| !is_same_or_descendant(*p, o)))?;
+    let name = comm(pid)
+        .and_then(|c| std::path::Path::new(c.trim()).file_name().map(|n| n.to_string_lossy().into_owned()))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "?".into());
+    Some((pid, name))
+}
+
 fn lsof_listener_pids(port: u16) -> Vec<u32> {
     let Ok(out) = Command::new("lsof").args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"]).output() else {
         return Vec::new();
@@ -121,6 +162,13 @@ mod linux {
         pids
     }
 
+    pub fn ppid(pid: u32) -> Option<u32> {
+        // `pid (comm) S ppid ...`: comm may contain spaces and parentheses, so split after the last ')'.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &stat[stat.rfind(')')? + 1..];
+        rest.split_whitespace().nth(1)?.parse().ok()
+    }
+
     pub fn comm(pid: u32) -> Option<String> {
         std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string())
     }
@@ -162,5 +210,34 @@ mod tests {
         assert!(comm(me).is_some_and(|c| !c.is_empty()));
         assert!(argv(me).is_some_and(|a| !a.is_empty()));
         assert!(cwd(me).is_some());
+    }
+
+    #[test]
+    fn parents_and_descendants() {
+        let me = std::process::id();
+        assert!(ppid(me).is_some_and(|p| p > 0));
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        assert_eq!(ppid(child.id()), Some(me));
+        assert!(is_same_or_descendant(child.id(), me));
+        assert!(is_same_or_descendant(me, me));
+        assert!(!is_same_or_descendant(me, child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn foreign_listener_names_the_owner_and_skips_the_node_and_its_children() {
+        // This test process listens, so it is the "foreign" owner for a node that is not it ...
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let me = std::process::id();
+        let (pid, name) = foreign_listener(port, None).expect("a listener");
+        assert_eq!(pid, me);
+        assert!(!name.is_empty());
+        assert_eq!(foreign_listener(port, Some(1)).map(|f| f.0), Some(me), "not the node's");
+        // ... but it is not foreign to a node that is (or contains) the listener.
+        assert_eq!(foreign_listener(port, Some(me)), None);
+        drop(l);
+        assert_eq!(foreign_listener(port, None), None, "nobody listens any more");
     }
 }
