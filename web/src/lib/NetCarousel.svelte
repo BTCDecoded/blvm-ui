@@ -1,17 +1,21 @@
 <script lang="ts">
   import Light from "./Light.svelte";
 
-  type Net = { rpc: string; chain: string; label: string };
+  // `detail` (optional) is a managed-mode extra line, such as the size on disk. Without it the card is unchanged.
+  type Net = { rpc: string; chain: string; label: string; detail?: string };
 
   let {
     nets,
     current,
     busy = false,
+    disabled = false,
     onpick,
   }: {
     nets: Net[];
     current: string;
     busy?: boolean;
+    /** Browsing stays possible; picking does not (a network switch is running). */
+    disabled?: boolean;
     onpick: (rpc: string) => void;
   } = $props();
 
@@ -34,7 +38,7 @@
     clearTimeout(timer);
     // Switch once the user stops clicking, not on every step.
     timer = setTimeout(() => {
-      if (nets[idx].rpc !== current) onpick(nets[idx].rpc);
+      if (!disabled && nets[idx].rpc !== current) onpick(nets[idx].rpc);
     }, 450);
   }
 
@@ -91,6 +95,8 @@
             <Light health="good" class="!h-[0.5rem] !w-[0.5rem]" /> Active
           {:else if front && busy}
             Switching…
+          {:else if n.detail}
+            {n.detail}
           {:else}
             RPC {n.rpc.split(":")[1]}
           {/if}
@@ -230,6 +236,16 @@
   .dots span.on {
     width: 1.1rem;
     background: var(--color-orange);
+  }
+  /* Phone width: the cards follow the column (never wider than it), the arrows tighten. */
+  @media (max-width: 767px) {
+    .carousel {
+      max-width: 100%;
+      gap: 0.35rem;
+    }
+    .net {
+      width: clamp(8.5rem, 68%, 11.5rem);
+    }
   }
   @media (prefers-reduced-motion: reduce) {
     .net {

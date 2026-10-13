@@ -1,4 +1,4 @@
-import { emptySnapshot, type Snapshot } from "./types";
+import { emptySnapshot, type Managed, type Snapshot } from "./types";
 
 export type Page =
   | "home"
@@ -41,7 +41,32 @@ export const ui = $state({
   sub: start.sub as Sub,
   peersMsg: "",
   networkMsg: "",
+  /** True after the first status answer; the sidebar stays as before until then. */
+  ready: false,
+  /** The setup wizard was opened on purpose ("Run setup again", "Use a managed node"). */
+  setupOpen: false,
+  /** The first-run wizard was skipped or finished in this tab. */
+  setupDone: false,
+  /** The host refused this address (403) and said why; shown instead of a silently dead page. */
+  hostError: "",
 });
+
+/** Design A: the page learns the mode from /api/status. Absent => standalone. */
+export const isManaged = (s: Snapshot) => s.mode === "managed" && !!s.managed;
+
+/**
+ * Design K: the wizard shows instead of the dashboard when the host says setup is not done AND it reports a
+ * mode at all. A host without the new fields never triggers it.
+ */
+export const wizardActive = () =>
+  ui.setupOpen || (ui.ready && ui.snap.setup_done === false && ui.snap.mode !== undefined && !ui.setupDone);
+
+/** A network switch owns the node right now (stopping the old one or starting the new one). */
+export const switchRunning = (m: Managed | null | undefined): boolean =>
+  !!m?.switch && (m.switch.phase === "stopping" || m.switch.phase === "starting");
+
+/** Design L: module-added sidebar pages. Null when the host does not say (sidebar unchanged). */
+export const modulePages = (s: Snapshot): string[] | null => (Array.isArray(s.modules_pages) ? s.modules_pages : null);
 
 export function setPage(page: Page, sub?: Sub) {
   ui.page = page;
@@ -61,4 +86,6 @@ export function setSub(sub: Sub) {
 export function applySnap(s: Snapshot) {
   ui.snap = s;
   ui.live = true;
+  ui.ready = true;
+  ui.hostError = "";
 }

@@ -75,3 +75,69 @@ export function seenAt(unixSecs: number): string {
     ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
     : d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
+
+/** "3 h ago", "2 d ago", "just now". `at` is unix seconds. */
+export function agoLabel(at: number): string {
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - at));
+  if (secs < 60) return "just now";
+  if (secs < 3600) return `${Math.floor(secs / 60)} min ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)} h ago`;
+  return `${Math.floor(secs / 86400)} d ago`;
+}
+
+/** "v0.1.13" for "0.1.13" or "v0.1.13"; anything that is not a bare number stays as given. */
+export function withV(version: string): string {
+  return /^\d/.test(version) ? `v${version}` : version;
+}
+
+/**
+ * Design M.1: the node's own version, live only. When the node is not answering this is "—" (even if the
+ * host still carries an old value over), and the last answer, if the host sends one, goes in `seen`.
+ */
+export function nodeVersion(s: {
+  connected: boolean;
+  blvm_version: string;
+  blvm_version_seen?: { version: string; at: number } | null;
+}): { text: string; seen: string | null } {
+  if (s.connected) return { text: s.blvm_version || "—", seen: null };
+  const v = s.blvm_version_seen;
+  return { text: "—", seen: v ? `last seen ${withV(v.version)}, ${agoLabel(v.at)}` : null };
+}
+
+/**
+ * The one version a managed console shows for the node program (design M.3), on every card: the release tag
+ * ("v0.1.60") or, for a build the console did not install, the binary's own report ("blvm 0.1.0") with the
+ * "Custom build" chip next to it. "—" until the host has read it.
+ */
+export function installedVersion(m: { node_version: string | null; custom_build: boolean } | null | undefined): {
+  text: string;
+  custom: boolean;
+} {
+  if (!m?.node_version) return { text: "—", custom: false };
+  return m.custom_build
+    ? { text: `blvm ${m.node_version.replace(/^blvm\s+/, "")}`, custom: true }
+    : { text: withV(m.node_version), custom: false };
+}
+
+/**
+ * Design M.5: what the running node says about itself over RPC, as a secondary line next to the installed
+ * version ("Node reports BitcoinCommons 0.1.13"), live only. Null when the node is not answering or says the
+ * same as the installed version.
+ */
+export function nodeReports(
+  s: { connected: boolean; blvm_version: string },
+  installed: { text: string },
+): string | null {
+  if (!s.connected || !s.blvm_version || s.blvm_version === "—") return null;
+  if (withV(s.blvm_version) === installed.text) return null;
+  return `Node reports BitcoinCommons ${s.blvm_version.replace(/^v/, "")}`;
+}
+
+/** "12d 07h 41m" / "07h 41m" (same shape the host uses for node uptime). */
+export function durLabel(secs: number): string {
+  const t = Math.max(0, Math.floor(secs));
+  const d = Math.floor(t / 86400);
+  const h = String(Math.floor((t % 86400) / 3600)).padStart(2, "0");
+  const m = String(Math.floor((t % 3600) / 60)).padStart(2, "0");
+  return d > 0 ? `${d}d ${h}h ${m}m` : `${h}h ${m}m`;
+}

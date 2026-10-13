@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { fetchStatus } from "./lib/api";
+  import { ApiError, fetchStatus } from "./lib/api";
   import HomePanel from "./lib/HomePanel.svelte";
   import Icon from "./lib/Icon.svelte";
   import InsightsPanel from "./lib/InsightsPanel.svelte";
@@ -9,23 +9,54 @@
   import SettingsPanel from "./lib/SettingsPanel.svelte";
   import LogsPanel from "./lib/LogsPanel.svelte";
   import MiningPanel from "./lib/MiningPanel.svelte";
+  import ModuleGate from "./lib/ModuleGate.svelte";
+  import { MODULE_PAGES } from "./lib/modules";
+  import Setup from "./lib/Setup.svelte";
   import Terrain from "./lib/Terrain.svelte";
   import ViewSwitch from "./lib/ViewSwitch.svelte";
-  import { applySnap, setPage, ui, type Page } from "./lib/status.svelte";
+  import { applySnap, modulePages, setPage, ui, wizardActive, type Page } from "./lib/status.svelte";
 
-  const side: { id: Page; label: string; icon: string }[] = [
-    { id: "home", label: "Home", icon: "home" },
-    { id: "mining", label: "Mining", icon: "mining" },
+  type Item = { id: Page; label: string; icon: string };
+  const home: Item = { id: "home", label: "Home", icon: "home" };
+  const mining: Item = { id: "mining", label: "Mining", icon: "mining" };
+  const core: Item[] = [
     { id: "network", label: "Network", icon: "network" },
     { id: "logs", label: "Logs", icon: "logs" },
     { id: "settings", label: "Settings", icon: "settings" },
   ];
 
+  // Design L: core pages plus the pages installed modules add. A host that does not send `modules_pages`
+  // (every host before the managed-node work) keeps the sidebar exactly as it was, Mining included.
+  const side = $derived.by<Item[]>(() => {
+    const mp = ui.ready ? modulePages(ui.snap) : null;
+    if (mp === null) return [home, mining, ...core];
+    const extra = mp.filter((id) => id in MODULE_PAGES).map((id) => ({ id: id as Page, ...MODULE_PAGES[id] }));
+    return [home, ...extra, ...core];
+  });
+
+  // A module page whose module is not there (typed URL, or the module was just removed).
+  const gated = $derived.by(() => {
+    if (!ui.ready || !(ui.page in MODULE_PAGES)) return false;
+    const mp = modulePages(ui.snap);
+    return mp !== null && !mp.includes(ui.page);
+  });
+  const wizard = $derived(wizardActive());
+  // Umbrel: the node runs under an agent in another container; when its heartbeat is gone the page says so
+  // next to the "Console Live" light (the console itself is fine, the node is not being looked after).
+  const agentDown = $derived(ui.live && ui.snap.managed?.agent.external === true && ui.snap.managed.agent.alive === false);
+
+  // False until the first /api/status has answered (or failed): the dashboard and the wizard both depend on
+  // `setup_done`, so neither is drawn before that, and a finished setup never flashes the wizard.
+  let settled = $state(false);
+
   async function tick() {
     try {
       applySnap(await fetchStatus(AbortSignal.timeout(3000)));
-    } catch {
+    } catch (e) {
       ui.live = false;
+      ui.hostError = e instanceof ApiError && e.status === 403 ? e.message : "";
+    } finally {
+      settled = true;
     }
   }
 
@@ -44,16 +75,22 @@
     <div class="flex items-center gap-3">
       <img src="/logo.png" alt="Commons" class="h-7 w-auto" />
       <span class="text-faint">/</span>
-      <span class="text-sm text-muted">Local Console</span>
+      <span class="text-sm text-muted">Node View</span>
     </div>
     <div></div>
     <div class="flex items-center justify-end gap-2 text-sm text-muted">
-      <Light health={ui.live ? "good" : "dead"} />
-      Console Live
+      {#if agentDown}
+        <Light health="dead" />
+        <span role="status">Node agent offline</span>
+      {:else}
+        <Light health={ui.live ? "good" : "dead"} />
+        Console Live
+      {/if}
     </div>
   </header>
 
   <div class="relative z-10 flex min-h-0 flex-1">
+    {#if settled && !wizard}
     <aside class="flex w-[4.5rem] shrink-0 flex-col border-r border-line py-4 sm:w-48">
       <nav class="flex flex-col gap-0.5 px-2" aria-label="Primary">
         {#each side as item}
@@ -71,12 +108,26 @@
         {/each}
       </nav>
     </aside>
+    {/if}
 
     <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-5 sm:px-6 sm:py-6">
+      {#if ui.hostError}
+        <p class="ui-note ui-bad mb-4 max-w-3xl" role="alert">{ui.hostError}</p>
+      {/if}
+      {#if !settled}
+        <div class="boot" role="status" aria-live="polite">
+          <span class="boot-ring" aria-hidden="true"></span>
+          Connecting to the console…
+        </div>
+      {:else if wizard}
+        <Setup />
+      {:else}
       {#if ui.page === "home" || ui.page === "insights"}
         <ViewSwitch />
       {/if}
-      {#if ui.page === "home"}
+      {#if gated}
+        <ModuleGate page={ui.page} />
+      {:else if ui.page === "home"}
         <HomePanel />
       {:else if ui.page === "insights"}
         <InsightsPanel />
@@ -89,6 +140,36 @@
       {:else}
         <LogsPanel />
       {/if}
+      {/if}
     </main>
   </div>
 </div>
+
+<style>
+  .boot {
+    margin: auto;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    color: var(--color-muted);
+    font-size: 0.95rem;
+  }
+  .boot-ring {
+    width: 1.1rem;
+    height: 1.1rem;
+    border-radius: 999px;
+    border: 2px solid rgb(240 230 208 / 0.18);
+    border-top-color: var(--color-orange);
+    animation: boot-spin 0.9s linear infinite;
+  }
+  @keyframes boot-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .boot-ring {
+      animation-duration: 3s;
+    }
+  }
+</style>
