@@ -78,6 +78,27 @@ pub struct Snapshot {
     pub node_power_label: String,
     /// Unix seconds of the node's last answer (so the page can say "as of …").
     pub last_seen: Option<u64>,
+
+    // ---- Managed-node additions (design F, M). All additive. ----
+    /// `"standalone"` or `"managed"`.
+    pub mode: &'static str,
+    /// `false` while the first-run wizard is wanted.
+    pub setup_done: bool,
+    /// The node agent's view; `None` in standalone mode.
+    pub managed: Option<crate::managed::ManagedView>,
+    /// Page ids that installed modules add to the sidebar.
+    pub modules_pages: Vec<String>,
+    /// Last version the node itself reported, while `blvm_version` is `"—"` (design M.1).
+    pub blvm_version_seen: Option<VersionSeen>,
+    /// A node binary is known to this console, so "run a node for me" is possible.
+    pub bundle_available: bool,
+}
+
+/// What the node last said its version was, and when (unix seconds). Shown only as "last seen".
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VersionSeen {
+    pub version: String,
+    pub at: u64,
 }
 
 impl Snapshot {
@@ -132,6 +153,12 @@ impl Snapshot {
             node_busy: false,
             node_power_label: "Turn Node On".into(),
             last_seen: None,
+            mode: "standalone",
+            setup_done: true,
+            managed: None,
+            modules_pages: vec!["mining".to_string()],
+            blvm_version_seen: None,
+            bundle_available: false,
         }
     }
 }
@@ -157,6 +184,8 @@ struct ChainFeed {
     dirty: bool,
     /// Node status from its last answer, saved so a frozen node still shows it.
     last_known: Option<crate::persist::LastKnown>,
+    /// Version the node itself reported on its last full poll: `(version, unix seconds)`.
+    version_seen: Option<(String, u64)>,
 }
 
 impl ChainFeed {
@@ -166,6 +195,7 @@ impl ChainFeed {
             drop_seen: 0,
             dirty: false,
             last_known: None,
+            version_seen: None,
             last: None,
             feed: VecDeque::new(),
             arrival: VecDeque::from(vec![0; HIST_BARS]),
@@ -192,6 +222,8 @@ pub struct LiveState {
     pub power_phase: PowerPhase,
     pub launch: Option<LaunchSpec>,
     pub power_lock: Arc<Mutex<()>>,
+    /// Mode, persisted settings and the node agent (managed mode).
+    pub console: crate::managed::Console,
 }
 
 impl LiveState {
@@ -208,6 +240,7 @@ impl LiveState {
             power_phase: PowerPhase::Idle,
             launch: None,
             power_lock: Arc::new(Mutex::new(())),
+            console: crate::managed::Console::inert(),
         }
     }
 
@@ -217,6 +250,11 @@ impl LiveState {
             let mut c = ChainFeed::new();
             c.chain = v.chain;
             c.last = v.last;
+            c.version_seen = v
+                .last_known
+                .as_ref()
+                .filter(|lk| !lk.blvm_version.is_empty() && lk.blvm_version != "—")
+                .map(|lk| (lk.blvm_version.clone(), lk.at));
             c.last_known = v.last_known;
             c.feed = v.items.iter().map(crate::persist::StoredItem::to_item).collect();
             self.views.insert(rpc, c);
@@ -261,6 +299,13 @@ impl LiveState {
             .and_then(|c| c.last_snapshot.clone())
             .unwrap_or_else(|| Snapshot::disconnected(&addr));
         self.snapshot.rpc_addr = addr;
+        // The parked snapshot is a memory, not a live answer: no version until this view is polled.
+        if self.snapshot.blvm_version != "—" {
+            let carried = (self.snapshot.blvm_version.clone(), self.snapshot.last_seen.unwrap_or_else(crate::persist::unix_now));
+            let seen = chain_mut(self).version_seen.clone().unwrap_or(carried);
+            self.snapshot.blvm_version = "—".into();
+            self.snapshot.blvm_version_seen = Some(VersionSeen { version: seen.0, at: seen.1 });
+        }
         stamp_power(self);
     }
 }
@@ -275,6 +320,7 @@ pub fn stamp_power(g: &mut LiveState) {
         PowerPhase::Idle if running => "Turn Node Off".into(),
         PowerPhase::Idle => "Turn Node On".into(),
     };
+    crate::managed::stamp(g);
 }
 
 fn chain_mut(g: &mut LiveState) -> &mut ChainFeed {
@@ -297,14 +343,34 @@ pub async fn poll_tick(state: &Shared) {
         is_full_poll(g.poll_n)
     };
     poll_inner(state, full).await;
+    crate::managed::housekeeping(state).await;
 }
 
 pub async fn poll_once(state: &Shared) {
     poll_inner(state, true).await;
 }
 
+/// The node answered the batch but `getblockchaininfo` inside it did not (the RPC server is up before the
+/// chain is: during start-up, or while the state is replayed). The poll fails, the node is not "down".
+#[derive(Debug)]
+struct ChainInfoMissing;
+
+impl std::fmt::Display for ChainInfoMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("getblockchaininfo failed")
+    }
+}
+
+impl std::error::Error for ChainInfoMissing {}
+
 async fn poll_inner(state: &Shared, full: bool) {
     let rpc_addr = { state.read().await.rpc_addr.clone() };
+    if rpc_addr.is_empty() {
+        // Managed console with no network chosen: nothing to poll, only the agent's state to show.
+        let mut g = state.write().await;
+        stamp_power(&mut g);
+        return;
+    }
     match refresh(&rpc_addr, state, full).await {
         Ok(()) => {}
         Err(e) => {
@@ -312,6 +378,13 @@ async fn poll_inner(state: &Shared, full: bool) {
             let mut g = state.write().await;
             if g.rpc_addr != rpc_addr {
                 return;
+            }
+            // "Did the RPC answer" is the agent's start-up signal. A batch that came back (even without
+            // chain info) answered; only a failure to get any answer takes the signal down.
+            if e.downcast_ref::<ChainInfoMissing>().is_none() {
+                if let Some(a) = &g.console.agent {
+                    a.rpc_flag().store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             mark_unreachable(&mut g, e.to_string(), listening);
         }
@@ -350,10 +423,17 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
         }
     }
     let mut answers = rpc::call_batch_calls(rpc_addr, &calls).await?;
-    let chain = answers
-        .get_mut(0)
-        .and_then(Option::take)
-        .ok_or_else(|| anyhow::anyhow!("getblockchaininfo failed"))?;
+    {
+        // The node's RPC server answered something: that is all `starting -> running` needs (design B asks
+        // for one `getblockcount`, not the whole probe batch). Only for the address we still follow.
+        let g = state.read().await;
+        if g.rpc_addr == rpc_addr {
+            if let Some(a) = &g.console.agent {
+                a.rpc_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let chain = answers.get_mut(0).and_then(Option::take).ok_or(ChainInfoMissing)?;
     let counted = answers
         .get_mut(1)
         .and_then(Option::take)
@@ -499,6 +579,9 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
     }
     g.fail_streak = 0;
     g.was_connected = true;
+    if let Some(a) = &g.console.agent {
+        a.rpc_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let (ibd, healing, health, health_label, node_status, feed_waiting, feed_items, arrival, network_height, behind, pct, sync_pct, sync_pct_num) = {
         let c = chain_mut(&mut g);
         c.hashed_lo = next_lo.max(hashed_tip);
@@ -578,7 +661,19 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
             sync_pct_num,
         )
     };
+    if let Some(a) = &g.console.agent {
+        a.note_height(&rpc_addr, blocks, network_height);
+    }
 
+    // Live-only version (design M.1): remember what the node said, show it only while it answers.
+    let version_seen = {
+        let c = chain_mut(&mut g);
+        if version != "—" {
+            c.version_seen = Some((version.clone(), crate::persist::unix_now()));
+        }
+        c.version_seen.clone()
+    };
+    let blvm_version_now = version.clone();
     node_ctl::remember_if_running(rpc_addr, &mut g.launch);
     let size_on_disk = chain_bytes_on_disk(rpc_addr, &g.launch, size_on_disk, blocks, headers);
     let (disk_num, disk_unit, disk_label) = format_bytes_parts(size_on_disk);
@@ -639,6 +734,16 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
         node_busy: false,
         node_power_label: "Turn Node Off".into(),
         last_seen: Some(crate::persist::unix_now()),
+        mode: prev.mode,
+        setup_done: prev.setup_done,
+        managed: None,
+        modules_pages: prev.modules_pages.clone(),
+        blvm_version_seen: if blvm_version_now == "—" {
+            version_seen.map(|(version, at)| VersionSeen { version, at })
+        } else {
+            None
+        },
+        bundle_available: prev.bundle_available,
     };
     stamp_power(&mut g);
     let snap = g.snapshot.clone();
@@ -654,6 +759,15 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
         blvm_version: snap.blvm_version.clone(),
     };
     let c = chain_mut(&mut g);
+    // A cheap tick right after a reconnect has no version yet; keep the saved one.
+    let lk = if lk.blvm_version == "—" {
+        crate::persist::LastKnown {
+            blvm_version: c.last_known.as_ref().map(|k| k.blvm_version.clone()).unwrap_or(lk.blvm_version.clone()),
+            ..lk
+        }
+    } else {
+        lk
+    };
     // Save when the status changes, and refresh the "last seen" time once a minute.
     let changed = match &c.last_known {
         Some(old) => !old.same_status(&lk) || lk.at.saturating_sub(old.at) >= 60,
@@ -751,13 +865,14 @@ fn mark_unreachable(g: &mut LiveState, err: String, listening: bool) {
     let ui_uptime = format_uptime(g.started.elapsed());
     let refused = crate::rpc::is_connect_refused(&err);
     let parked = g.views.get(&g.rpc_addr).and_then(|c| c.last_snapshot.clone());
-    let (feed, arrival, saved_height, last_known) = {
+    let (feed, arrival, saved_height, last_known, version_seen) = {
         let c = chain_mut(g);
         (
             c.feed.iter().cloned().collect::<Vec<_>>(),
             c.arrival.iter().copied().collect::<Vec<_>>(),
             c.last,
             c.last_known.clone(),
+            c.version_seen.clone(),
         )
     };
     let mut snap = parked.unwrap_or_else(|| Snapshot::disconnected(&g.rpc_addr));
@@ -796,7 +911,6 @@ fn mark_unreachable(g: &mut LiveState, err: String, listening: bool) {
                 if !lk.network.is_empty() && lk.network != "—" {
                     snap.network = lk.network.clone();
                 }
-                snap.blvm_version = lk.blvm_version.clone();
                 snap.last_seen = Some(lk.at);
             } else if let Some(h) = saved_height {
                 snap.local_height = h;
@@ -824,6 +938,24 @@ fn mark_unreachable(g: &mut LiveState, err: String, listening: bool) {
         snap.node_status = "Down".into();
         snap.network_active = false;
         snap.accepting_inbound = false;
+    }
+    // Live-only version (design M.1): never show one next to "node is down". What the node last said
+    // moves to `blvm_version_seen`, for a muted "last seen" line.
+    if snap.connected {
+        snap.blvm_version_seen = None;
+    } else {
+        let carried = (snap.blvm_version != "—").then(|| {
+            (snap.blvm_version.clone(), snap.last_seen.unwrap_or_else(crate::persist::unix_now))
+        });
+        let saved = last_known
+            .as_ref()
+            .filter(|lk| !lk.blvm_version.is_empty() && lk.blvm_version != "—")
+            .map(|lk| (lk.blvm_version.clone(), lk.at));
+        snap.blvm_version_seen = version_seen
+            .or(carried)
+            .or(saved)
+            .map(|(version, at)| VersionSeen { version, at });
+        snap.blvm_version = "—".into();
     }
     snap.error = Some(err);
     snap.rpc_failures = g.fail_streak;
@@ -855,7 +987,7 @@ fn roll_arrival(c: &mut ChainFeed, delta: u64) {
 }
 
 /// `/BitcoinCommons:0.1.0/` or `/blvm-node:0.1.0/` → `v0.1.0`
-fn parse_blvm_version(sub: &str) -> String {
+pub fn parse_blvm_version(sub: &str) -> String {
     let s = sub.trim().trim_matches('/');
     if let Some((_, ver)) = s.rsplit_once(':') {
         let ver = ver.trim().trim_matches('/');
@@ -1144,11 +1276,22 @@ fn disk_volume() -> DiskVolume {
     }
 }
 
-#[cfg(unix)]
 fn volume_space() -> (u64, u64) {
+    let path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    volume_space_at(&path)
+}
+
+/// (total, available) bytes of the volume holding `path`, or of its nearest existing parent.
+#[cfg(unix)]
+pub fn volume_space_at(path: &std::path::Path) -> (u64, u64) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    let path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let mut path = path.to_path_buf();
+    while !path.exists() {
+        if !path.pop() {
+            break;
+        }
+    }
     let path = path.canonicalize().unwrap_or(path);
     let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
         return (0, 0);
@@ -1167,7 +1310,7 @@ fn volume_space() -> (u64, u64) {
 }
 
 #[cfg(not(unix))]
-fn volume_space() -> (u64, u64) {
+pub fn volume_space_at(_path: &std::path::Path) -> (u64, u64) {
     (0, 0)
 }
 
@@ -1361,6 +1504,46 @@ mod tests {
         let testnet = chain_mut(&mut g);
         assert_eq!(testnet.last, Some(50));
         assert_eq!(testnet.feed.front().unwrap().label, "50");
+    }
+
+    #[test]
+    fn switching_rpc_back_restores_that_networks_history_and_last_status() {
+        // Managed switches move the poller between each network's default RPC address; the block
+        // history, the last status and the saved version are all keyed by that address.
+        let regtest = "127.0.0.1:18443";
+        let signet = "127.0.0.1:38332";
+        let mut g = LiveState::new(regtest.into());
+        {
+            let c = chain_mut(&mut g);
+            c.last = Some(150);
+            c.feed.push_front(FeedItem::block(150));
+            let mut snap = Snapshot::disconnected(regtest);
+            snap.connected = true;
+            snap.local_height = 150;
+            snap.network = "regtest".into();
+            snap.feed = vec![FeedItem::block(150)];
+            c.last_snapshot = Some(snap);
+            c.dirty = true;
+        }
+        let saved_before = g.all_feeds();
+        g.switch_rpc(signet.into());
+        assert_eq!(g.snapshot.rpc_addr, signet);
+        assert!(g.snapshot.feed.is_empty(), "a network never polled shows no blocks of another");
+        assert_eq!(g.snapshot.local_height, 0);
+        {
+            let c = chain_mut(&mut g);
+            c.last = Some(210_000);
+            c.feed.push_front(FeedItem::block(210_000));
+        }
+        g.switch_rpc(regtest.into());
+        assert_eq!(g.snapshot.rpc_addr, regtest);
+        assert_eq!(g.snapshot.local_height, 150, "last status of that network is back at once");
+        assert_eq!(g.snapshot.feed.len(), 1);
+        assert_eq!(chain_mut(&mut g).last, Some(150));
+        assert_eq!(chain_mut(&mut g).feed.front().unwrap().label, "150");
+        let saved_after = g.all_feeds();
+        assert_eq!(saved_after[regtest], saved_before[regtest], "regtest history untouched by the signet detour");
+        assert_eq!(saved_after[signet].last, Some(210_000));
     }
 
     #[test]
@@ -1580,5 +1763,245 @@ mod tests {
         assert_eq!(g.snapshot.health_label, "Node down");
         assert_eq!(g.snapshot.node_status, "Down");
         assert!(!g.snapshot.node_running);
+    }
+    // ---- version truth (design M.1) ----
+
+    fn live_snapshot(g: &mut LiveState) {
+        g.snapshot.connected = true;
+        g.snapshot.local_height = 100;
+        g.snapshot.blvm_version = "v0.1.13".into();
+        g.snapshot.last_seen = Some(1_790_000_500);
+        chain_mut(g).last_snapshot = Some(g.snapshot.clone());
+    }
+
+    #[test]
+    fn version_is_dash_when_the_node_stops_answering_and_last_seen_keeps_it() {
+        let mut g = LiveState::new("127.0.0.1:18332".into());
+        live_snapshot(&mut g);
+        chain_mut(&mut g).version_seen = Some(("v0.1.13".into(), 1_790_000_400));
+
+        // Process gone: refused connection.
+        mark_unreachable(&mut g, "connect 127.0.0.1:18332".into(), false);
+        assert!(!g.snapshot.connected);
+        assert_eq!(g.snapshot.blvm_version, "—");
+        assert_eq!(
+            g.snapshot.blvm_version_seen,
+            Some(VersionSeen { version: "v0.1.13".into(), at: 1_790_000_400 })
+        );
+        let v = serde_json::to_value(&g.snapshot).unwrap();
+        assert_eq!(v["blvm_version"], "—");
+        assert_eq!(v["blvm_version_seen"]["version"], "v0.1.13");
+        assert_eq!(v["blvm_version_seen"]["at"], 1_790_000_400u64);
+
+        // It stays "—" on later failed polls and keeps the same last-seen.
+        mark_unreachable(&mut g, "connect 127.0.0.1:18332".into(), false);
+        assert_eq!(g.snapshot.blvm_version, "—");
+        assert_eq!(g.snapshot.blvm_version_seen.as_ref().unwrap().version, "v0.1.13");
+    }
+
+    #[test]
+    fn a_frozen_node_shows_no_version_either_but_remembers_the_saved_one() {
+        let mut g = LiveState::new("127.0.0.1:18332".into());
+        chain_mut(&mut g).last_known = Some(crate::persist::LastKnown {
+            at: 1_790_000_000,
+            local_height: 5,
+            network_height: 10,
+            behind: 5,
+            sync_pct: "50%".into(),
+            sync_pct_num: "50".into(),
+            ibd: true,
+            network: "test".into(),
+            blvm_version: "v0.1.13".into(),
+        });
+        for _ in 0..FROZEN_AFTER {
+            mark_unreachable(&mut g, "RPC 127.0.0.1:18332 frozen".into(), true);
+        }
+        assert!(g.snapshot.frozen);
+        assert_eq!(g.snapshot.blvm_version, "—", "no live source, no version");
+        assert_eq!(
+            g.snapshot.blvm_version_seen,
+            Some(VersionSeen { version: "v0.1.13".into(), at: 1_790_000_000 })
+        );
+    }
+
+    #[test]
+    fn a_hiccup_while_the_node_is_still_considered_up_keeps_the_live_version() {
+        let mut g = LiveState::new("127.0.0.1:18332".into());
+        live_snapshot(&mut g);
+        mark_unreachable(&mut g, "Connection rate limit exceeded for IP 127.0.0.1".into(), true);
+        assert!(g.snapshot.connected);
+        assert_eq!(g.snapshot.blvm_version, "v0.1.13");
+        assert_eq!(g.snapshot.blvm_version_seen, None);
+    }
+
+    #[test]
+    fn saved_version_comes_back_only_as_last_seen_after_a_console_restart() {
+        let mut views = std::collections::BTreeMap::new();
+        views.insert(
+            "127.0.0.1:18332".to_string(),
+            crate::persist::StoredView {
+                chain: Some("test".into()),
+                last: Some(7),
+                items: vec![],
+                last_known: Some(crate::persist::LastKnown {
+                    at: 1_790_000_000,
+                    local_height: 7,
+                    network_height: 9,
+                    behind: 2,
+                    sync_pct: "77%".into(),
+                    sync_pct_num: "77".into(),
+                    ibd: false,
+                    network: "test".into(),
+                    blvm_version: "v0.1.13".into(),
+                }),
+            },
+        );
+        let mut g = LiveState::new("127.0.0.1:18332".into());
+        g.restore(views);
+        mark_unreachable(&mut g, "connect 127.0.0.1:18332".into(), false);
+        assert_eq!(g.snapshot.blvm_version, "—");
+        assert_eq!(
+            g.snapshot.blvm_version_seen,
+            Some(VersionSeen { version: "v0.1.13".into(), at: 1_790_000_000 })
+        );
+    }
+
+    #[test]
+    fn switching_the_target_clears_the_version_of_the_parked_view() {
+        let mut g = LiveState::new("127.0.0.1:18332".into());
+        live_snapshot(&mut g);
+        g.switch_rpc("127.0.0.1:38332".into());
+        assert_eq!(g.snapshot.blvm_version, "—");
+        g.switch_rpc("127.0.0.1:18332".into());
+        assert_eq!(g.snapshot.blvm_version, "—", "the parked snapshot is a memory, not a live answer");
+        assert_eq!(g.snapshot.blvm_version_seen.as_ref().map(|v| v.version.as_str()), Some("v0.1.13"));
+    }
+
+    /// A one-connection-at-a-time JSON-RPC server: every request is a batch; `chain` is what it says to
+    /// `getblockchaininfo` (None: an error object), `count` to `getblockcount`.
+    async fn fake_rpc(chain: Option<serde_json::Value>, count: u64) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let chain = chain.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        let mut tmp = [0u8; 4096];
+                        let n = match s.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else { continue };
+                        let want: usize = head
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if body.len() < want {
+                            continue;
+                        }
+                        let req: serde_json::Value = serde_json::from_str(body).unwrap();
+                        let out: Vec<serde_json::Value> = req
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|c| match c["method"].as_str().unwrap() {
+                                "getblockchaininfo" => match &chain {
+                                    Some(v) => serde_json::json!({"id": c["id"], "result": v}),
+                                    None => serde_json::json!({"id": c["id"], "error": {"code": -28, "message": "Loading block index"}}),
+                                },
+                                "getblockcount" => serde_json::json!({"id": c["id"], "result": count}),
+                                _ => serde_json::json!({"id": c["id"], "error": {"code": -32601, "message": "no"}}),
+                            })
+                            .collect();
+                        let body = serde_json::to_string(&out).unwrap();
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                        if s.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        buf.clear();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn state_with_agent(addr: &str) -> (Shared, crate::agent::Agent) {
+        let root = std::env::temp_dir().join(format!("blvm-state-flag-{}", std::process::id()));
+        let agent = crate::agent::Agent::new(
+            crate::agent::AgentConfig {
+                bin: None,
+                root,
+                network: crate::networks::by_id("regtest"),
+                rpc_addr: Some(addr.to_string()),
+                assume_valid: None,
+                child_env: Default::default(),
+                rpc_auth: None,
+                p2p_port: None,
+            },
+            crate::agent::Timings::default(),
+        );
+        let mut live = LiveState::new(addr.to_string());
+        live.console.agent = Some(agent.clone());
+        (Arc::new(RwLock::new(live)), agent)
+    }
+
+    #[tokio::test]
+    async fn s3_any_answer_from_the_rpc_counts_as_answered_for_the_agent() {
+        // The RPC server is up but the chain is not ready: getblockchaininfo errors, getblockcount answers.
+        let addr = fake_rpc(None, 5).await;
+        let (state, agent) = state_with_agent(&addr.to_string());
+        assert!(!agent.rpc_flag().load(std::sync::atomic::Ordering::Relaxed));
+        poll_once(&state).await;
+        assert!(
+            agent.rpc_flag().load(std::sync::atomic::Ordering::Relaxed),
+            "the node answered the batch; waiting for the whole probe to succeed would kill a slow start"
+        );
+        let g = state.read().await;
+        assert!(!g.snapshot.connected, "no chain info yet: not shown as a connected node");
+        drop(g);
+
+        // And with chain info the usual way: connected, flag up.
+        let addr = fake_rpc(Some(serde_json::json!({"chain": "regtest", "blocks": 3, "headers": 3})), 3).await;
+        let (state, agent) = state_with_agent(&addr.to_string());
+        poll_once(&state).await;
+        assert!(agent.rpc_flag().load(std::sync::atomic::Ordering::Relaxed));
+        assert!(state.read().await.snapshot.connected);
+    }
+
+    #[tokio::test]
+    async fn s3_nothing_listening_is_not_an_answer() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        drop(l);
+        let (state, agent) = state_with_agent(&addr);
+        agent.rpc_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+        poll_once(&state).await;
+        assert!(!agent.rpc_flag().load(std::sync::atomic::Ordering::Relaxed), "a refused connection clears the signal");
+    }
+
+    #[test]
+    fn old_status_fields_are_all_still_serialized() {
+        let v = serde_json::to_value(Snapshot::disconnected("127.0.0.1:48332")).unwrap();
+        for k in [
+            "connected", "rpc_addr", "health", "health_label", "node_status", "uptime", "blvm_version", "network",
+            "sync_pct", "sync_pct_num", "syncing", "behind", "local_height", "network_height", "ibd", "ibd_label",
+            "peers", "inbound", "outbound", "accepting_inbound", "network_active", "peer_rows", "self_geo", "banned",
+            "disk_used_num", "disk_used_unit", "disk_used_label", "disk_used_bytes", "disk_free_num", "disk_free_unit",
+            "disk_free_label", "disk_free_bytes", "disk_total_bytes", "disk_vol_used_label", "feed", "feed_waiting",
+            "arrival", "last_check", "ui_version", "ui_uptime", "rpc_failures", "show_manual", "error", "frozen",
+            "node_running", "node_busy", "node_power_label", "last_seen",
+        ] {
+            assert!(v.get(k).is_some(), "status lost field {k}");
+        }
+        for k in ["mode", "setup_done", "managed", "modules_pages", "blvm_version_seen", "bundle_available"] {
+            assert!(v.get(k).is_some(), "status is missing new field {k}");
+        }
     }
 }
