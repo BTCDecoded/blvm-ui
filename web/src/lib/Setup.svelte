@@ -236,7 +236,7 @@
     }
   }
 
-  const chainLabel = (chain?: string) => NETWORKS.find((n) => n.chain === chain)?.label ?? chain ?? "unknown chain";
+  const chainLabel = (chain?: string | null) => NETWORKS.find((n) => n.chain === chain)?.label ?? chain ?? "unknown chain";
 
   const nextOk = $derived.by(() => {
     if (cur === "mode") return w.mode === "managed" ? canManage : !!w.rpc.trim();

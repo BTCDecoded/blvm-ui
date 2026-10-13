@@ -83,6 +83,9 @@ pub struct Console {
     /// The generated RPC login exists only in memory so far (it is written with the next save, and in any case
     /// before a node is started with it: see [`Console::persist_login`]).
     login_unsaved: std::sync::atomic::AtomicBool,
+    /// Peer-to-peer port for the node instead of the network's own, on loopback only. Tests only: a node in a
+    /// test must not take a port that a real node of the person running the tests may be using.
+    pub p2p_port: Option<u16>,
     disk: Arc<Mutex<DiskCache>>,
     last_pid: Option<u32>,
 }
@@ -111,6 +114,7 @@ impl Console {
             auto_check: false,
             publish_rpc_login: false,
             login_unsaved: std::sync::atomic::AtomicBool::new(false),
+            p2p_port: None,
             disk: Arc::new(Mutex::new(DiskCache::default())),
             last_pid: None,
         }
@@ -138,6 +142,7 @@ impl Console {
             auto_check: false,
             publish_rpc_login: false,
             login_unsaved: std::sync::atomic::AtomicBool::new(false),
+            p2p_port: None,
             disk: Arc::new(Mutex::new(DiskCache::default())),
             last_pid: None,
         };
@@ -191,6 +196,11 @@ impl Console {
                 tracing::warn!("could not save the generated RPC login: {e}");
             }
         }
+    }
+
+    /// The login was created in this run and has not been saved yet: no node can have been started with it.
+    pub fn login_is_new(&self) -> bool {
+        self.login_unsaved.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Tell the RPC client which login to send.
@@ -283,7 +293,7 @@ impl Console {
             child_env: self.settings.child_env.clone(),
             // A node this process starts gets a login too (the agent of another container has its own).
             rpc_auth: self.rpc_auth(),
-            p2p_port: None,
+            p2p_port: self.p2p_port,
         }
     }
 
@@ -701,7 +711,18 @@ pub async fn boot(state: &Shared) {
         Some(found) => found,
         None => state.read().await.console.eff.node_bin.as_deref().is_some_and(Path::is_file),
     };
-    if agent.adopt() {
+    // A login that only exists since this run (an install from before nodes had one): save it now, and let the
+    // agent restart a node it adopts that still answers without a password, instead of stopping it as broken.
+    let login_is_new = state.read().await.console.login_is_new();
+    if login_is_new && !agent.is_external() {
+        state.read().await.console.persist_login();
+        agent.restart_adopted_node_with_login(true);
+    }
+    let adopted = agent.adopt();
+    if !adopted {
+        agent.restart_adopted_node_with_login(false);
+    }
+    if adopted {
         tracing::info!("managed node: re-adopted the running node");
     } else if agent.is_external() && control::read_desired(&root).is_some() {
         tracing::info!("managed node: the node agent restores what was asked last, nothing to write");
@@ -1415,11 +1436,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::sync::RwLock;
 
-    const FAKE: &str = "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'blvm 9.9.9'; exit 0; fi\ntrap 'exit 0' TERM\necho up\nwhile :; do sleep 0.1; done\n";
+    const FAKE: &str = "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'blvm 9.9.9'; exit 0; fi\ntrap 'exit 0' TERM\necho up\nwhile kill -0 $PPID 2>/dev/null; do sleep 0.1; done\n";
 
     struct Fix {
         dir: PathBuf,
         state: Shared,
+        _reap: crate::agent::testkit::ReapNodes,
     }
 
     fn fixture(tag: &str, env: EnvOverrides, with_bin: bool) -> Fix {
@@ -1439,7 +1461,8 @@ mod tests {
         let console = Console::load(Some(dir.join("state")), env, None);
         let mut live = LiveState::new(console.initial_rpc());
         live.console = console;
-        Fix { dir, state: Arc::new(RwLock::new(live)) }
+        let _reap = crate::agent::testkit::ReapNodes::under(&dir);
+        Fix { dir, state: Arc::new(RwLock::new(live)), _reap }
     }
 
     fn managed_env() -> EnvOverrides {
@@ -2477,6 +2500,108 @@ mod tests {
         assert_eq!(f.state.read().await.console.settings.node_wanted, Some(true));
         agent.stop_and_wait().await;
         let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Review R2: a desktop install from before nodes had a login. A node is running with open RPC and
+    /// `console.json` holds no login; the new console generates one at load.
+    #[tokio::test]
+    async fn an_old_install_gets_its_open_node_restarted_with_a_password_and_the_login_saved() {
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let rpc = free().to_string();
+        let dir = std::env::temp_dir().join(format!("blvm-managed-r2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _reap = crate::agent::testkit::ReapNodes::under(&dir);
+        // The node is a program that listens on the RPC port: open until `./blvm.toml` exists next to it, then
+        // asking for a login (what the real node does with the config file; see `stub_node_server`).
+        let bin = crate::agent::testkit::write_stub_node(&dir);
+        let stub_env: BTreeMap<String, String> = [
+            ("BLVM_TEST_STUB_ADDR".to_string(), rpc.clone()),
+            ("BLVM_TEST_STUB_STATUS".to_string(), "by-config".to_string()),
+        ]
+        .into();
+        let root = dir.join("root");
+        let regtest = networks::by_id("regtest").unwrap();
+        let toml = networks::dir(&root, regtest).join("blvm.toml");
+        // console.json as the old version left it: set up, a network, no login.
+        let mut old = ConsoleSettings { setup_done: true, mode: Some("managed".into()), network: Some("regtest".into()), ..Default::default() };
+        old.rpc_overrides.insert("regtest".into(), rpc.clone());
+        old.child_env = stub_env.clone();
+        settings::save_console(&dir.join("state"), &old).unwrap();
+        assert_eq!(settings::load_console(&dir.join("state")).rpc_pass, None);
+        // The node the old console started (it has no login) and that outlived it.
+        let p2p = free().port();
+        let old_cfg = AgentConfig {
+            bin: Some(bin.clone()),
+            root: root.clone(),
+            network: Some(regtest),
+            rpc_addr: Some(rpc.clone()),
+            assume_valid: None,
+            child_env: stub_env,
+            rpc_auth: None,
+            p2p_port: Some(p2p),
+        };
+        let old_agent = Agent::new(old_cfg.clone(), Timings::default());
+        old_agent.start().await.unwrap();
+        let old_pid = old_agent.view().pid.unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end && std::net::TcpStream::connect(&rpc).is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(std::net::TcpStream::connect(&rpc).is_ok(), "the node listens");
+        old_agent.detach();
+
+        // The new console.
+        let env = EnvOverrides {
+            data_root: Some(root.display().to_string()),
+            node_bin: Some(bin.display().to_string()),
+            ..Default::default()
+        };
+        let console = Console::load(Some(dir.join("state")), env, None);
+        assert!(console.login_is_new(), "generated at load, not saved yet");
+        let auth = console.rpc_auth().unwrap();
+        let state = shared(console);
+        let agent = state.read().await.console.agent.clone().unwrap();
+        agent.set_config(AgentConfig { p2p_port: Some(p2p), ..agent.config() });
+        agent.rpc_flag().store(true, std::sync::atomic::Ordering::Relaxed); // the poller reads the open node fine
+        boot(&state).await;
+
+        let end = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < end {
+            // (A start resets the flag, as it should; the real poller sets it again within a second.)
+            agent.rpc_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+            let v = agent.view();
+            if v.state == ProcState::Running && v.pid.is_some_and(|p| p != old_pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let v = agent.view();
+        assert!(v.state == ProcState::Running && v.pid.is_some_and(|p| p != old_pid), "restarted: {v:?}");
+        assert!(!crate::agent::pid_alive(old_pid), "the open node is gone");
+        assert_eq!(v.notice.as_deref(), Some("Restarted the node to turn on its RPC password."));
+        assert_eq!(v.last_error, None, "not shown as a crash");
+        // The login that the node got is the one that was saved.
+        let saved = console_json(&dir).await;
+        assert_eq!((saved.rpc_user.as_deref(), saved.rpc_pass.as_deref()), (Some(auth.user.as_str()), Some(auth.pass.as_str())));
+        let file = std::fs::read_to_string(&toml).unwrap();
+        assert!(file.contains(&format!("password = \"{}\"", auth.pass)), "the node's config has it");
+        let log = std::fs::read_to_string(networks::log_file(&root, regtest)).unwrap();
+        assert!(log.contains("[console] Restarted the node to turn on its RPC password"), "{log}");
+        // The page sees the note, and never the password.
+        {
+            let mut g = state.write().await;
+            stamp_power(&mut g);
+        }
+        let status = serde_json::to_string(&state.read().await.snapshot).unwrap();
+        assert!(status.contains("Restarted the node to turn on its RPC password."), "{status}");
+        assert!(!status.contains(&auth.pass));
+        // The next run of the console finds the login in the file and has nothing more to do.
+        let again = Console::load(Some(dir.join("state")), EnvOverrides { data_root: Some(root.display().to_string()), ..Default::default() }, None);
+        assert!(!again.login_is_new());
+        assert_eq!(again.rpc_auth(), Some(auth));
+        agent.stop_and_wait().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

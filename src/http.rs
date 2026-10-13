@@ -678,6 +678,7 @@ mod tests {
         addr: SocketAddr,
         dir: PathBuf,
         state: Shared,
+        _reap: crate::agent::testkit::ReapNodes,
     }
 
     async fn server(tag: &str, managed: bool) -> Server {
@@ -685,7 +686,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("fake-blvm.sh");
-        std::fs::write(&bin, "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'blvm 9.9.9'; exit 0; fi\ntrap 'exit 0' TERM\necho up\nwhile :; do sleep 0.1; done\n").unwrap();
+        std::fs::write(&bin, "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'blvm 9.9.9'; exit 0; fi\ntrap 'exit 0' TERM\necho up\nwhile kill -0 $PPID 2>/dev/null; do sleep 0.1; done\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let env = EnvOverrides {
             mode: Some(if managed { "managed" } else { "standalone" }.into()),
@@ -704,7 +705,8 @@ mod tests {
         tokio::spawn(async move {
             let _ = serve_listener(listener, st).await;
         });
-        Server { addr, dir, state }
+        let _reap = crate::agent::testkit::ReapNodes::under(&dir);
+        Server { addr, dir, state, _reap }
     }
 
     /// Minimal HTTP/1.1 client: returns (status, body).

@@ -223,10 +223,22 @@ pub async fn probe_once(rpc_addr: &str, creds: Option<(&str, &str)>) -> Result<V
     Ok(out)
 }
 
-/// Does the node at `addr` answer `getblockcount` to a caller with no login? `true` only for a clean `200`:
-/// a refusal (401/403/429), a closed port or a silent peer are not "open". Used right after a node that was
-/// given a password came up, to make sure the password was really applied.
-pub async fn answers_without_login(addr: &str) -> bool {
+/// What a node said to a caller with no login (see [`probe_login`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginProbe {
+    /// A clean `200`: the node serves RPC calls to anybody.
+    Open,
+    /// An explicit `401` or `403`: the node asks for a login.
+    Locked,
+    /// No usable answer (refused, dropped, timed out, `429`, a server error ...). The node limits the
+    /// connections of one address (10 per minute), so silence says nothing either way: ask again later.
+    Unknown,
+}
+
+/// Ask the node at `addr` for `getblockcount` without a login. Used right after a node that was given a
+/// password came up, to make sure the password was really applied. Only an explicit refusal counts as
+/// [`LoginProbe::Locked`]; a dropped connection or a timeout is [`LoginProbe::Unknown`], never "safe".
+pub async fn probe_login(addr: &str) -> LoginProbe {
     let body = r#"{"jsonrpc":"2.0","id":0,"method":"getblockcount","params":[]}"#;
     let req = format!(
         "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -244,9 +256,20 @@ pub async fn answers_without_login(addr: &str) -> bool {
             }
             head.extend_from_slice(&tmp[..n]);
         }
-        Some(head.starts_with(b"HTTP/1.1 200") || head.starts_with(b"HTTP/1.0 200"))
+        let code = head
+            .strip_prefix(b"HTTP/1.1 ")
+            .or_else(|| head.strip_prefix(b"HTTP/1.0 "))
+            .map(|rest| &rest[..rest.len().min(3)])?;
+        Some(match code {
+            b"200" => LoginProbe::Open,
+            b"401" | b"403" => LoginProbe::Locked,
+            _ => LoginProbe::Unknown,
+        })
     };
-    matches!(tokio::time::timeout(Duration::from_secs(2), attempt).await, Ok(Some(true)))
+    match tokio::time::timeout(Duration::from_secs(2), attempt).await {
+        Ok(Some(p)) => p,
+        _ => LoginProbe::Unknown,
+    }
 }
 
 /// `Basic …` for a user and password.
@@ -439,14 +462,37 @@ mod tests {
             });
             addr
         }
-        assert!(answers_without_login(&stub("200 OK").await).await);
-        for refusal in ["401 Unauthorized", "403 Forbidden", "429 Too Many Requests", "500 Internal Server Error"] {
-            assert!(!answers_without_login(&stub(refusal).await).await, "{refusal}");
+        assert_eq!(probe_login(&stub("200 OK").await).await, LoginProbe::Open);
+        for refusal in ["401 Unauthorized", "403 Forbidden"] {
+            assert_eq!(probe_login(&stub(refusal).await).await, LoginProbe::Locked, "{refusal}");
+        }
+        // Anything else is no answer to the question: the node's connection limit answers 429 or just hangs up.
+        for other in ["429 Too Many Requests", "500 Internal Server Error", "404 Not Found"] {
+            assert_eq!(probe_login(&stub(other).await).await, LoginProbe::Unknown, "{other}");
         }
         let free = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().to_string()
         };
-        assert!(!answers_without_login(&free).await, "nothing listening is not an open node");
+        assert_eq!(probe_login(&free).await, LoginProbe::Unknown, "nothing listening is not a locked node");
+        // A peer that accepts and drops the connection (the per-address limit) is not a locked node either.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dropper = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                drop(s);
+            }
+        });
+        assert_eq!(probe_login(&dropper).await, LoginProbe::Unknown, "a dropped connection is not a locked node");
+        // ... and one that stays silent until the check gives up.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+        assert_eq!(probe_login(&silent).await, LoginProbe::Unknown, "a timeout is not a locked node");
     }
 }

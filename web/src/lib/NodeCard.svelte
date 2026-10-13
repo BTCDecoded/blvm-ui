@@ -134,6 +134,10 @@
     </p>
   {/if}
 
+  {#if proc.notice && (st === "running" || st === "starting") && !agentGone}
+    <p class="ui-note mt-4">{proc.notice}</p>
+  {/if}
+
   {#if st === "stopped" && proc.last_error && !agentGone}
     <p class="ui-note ui-warn mt-4">{proc.last_error}</p>
   {/if}
@@ -185,25 +189,27 @@
   </div>
 
   <div class="opts">
-    <div class="opt">
-      <span>Start the node when this app starts</span>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={autoStart}
-        aria-label="Start the node when this app starts"
-        class="ui-switch"
-        onclick={() => flip("auto_start")}
-      ></button>
-    </div>
-    <p class="ui-note opt-help">
-      {#if external}
-        Applies when you left the node running: after an app update or a restart of your Umbrel it comes back by itself.
-        A node you stopped stays stopped.
-      {:else}
-        Applies when you left the node running. A node you stopped stays stopped until you start it.
-      {/if}
-    </p>
+    {#if external}
+      <!-- On Umbrel the node agent restores what you asked for last by itself, whatever this app is set to, so
+           there is nothing to switch here. -->
+      <p class="ui-note opt-help">
+        The node comes back after an app update or a restart of your Umbrel if you left it running. A node you
+        stopped stays stopped.
+      </p>
+    {:else}
+      <div class="opt">
+        <span>Start the node when this app starts</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={autoStart}
+          aria-label="Start the node when this app starts"
+          class="ui-switch"
+          onclick={() => flip("auto_start")}
+        ></button>
+      </div>
+      <p class="ui-note opt-help">Applies when you left the node running. A node you stopped stays stopped until you start it.</p>
+    {/if}
     {#if !external}
       <!-- On Umbrel the node belongs to its own container, which the app never stops on its way out. -->
       <div class="opt">

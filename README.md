@@ -99,9 +99,10 @@ What you see depends on the mode.
 **Managed** (the node is the console's):
 
 * **Node.** Running, stopped, starting or crashed, with the network, the installed version, uptime and Start, Stop and
-  Restart. Two switches: *Start the node when this app starts* (it applies only when you left the node running: a node
-  you stopped stays stopped) and *Stop the node when this console quits* (not shown on Umbrel, where the node belongs to
-  its own container). If the node agent of an Umbrel app stops answering, the card and the top light say so. If the node
+  Restart. Two switches on the desktop: *Start the node when this app starts* (it applies only when you left the node
+  running: a node you stopped stays stopped) and *Stop the node when this console quits*. Neither is shown on Umbrel,
+  where the node belongs to its own container and its agent brings back what you left running, whatever this app is set
+  to; the card says so in one line. If the node agent of an Umbrel app stops answering, the card and the top light say so. If the node
   crashed, the card shows the last log lines and *Try again*; if another program holds the node's port, it says which
   program and refuses to start.
 * **Network.** A carousel of the networks. Picking another one asks first: it shows what the current network keeps on
@@ -136,7 +137,9 @@ computer (Unix only), and version and uptime details.
 With a managed node the Logs page **tails the node's log live**, next to a short guide to the lines worth watching. The
 full file is `networks/<network>/logs/node.log` in the data folder (copy-truncated at 50 MB, one older file kept), and
 the page has a button to copy its path. With a standalone node the console cannot see the node's output, so the page
-shows the commands to run your node with verbose output, save it and follow it.
+shows the commands to run your node with verbose output, save it and follow it. A line such as "RPC authentication is
+required but no tokens or certificates are configured" in the node's log is an upstream wording issue: with the login
+this console gives the node, Basic authentication is in effect (a call without it gets `401`).
 
 ![Logs](docs/screenshots/logs.png)
 
@@ -171,7 +174,9 @@ What you get:
   asks the node to finish saving first (the agent waits up to 200 s; Docker allows 240 s). The node runs **inside the
   agent container**: restarting that container restarts the node, and a node is only taken over again when the agent
   process restarts inside a running container (a `kill -9` of the agent), not after a container restart. Your last
-  Start or Stop is kept: a node you stopped stays stopped after an app restart, an update or a reboot.
+  Start or Stop is kept: a node you stopped stays stopped after an app restart, an update or a reboot. There is no
+  *Start the node when this app starts* switch here: the agent restores `control/desired.json` by itself, so a switch
+  would change nothing.
 * **The node is not in the image.** It is downloaded on first setup, when you pick a network, from the official
   [BLVM releases](https://github.com/BTCDecoded/blvm/releases) by the web container, checked against the release's
   published checksum (releases are not signed yet), and kept under `/data/bin`; the agent runs it. Updates are installed the same way when you click, so the app's version and the node's version are
@@ -651,8 +656,15 @@ password = "…"
 * **Safety check:** once a node answers, the agent asks it for `getblockcount` without a login. If that works (the node
   did not apply the config file, for example because it could not parse it and fell back to its defaults), the node is
   stopped and the card says why. A request without or with a wrong login gets `401` from the real node (tested against
-  the built `blvm` on regtest).
-* A node that is still running from before this version keeps running without a login until it is restarted.
+  the built `blvm` on regtest). Only an explicit `401` or `403` counts as "asks for a login": a dropped connection or
+  a timeout (the node limits the connections of one address) is no answer, and the check is repeated a few seconds
+  later before the node is called `running`.
+* A node that is still running from before this version (desktop, in-process) has no login. The console creates one
+  and saves it, then **restarts that node once** to turn it on: the node is adopted, it answers a caller without a
+  password, so it is stopped and started again with the config file, and the Node card says "Restarted the node to turn
+  on its RPC password." (the log has the same line). The safety check above keeps stopping a node that should have a
+  login and does not. A start without a login (loopback only) deletes an old `blvm.toml` from the network folder,
+  because the node reads that file from its working folder even when it is not told to.
 
 Quick start (regtest, a node binary you built):
 

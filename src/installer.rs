@@ -1044,7 +1044,7 @@ mod tests {
     fn script(ver: &str, crash: Option<&str>) -> Vec<u8> {
         let run = match crash {
             Some(after) => format!("echo \"node v{ver} up\"; sleep {after}; echo boom; exit 3"),
-            None => format!("echo \"node v{ver} up\"; while :; do sleep 0.1; done"),
+            None => format!("echo \"node v{ver} up\"; while kill -0 $PPID 2>/dev/null; do sleep 0.1; done"),
         };
         format!(
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"version\" ]; then echo \"blvm {ver}\"; exit 0; fi\ntrap 'exit 0' TERM\n{run}\n"
@@ -1063,6 +1063,7 @@ mod tests {
         fake: Fake,
         ready: Arc<AtomicBool>,
         published: Mutex<Vec<(String, Vec<u8>)>>,
+        _reap: crate::agent::testkit::ReapNodes,
     }
 
     impl Fx {
@@ -1188,10 +1189,13 @@ mod tests {
         let r2 = Arc::clone(&ready);
         console.agent = None;
         console.reresolve();
-        console.agent = Some(Agent::with_ready(console.agent_config(), fast(), Arc::new(move || r2.load(Ordering::Relaxed))));
+        let agent = Agent::with_ready(console.agent_config(), fast(), Arc::new(move || r2.load(Ordering::Relaxed)));
+        agent.skip_login_check(); // the fake node has no RPC server to ask
+        console.agent = Some(agent);
         let mut live = LiveState::new(console.initial_rpc());
         live.console = console;
-        Fx { dir, root, state: Arc::new(RwLock::new(live)), fake, ready, published: Mutex::new(Vec::new()) }
+        let _reap = crate::agent::testkit::ReapNodes::under(&dir);
+        Fx { dir, root, state: Arc::new(RwLock::new(live)), fake, ready, published: Mutex::new(Vec::new()), _reap }
     }
 
     #[test]
@@ -1846,7 +1850,7 @@ mod tests {
         f.clean();
     }
 
-    /// Collects what `tracing` prints on this thread.
+    /// Collects what `tracing` prints (see `captured_log`).
     #[derive(Clone, Default)]
     struct LogBuf(Arc<Mutex<Vec<u8>>>);
 
@@ -1867,24 +1871,35 @@ mod tests {
         }
     }
 
+    /// What `tracing` printed in this test program since the first call (a process-wide subscriber, installed
+    /// once: a subscriber that is only set for one thread misses log calls made on other threads, and the
+    /// per-callsite interest cache is shared with every other test that runs at the same time).
+    fn captured_log() -> String {
+        static LOG: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
+        let buf = LOG.get_or_init(|| {
+            let buf = LogBuf::default();
+            let sub = tracing_subscriber::fmt().with_writer(buf.clone()).with_ansi(false).with_max_level(tracing::Level::INFO).finish();
+            let _ = tracing::subscriber::set_global_default(sub);
+            buf
+        });
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
     #[tokio::test]
     async fn the_checked_hash_is_written_to_the_log() {
-        let buf = LogBuf::default();
-        let sub = tracing_subscriber::fmt().with_writer(buf.clone()).with_ansi(false).with_max_level(tracing::Level::INFO).finish();
-        let _guard = tracing::subscriber::set_default(sub);
-        // Other tests may have registered this log call before, when nobody listened: have it asked again.
-        tracing::callsite::rebuild_interest_cache();
+        let _ = captured_log(); // installed before anything under test logs
         let f = fixture("loghash").await;
-        let body = script(VER, None);
+        // A program of its own, so that no other test's line can have the same checksum.
+        let mut body = script(VER, None);
+        body.extend_from_slice(b"# the-checked-hash-is-written-to-the-log\n");
         f.publish("v0.1.60", body.clone());
         let (code, _) = f.begin(Kind::Install, None).await;
         assert_eq!(code, 202);
         assert_eq!(f.wait_job("log").await.phase, "done");
-        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("checksum matches") && text.contains(&sha(&body)) && text.contains("INFO"), "{text}");
-        // A wrong checksum logs no such line.
-        let buf2 = text.matches("checksum matches").count();
-        assert_eq!(buf2, 1);
+        let text = captured_log();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("checksum matches") && l.contains(&sha(&body))).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("INFO"), "{}", lines[0]);
         f.clean();
     }
 }

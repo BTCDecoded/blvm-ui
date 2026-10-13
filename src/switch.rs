@@ -476,13 +476,27 @@ case "$FAKE_MODE" in
 esac
 echo "fake node up: $*"
 if [ "$FAKE_MODE" = crash ]; then sleep 0.3; echo "about to crash"; exit 3; fi
-while :; do sleep 0.1; done
+while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
 "#;
 
     struct Fix {
         dir: PathBuf,
         state: Shared,
         ready: Arc<AtomicBool>,
+        /// Where each network's node answers in this test: free loopback ports, never the networks' own (a node
+        /// of the person running the tests would make the tests fail).
+        rpc: std::collections::BTreeMap<&'static str, String>,
+        _reap: crate::agent::testkit::ReapNodes,
+    }
+
+    impl Fix {
+        fn rpc(&self, net: &str) -> String {
+            self.rpc[net].clone()
+        }
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
     }
 
     fn timings() -> Timings {
@@ -521,19 +535,28 @@ while :; do sleep 0.1; done
         };
         let mut s = ConsoleSettings { network: network.map(Into::into), ..Default::default() };
         s.child_env.insert("FAKE_MODE".into(), fake_mode.into());
+        let rpc: std::collections::BTreeMap<&'static str, String> =
+            networks::ALL.iter().map(|n| (n.id, format!("127.0.0.1:{}", free_port()))).collect();
+        for (id, addr) in &rpc {
+            s.rpc_overrides.insert((*id).into(), addr.clone());
+        }
         settings::save_console(&dir.join("state"), &s).unwrap();
         let mut console = Console::load(Some(dir.join("state")), env, None);
         console.timings = t.clone();
+        console.p2p_port = Some(free_port());
         console.agent = None;
         console.reresolve();
         let ready = Arc::new(AtomicBool::new(false));
         let r2 = Arc::clone(&ready);
         let cfg = console.agent_config();
-        console.agent = Some(Agent::with_ready(cfg, t, Arc::new(move || r2.load(Ordering::Relaxed))));
+        let agent = Agent::with_ready(cfg, t, Arc::new(move || r2.load(Ordering::Relaxed)));
+        agent.skip_login_check(); // the fake node has no RPC server to ask
+        console.agent = Some(agent);
         let mut live = LiveState::new(console.initial_rpc());
         live.console = console;
         stamp_power(&mut live);
-        Fix { dir, state: Arc::new(RwLock::new(live)), ready }
+        let _reap = crate::agent::testkit::ReapNodes::under(&dir);
+        Fix { dir, state: Arc::new(RwLock::new(live)), ready, rpc, _reap }
     }
 
     async fn agent(f: &Fix) -> Agent {
@@ -761,7 +784,7 @@ while :; do sleep 0.1; done
         wait_until("signet node spawned", || a.state() == ProcState::Starting && a.view().pid.is_some()).await;
         wait_until("network saved", || console_json(&f).network.as_deref() == Some("signet")).await;
         assert_eq!(phase_of(&f).await, Some(SwitchPhase::Starting), "still waiting for the RPC");
-        assert_eq!(f.state.read().await.rpc_addr, "127.0.0.1:38332");
+        assert_eq!(f.state.read().await.rpc_addr, f.rpc("signet"));
         {
             // A parked snapshot of that network that says "connected" is a memory: the node has not answered yet.
             let mut g = f.state.write().await;
@@ -774,12 +797,12 @@ while :; do sleep 0.1; done
         wait_phase(&f, SwitchPhase::Done).await;
         wait_until("node output", || log_text(&a).contains("--network signet")).await;
         let text = log_text(&a);
-        assert!(text.contains("--rpc-addr 127.0.0.1:38332"), "{text}");
+        assert!(text.contains(&format!("--rpc-addr {}", f.rpc("signet"))), "{text}");
         assert!(!text.contains("--noassumevalid"), "signet keeps the node's default assume-valid: {text}");
         assert!(text.contains("networks/signet"), "the node runs in the network's folder: {text}");
         // Status: process on the new network, switch visible, page target followed.
         let snap = f.state.read().await.snapshot.clone();
-        assert_eq!(snap.rpc_addr, "127.0.0.1:38332");
+        assert_eq!(snap.rpc_addr, f.rpc("signet"));
         assert_eq!(snap.managed.as_ref().unwrap().network, Some("signet"));
         assert_eq!(snap.managed.as_ref().unwrap().switch.as_ref().unwrap().phase, SwitchPhase::Done);
         assert!(f.dir.join("root/networks/signet/meta.json").is_file(), "meta written on spawn");
@@ -798,7 +821,7 @@ while :; do sleep 0.1; done
         let reg_dir = networks::dir(&root, reg);
         std::fs::create_dir_all(reg_dir.join("data")).unwrap();
         std::fs::write(reg_dir.join("data/blk0.dat"), b"chain bytes").unwrap();
-        a.note_height("127.0.0.1:18443", 1234, 1300);
+        a.note_height(&f.rpc("regtest"), 1234, 1300);
         a.note_height("127.0.0.1:9999", 5, 5); // another address: ignored
         let old_pid = a.view().pid.unwrap();
         f.ready.store(false, Ordering::Relaxed); // the new node must be seen as "starting" for a while
@@ -873,7 +896,7 @@ while :; do sleep 0.1; done
         assert_eq!(console_json(&f).network.as_deref(), Some("regtest"));
         assert_eq!(f.state.read().await.console.settings.network.as_deref(), Some("regtest"));
         assert_eq!(a.config().network.map(|n| n.id), Some("regtest"));
-        assert_eq!(f.state.read().await.rpc_addr, "127.0.0.1:18443");
+        assert_eq!(f.state.read().await.rpc_addr, f.rpc("regtest"));
         assert!(!f.dir.join("root/networks/signet").exists());
         assert_eq!(a.state(), ProcState::Stopping, "still trying to stop; the console did not pretend otherwise");
         assert_eq!(a.view().pid, Some(pid));
@@ -936,7 +959,7 @@ while :; do sleep 0.1; done
         assert_eq!(console_json(&f).network.as_deref(), Some("regtest"), "persisted only after the spawn");
         assert_eq!(f.state.read().await.console.settings.network.as_deref(), Some("regtest"));
         assert_eq!(a.config().network.map(|n| n.id), Some("regtest"), "agent config is put back");
-        assert_eq!(f.state.read().await.rpc_addr, "127.0.0.1:18443");
+        assert_eq!(f.state.read().await.rpc_addr, f.rpc("regtest"));
         // A new console reading the same files wakes up on the old network.
         let again = Console::load(Some(f.dir.join("state")), EnvOverrides { mode: Some("managed".into()), ..Default::default() }, None);
         assert_eq!(again.network().map(|n| n.id), Some("regtest"));
@@ -1084,11 +1107,11 @@ while :; do sleep 0.1; done
         let f = fixture("history", Some("regtest"), "run", timings());
         // Saved history for both networks' RPC addresses, as `feeds.json` would hold it.
         let mut saved = std::collections::BTreeMap::new();
-        for (rpc, last) in [("127.0.0.1:18443", 150u64), ("127.0.0.1:38332", 210_000u64)] {
+        for (net, last) in [("regtest", 150u64), ("signet", 210_000u64)] {
             saved.insert(
-                rpc.to_string(),
+                f.rpc(net),
                 crate::persist::StoredView {
-                    chain: Some(if rpc.ends_with("18443") { "regtest" } else { "signet" }.into()),
+                    chain: Some(net.into()),
                     last: Some(last),
                     items: vec![crate::persist::StoredItem::from_item(&crate::feed::FeedItem::block(last))],
                     last_known: None,
@@ -1101,13 +1124,13 @@ while :; do sleep 0.1; done
         let (code, _) = begin(&f.state, "signet").await;
         assert_eq!(code, 202);
         wait_phase(&f, SwitchPhase::Done).await;
-        assert_eq!(f.state.read().await.rpc_addr, "127.0.0.1:38332");
+        assert_eq!(f.state.read().await.rpc_addr, f.rpc("signet"));
         // Back again: the page's target is regtest's address, and both histories are exactly as saved.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let (code, v) = begin(&f.state, "regtest").await;
         assert_eq!(code, 202, "{v}");
         loop {
-            if phase_of(&f).await == Some(SwitchPhase::Done) && f.state.read().await.rpc_addr == "127.0.0.1:18443" {
+            if phase_of(&f).await == Some(SwitchPhase::Done) && f.state.read().await.rpc_addr == f.rpc("regtest") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1129,10 +1152,10 @@ while :; do sleep 0.1; done
         let first = networks::read_meta(&root, reg).unwrap();
         assert!(first.created.is_some());
         // The poller reports a new height; the 100 ms tick (60 s in production) writes it.
-        a.note_height("127.0.0.1:18443", 77, 80);
+        a.note_height(&f.rpc("regtest"), 77, 80);
         wait_until("height in meta", || networks::read_meta(&root, reg).is_some_and(|m| m.last_height == Some(77))).await;
         // A node that briefly says 0 does not erase it.
-        a.note_height("127.0.0.1:18443", 0, 0);
+        a.note_height(&f.rpc("regtest"), 0, 0);
         tokio::time::sleep(Duration::from_millis(350)).await;
         assert_eq!(networks::read_meta(&root, reg).unwrap().last_height, Some(77));
         assert_eq!(networks::read_meta(&root, reg).unwrap().created, first.created, "created never changes");

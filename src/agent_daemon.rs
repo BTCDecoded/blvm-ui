@@ -43,6 +43,8 @@ pub struct DaemonOpts {
     pub heartbeat: Duration,
     /// Decide readiness without asking the RPC port (tests).
     pub ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Peer-to-peer port instead of the network's own, on loopback only (tests: see [`AgentConfig::p2p_port`]).
+    pub p2p_port: Option<u16>,
 }
 
 impl DaemonOpts {
@@ -56,6 +58,7 @@ impl DaemonOpts {
             poll: Duration::from_millis(250),
             heartbeat: Duration::from_secs(2),
             ready: None,
+            p2p_port: None,
         }
     }
 
@@ -103,7 +106,7 @@ impl Daemon {
             assume_valid: None,
             child_env: Default::default(),
             rpc_auth: opts.rpc_auth.clone(),
-            p2p_port: None,
+            p2p_port: opts.p2p_port,
         };
         let agent = match &opts.ready {
             Some(r) => Agent::with_ready(cfg, opts.timings.clone(), Arc::clone(r)),
@@ -142,7 +145,7 @@ impl Daemon {
             assume_valid: d.assume_valid.clone(),
             child_env: d.env.clone(),
             rpc_auth: self.opts.rpc_auth.clone(),
-            p2p_port: None,
+            p2p_port: self.opts.p2p_port,
         }
     }
 
@@ -470,7 +473,7 @@ if [ "$1" = "version" ] || [ "$1" = "--version" ]; then echo "blvm 9.9.9"; exit 
 trap 'echo "got TERM"; exit 0' TERM
 echo "fake node up: $*"
 echo "cwd=$(pwd)"
-while :; do sleep 0.1; done
+while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
 "#;
 
     fn fast() -> Timings {
@@ -495,6 +498,15 @@ while :; do sleep 0.1; done
         dir: PathBuf,
         root: PathBuf,
         bin: PathBuf,
+        /// Free ports for this test's nodes: never the network's own (a regtest node of the person running the
+        /// tests would make them fail).
+        rpc_port: u16,
+        p2p_port: u16,
+        _reap: crate::agent::testkit::ReapNodes,
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
     }
 
     fn env(tag: &str) -> Env {
@@ -504,12 +516,14 @@ while :; do sleep 0.1; done
         let bin = dir.join("fake-blvm.sh");
         std::fs::write(&bin, FAKE).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Env { root: dir.join("data"), dir, bin }
+        let _reap = crate::agent::testkit::ReapNodes::under(&dir);
+        Env { root: dir.join("data"), dir, bin, rpc_port: free_port(), p2p_port: free_port(), _reap }
     }
 
     fn opts(e: &Env, ready: Arc<AtomicBool>) -> DaemonOpts {
         let mut o = DaemonOpts::new(e.root.clone());
         o.timings = fast();
+        o.p2p_port = Some(e.p2p_port);
         o.poll = Duration::from_millis(40);
         o.heartbeat = Duration::from_millis(300);
         o.ready = Some(Arc::new(move || ready.load(Ordering::Relaxed)));
@@ -560,7 +574,7 @@ while :; do sleep 0.1; done
                 bin: Some(e.bin.clone()),
                 root: e.root.clone(),
                 network: networks::by_id(net),
-                rpc_addr: networks::by_id(net).map(networks::default_rpc),
+                rpc_addr: networks::by_id(net).map(|_| format!("127.0.0.1:{}", e.rpc_port)),
                 assume_valid: None,
                 child_env: Default::default(),
                 rpc_auth: None,
@@ -617,7 +631,8 @@ while :; do sleep 0.1; done
         wait_for("logs", || web.logs(None, 100).iter().any(|l| l.text.contains("fake node up"))).await;
         let text: String = web.logs(None, 100).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("--network regtest") && text.contains("networks/regtest"), "{text}");
-        assert!(text.contains("--rpc-addr 127.0.0.1:18443"), "bind address defaults to loopback: {text}");
+        assert!(text.contains(&format!("--rpc-addr 127.0.0.1:{}", e.rpc_port)), "bind address defaults to loopback: {text}");
+        assert!(text.contains(&format!("--listen-addr 127.0.0.1:{}", e.p2p_port)), "{text}");
 
         // Stop.
         web.request_stop();
@@ -832,7 +847,7 @@ while :; do sleep 0.1; done
         assert!(text.contains("username = \"umbrel\"") && text.contains("password = \"seeded-secret\""), "{text}");
         wait_for("log", || web.logs(None, 100).iter().any(|l| l.text.contains("fake node up"))).await;
         let log: String = web.logs(None, 100).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
-        assert!(log.contains("--rpc-addr 0.0.0.0:18443") && log.contains("--config ./blvm.toml"), "{log}");
+        assert!(log.contains(&format!("--rpc-addr 0.0.0.0:{}", e.rpc_port)) && log.contains("--config ./blvm.toml"), "{log}");
         assert!(!log.contains("seeded-secret"));
         agent.terminate();
         let _ = std::fs::remove_dir_all(&e.dir);

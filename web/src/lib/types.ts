@@ -129,6 +129,9 @@ export type ManagedProcess = {
   /** Host only: the start was refused (or the node stopped) because another program holds the node's RPC or
    *  P2P port; `last_error` names the port and the program. */
   conflict?: boolean;
+  /** Host only: something the console did to the node on its own, for example "Restarted the node to turn on its
+   *  RPC password." Shown while the node runs; the next Start or Stop clears it. */
+  notice?: string | null;
 };
 
 /** Design F `managed.networks[]`. */

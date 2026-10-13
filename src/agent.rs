@@ -222,8 +222,8 @@ pub struct AgentConfig {
     /// The RPC login the node is started with. `None`: no config file, the node's RPC has no login (only
     /// acceptable while it listens on this machine alone: a start with an exposed address is refused).
     pub rpc_auth: Option<RpcAuth>,
-    /// Port for `--listen-addr` when not the network's own. Tests only: a real node in a test must not take
-    /// the P2P port that every other test checks for strangers.
+    /// Port for `--listen-addr` when not the network's own, and then on loopback only. Tests only: a node in a
+    /// test must not take the P2P port that every other test checks for strangers, nor listen to the network.
     pub p2p_port: Option<u16>,
 }
 
@@ -281,7 +281,9 @@ pub fn listen_addr(net: &Network) -> String {
 }
 
 fn listen_addr_for(cfg: &AgentConfig, net: &Network) -> String {
-    format!("0.0.0.0:{}", cfg.p2p(net))
+    // A port chosen by a test (`p2p_port`) belongs to a node that must not be reachable from the network.
+    let host = if cfg.p2p_port.is_some() { "127.0.0.1" } else { "0.0.0.0" };
+    format!("{host}:{}", cfg.p2p(net))
 }
 
 pub fn build_args(cfg: &AgentConfig, net: &Network) -> Vec<String> {
@@ -409,6 +411,10 @@ pub struct ProcessView {
     pub last_error: Option<String>,
     /// The start failed because another program holds the node's RPC or P2P port (`last_error` says which).
     pub conflict: bool,
+    /// Something the console did to the node on its own that the user should know about, shown while the
+    /// node runs (for example: the node was restarted to turn on its RPC password). Cleared by the next
+    /// Start or Stop.
+    pub notice: Option<String>,
     /// Last 50 log lines when the process crashed.
     #[serde(skip)]
     pub crash_log: Vec<String>,
@@ -482,6 +488,10 @@ struct St {
     /// Process group the node leads (its pid), killed whole when the node crashes.
     group: Option<u32>,
     conflict: bool,
+    /// See [`ProcessView::notice`].
+    notice: Option<String>,
+    /// The notice the restart that is queued behind a stop will show once the new process is claimed.
+    notice_next: Option<String>,
 }
 
 impl St {
@@ -506,6 +516,8 @@ impl St {
             network: None,
             group: None,
             conflict: false,
+            notice: None,
+            notice_next: None,
         }
     }
 }
@@ -566,6 +578,13 @@ struct Inner {
     /// SIGTERM to SIGKILL, when the controlling console asked for something other than
     /// [`Timings::stop_wait`] (`stop_grace_secs` in `desired.json`).
     stop_wait_override: Mutex<Option<Duration>>,
+    /// The console has a login for the node that it created in this run (an install from before logins): a
+    /// node it adopts that still answers without one is restarted with the login instead of being stopped.
+    /// See [`Agent::restart_adopted_node_with_login`].
+    upgrade_login: AtomicBool,
+    /// Ask a node that was given a password whether it really wants one (see [`Inner::check_login`]). Off only
+    /// in tests whose stand-in node has no RPC server to ask.
+    login_check: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -580,6 +599,19 @@ pub struct Agent {
     inner: Arc<Inner>,
     ext: Option<Arc<external::Ext>>,
 }
+
+/// What [`Inner::check_login`] found.
+enum LoginCheck {
+    /// Nothing to object to (no login was given, or the node asks for it): carry on.
+    Fine,
+    /// The node could not be asked just now.
+    Later,
+    /// The node is being stopped (or this watch is stale): stand down.
+    Gone,
+}
+
+/// Shown on the Node card, and written to the log, after an adopted node was restarted with a login.
+pub const LOGIN_RESTART_NOTICE: &str = "Restarted the node to turn on its RPC password.";
 
 enum Claim {
     Go(u64),
@@ -624,6 +656,19 @@ impl Agent {
         }
     }
 
+    /// The console has just given the node a login it did not have before (it was saved by the caller, and the
+    /// agent's config carries it). If the node adopted next still answers without a password, it is an
+    /// install from before logins: restart it once with the config file instead of stopping it as broken.
+    pub fn restart_adopted_node_with_login(&self, on: bool) {
+        self.inner.upgrade_login.store(on, Ordering::SeqCst);
+    }
+
+    /// Tests: the stand-in node has no RPC server, so there is nothing to ask about its login.
+    #[cfg(test)]
+    pub fn skip_login_check(&self) {
+        self.inner.login_check.store(false, Ordering::SeqCst);
+    }
+
     /// Use `d` instead of [`Timings::stop_wait`] from now on (the agent daemon passes `stop_grace_secs`).
     pub fn set_stop_wait(&self, d: Duration) {
         *self.inner.stop_wait_override.lock().unwrap() = Some(d);
@@ -660,6 +705,8 @@ impl Agent {
                 closed: AtomicBool::new(false),
                 external,
                 stop_wait_override: Mutex::new(None),
+                upgrade_login: AtomicBool::new(false),
+                login_check: AtomicBool::new(true),
             }),
             ext: None,
         }
@@ -722,6 +769,7 @@ impl Agent {
             restarts: st.restarts,
             last_error: st.last_error.clone(),
             conflict: st.conflict,
+            notice: st.notice.clone(),
             crash_log: st.crash_log.clone(),
             adopted: st.adopted,
             network: st.network,
@@ -965,6 +1013,8 @@ impl Inner {
         st.group = None;
         st.crash_log.clear();
         st.adopted = false;
+        st.notice = None;
+        self.upgrade_login.store(false, Ordering::SeqCst);
         Claim::Go(st.epoch)
     }
 
@@ -1034,7 +1084,19 @@ impl Inner {
                         .into(),
                 );
             }
-            None => {}
+            None => {
+                // The node also reads `./blvm.toml` from its working folder when it is not told which file to
+                // use. A file left from an earlier start with a login would still be applied, and the node would
+                // then ask for a password this start does not send.
+                if let Err(e) = std::fs::remove_file(dir.join(NODE_CONFIG_FILE)) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return self.fail_start(
+                            epoch,
+                            format!("Cannot remove the old {}: {e}", dir.join(NODE_CONFIG_FILE).display()),
+                        );
+                    }
+                }
+            }
         }
         let args = build_args(&cfg, net);
         let mut log = match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
@@ -1103,6 +1165,8 @@ impl Inner {
             st.network = Some(net.id);
         }
         write_pid_file(&cfg.root, pid, net.id, &bin);
+        #[cfg(all(test, unix))]
+        testkit::note_spawn(pid, &cfg.root);
         self.write_meta(net.id);
         tracing::info!(pid, network = net.id, bin = %bin.display(), "node agent: started");
         self.ensure_tailer();
@@ -1167,11 +1231,13 @@ impl Inner {
         let mut restart_now = false;
         let mut kill_group_of: Option<u32> = None;
         let net_id;
+        let carried_notice: Option<String>;
         {
             let mut st = self.st.lock().unwrap();
             if st.epoch != epoch {
                 return;
             }
+            carried_notice = st.notice_next.take();
             net_id = st.network;
             let group = st.group.take();
             st.pid = None;
@@ -1240,6 +1306,10 @@ impl Inner {
             let this = Arc::clone(self);
             tokio::spawn(async move {
                 if let Claim::Go(e) = this.claim(None) {
+                    if let Some(n) = carried_notice {
+                        this.log_console(&n);
+                        this.st.lock().unwrap().notice = Some(n);
+                    }
                     let _ = this.spawn_node(e).await;
                 }
             });
@@ -1289,6 +1359,67 @@ impl Inner {
         self.request_stop();
     }
 
+    /// Make sure a node that was given a password really asks for it. Only an explicit 401/403 to a caller
+    /// with no login counts as "asks"; a dropped connection or a timeout is no answer (the node limits the
+    /// connections of one address), so it is asked again after a while instead of being taken for locked.
+    async fn check_login(self: &Arc<Self>, epoch: u64, last_probe: &mut Option<Instant>) -> LoginCheck {
+        let (locked, addr) = {
+            let c = self.cfg.lock().unwrap();
+            (c.rpc_auth.is_some(), c.rpc())
+        };
+        let Some(addr) = addr.filter(|_| locked && self.login_check.load(Ordering::SeqCst)) else {
+            return LoginCheck::Fine;
+        };
+        let gap = self.timings.ready_poll * 12;
+        if last_probe.is_some_and(|t| t.elapsed() < gap) {
+            return LoginCheck::Later;
+        }
+        *last_probe = Some(Instant::now());
+        match crate::rpc::probe_login(&probe_addr(&addr)).await {
+            crate::rpc::LoginProbe::Locked => {
+                self.upgrade_login.store(false, Ordering::SeqCst);
+                LoginCheck::Fine
+            }
+            crate::rpc::LoginProbe::Unknown => LoginCheck::Later,
+            crate::rpc::LoginProbe::Open => {
+                // The node still answers a caller who has no password: it did not apply the config file
+                // (the node falls back to "no login" when it cannot read it), or it was started before this
+                // console gave nodes a login. Never leave a node like that running.
+                let upgrade = {
+                    let mut st = self.st.lock().unwrap();
+                    if st.epoch != epoch || st.state != ProcState::Starting {
+                        return LoginCheck::Gone;
+                    }
+                    if st.adopted && self.upgrade_login.swap(false, Ordering::SeqCst) {
+                        st.pending_restart = true;
+                        st.notice_next = Some(LOGIN_RESTART_NOTICE.into());
+                        true
+                    } else {
+                        st.fail_reason = Some(
+                            "The node answered without asking for the RPC password, so the console stopped it. \
+                             See the node log for why it did not read its settings file."
+                                .into(),
+                        );
+                        false
+                    }
+                };
+                if upgrade {
+                    tracing::info!("node agent: the adopted node has no RPC password; restarting it with one");
+                }
+                self.request_stop();
+                LoginCheck::Gone
+            }
+        }
+    }
+
+    /// One line in the node's log file, marked as the console's.
+    fn log_console(&self, text: &str) {
+        let Some(path) = self.cfg.lock().unwrap().log_path() else { return };
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "[console] {text}");
+        }
+    }
+
     /// `starting` -> `running` when the RPC answers and the answering listener is ours; then keeps
     /// checking that it stays ours. A silent start is waited for while the node is alive and writing its
     /// log (see [`Timings::start_timeout`] and [`Timings::start_max`]).
@@ -1298,6 +1429,7 @@ impl Inner {
         let mut deadline = (started + self.timings.start_timeout).min(hard);
         let mut log_mark = self.log_len();
         let mut running = false;
+        let mut probed: Option<Instant> = None;
         loop {
             tokio::time::sleep(if running { self.timings.owner_check } else { self.timings.ready_poll }).await;
             {
@@ -1318,46 +1450,30 @@ impl Inner {
                     self.conflict_found(epoch, msg);
                     return;
                 }
-                // The node was given a password. If it still answers a caller who has none, it did not
-                // apply the config file (the node falls back to "no login" when it cannot read the file):
-                // never leave a node like that running.
-                let (locked, addr) = {
-                    let c = self.cfg.lock().unwrap();
-                    (c.rpc_auth.is_some(), c.rpc())
-                };
-                if let Some(addr) = addr.filter(|_| locked) {
-                    if crate::rpc::answers_without_login(&probe_addr(&addr)).await {
-                        {
+                match self.check_login(epoch, &mut probed).await {
+                    LoginCheck::Gone => return,
+                    // The node could not be asked (see [`crate::rpc::LoginProbe::Unknown`]): not `running` yet,
+                    // ask again in a while. The start deadline below still applies.
+                    LoginCheck::Later => {}
+                    LoginCheck::Fine => {
+                        let net = {
                             let mut st = self.st.lock().unwrap();
-                            if st.epoch != epoch || st.state != ProcState::Starting {
+                            if st.epoch != epoch {
                                 return;
                             }
-                            st.fail_reason = Some(
-                                "The node answered without asking for the RPC password, so the console stopped it. \
-                                 See the node log for why it did not read its settings file."
-                                    .into(),
-                            );
+                            if st.state == ProcState::Starting {
+                                st.state = ProcState::Running;
+                                st.since = Some(Self::now());
+                            }
+                            st.network
+                        };
+                        if let Some(n) = net {
+                            self.write_meta(n);
                         }
-                        self.request_stop();
-                        return;
+                        running = true;
+                        continue;
                     }
                 }
-                let net = {
-                    let mut st = self.st.lock().unwrap();
-                    if st.epoch != epoch {
-                        return;
-                    }
-                    if st.state == ProcState::Starting {
-                        st.state = ProcState::Running;
-                        st.since = Some(Self::now());
-                    }
-                    st.network
-                };
-                if let Some(n) = net {
-                    self.write_meta(n);
-                }
-                running = true;
-                continue;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -1414,6 +1530,7 @@ impl Inner {
             st.state = ProcState::Stopping;
             st.stop_requested = true;
             st.want_run = false;
+            st.notice = None;
             st.since = Some(Self::now());
             net = st.network;
             (pid, st.epoch)
@@ -1880,6 +1997,95 @@ fn kill_group(_pgid: u32) {}
 
 // ---------------------------------------------------------------------------------------------
 
+/// Test support: no node a test starts may outlive the test, whether it passes, fails or hangs.
+///
+/// * every node the agent spawns in a test is noted (pid, data folder);
+/// * [`testkit::ReapNodes`] in a test's fixture kills the noted nodes under its folder, process group and
+///   all, when the fixture is dropped (also while a failed assertion unwinds);
+/// * an `atexit` hook kills whatever is left when the test program ends;
+/// * the stand-in nodes are shell scripts that end by themselves when their parent (the test program) is gone,
+///   which covers a test program that was killed (`SIGKILL`) and so ran neither of the above.
+#[cfg(all(test, unix))]
+pub(crate) mod testkit {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, Once};
+
+    static SPAWNED: Mutex<Vec<(u32, PathBuf)>> = Mutex::new(Vec::new());
+    static ATEXIT: Once = Once::new();
+
+    extern "C" fn at_exit() {
+        reap(None);
+    }
+
+    pub(crate) fn note_spawn(pid: u32, root: &Path) {
+        ATEXIT.call_once(|| unsafe {
+            libc::atexit(at_exit);
+        });
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        SPAWNED.lock().unwrap_or_else(|e| e.into_inner()).push((pid, root));
+    }
+
+    /// Kill the noted nodes whose data folder is under `under` (all of them for `None`).
+    pub(crate) fn reap(under: Option<&Path>) {
+        let list: Vec<(u32, PathBuf)> = SPAWNED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (pid, root) in list {
+            if pid <= 1 || pid == std::process::id() || under.is_some_and(|u| !root.starts_with(u)) {
+                continue;
+            }
+            if !super::pid_alive(pid) {
+                continue;
+            }
+            // Still the same process? (A pid can be handed out again; a node runs inside its data folder.)
+            if let Some(cwd) = crate::procinfo::cwd(pid) {
+                let cwd = cwd.canonicalize().unwrap_or(cwd);
+                if !cwd.starts_with(&root) {
+                    continue;
+                }
+            }
+            unsafe {
+                libc::killpg(pid as i32, libc::SIGKILL);
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// `<dir>/stub-blvm.sh`: a program that is a node. It answers `version`, and otherwise becomes
+    /// `agent::tests::stub_node_server`, a listener on `BLVM_TEST_STUB_ADDR` that answers `BLVM_TEST_STUB_STATUS`
+    /// (see there). Its own name is on the command line as a second test filter that matches nothing, so that
+    /// adoption finds the program by name.
+    pub(crate) fn write_stub_node(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = std::env::current_exe().unwrap();
+        let script = dir.join("stub-blvm.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'blvm 9.9.9'; exit 0; fi\nexec '{}' --ignored --exact agent::tests::stub_node_server stub-blvm.sh --nocapture\n",
+                exe.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Put one in the fixture of a test: kills the nodes started under `dir` when it is dropped.
+    pub(crate) struct ReapNodes(PathBuf);
+
+    impl ReapNodes {
+        pub(crate) fn under(dir: &Path) -> Self {
+            let _ = std::fs::create_dir_all(dir);
+            ReapNodes(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()))
+        }
+    }
+
+    impl Drop for ReapNodes {
+        fn drop(&mut self) {
+            reap(Some(&self.0));
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1917,14 +2123,15 @@ echo "cwd=$(pwd) schnorr=$BLVM_SCHNORR_PER_SIG leak=[$BLVM_UI_TEST_LEAK]"
 case "$FAKE_MODE" in
   crash) sleep 0.3; echo "about to crash"; exit 3 ;;
   exit0) sleep 0.3; exit 0 ;;
-  chatty) while :; do echo "tick"; sleep 0.1; done ;;
-  *) while :; do sleep 0.1; done ;;
+  chatty) while kill -0 $PPID 2>/dev/null; do echo "tick"; sleep 0.1; done ;;
+  *) while kill -0 $PPID 2>/dev/null; do sleep 0.1; done ;;
 esac
 "#;
 
     struct Env {
         root: PathBuf,
         bin: PathBuf,
+        _reap: super::testkit::ReapNodes,
     }
 
     fn setup(tag: &str) -> Env {
@@ -1934,7 +2141,8 @@ esac
         let bin = root.join("fake-blvm.sh");
         std::fs::write(&bin, FAKE).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Env { root: root.join("data-root"), bin }
+        let _reap = super::testkit::ReapNodes::under(&root);
+        Env { root: root.join("data-root"), bin, _reap }
     }
 
     fn cfg(env: &Env, mode: &str) -> AgentConfig {
@@ -1944,11 +2152,13 @@ esac
             bin: Some(env.bin.clone()),
             root: env.root.clone(),
             network: networks::by_id("regtest"),
-            rpc_addr: None,
             assume_valid: None,
             child_env,
             rpc_auth: None,
-            p2p_port: None,
+            // Never the network's own ports: a regtest node of the person running the tests must not
+            // make them fail, and a test must not take a port that somebody else may be about to use.
+            rpc_addr: Some(free_addr()),
+            p2p_port: Some(free_port()),
         }
     }
 
@@ -1994,7 +2204,11 @@ esac
         wait_for("log lines", || agent.logs(None, 100).iter().any(|l| l.text.contains("schnorr=1"))).await;
         let text: Vec<String> = agent.logs(None, 100).into_iter().map(|l| l.text).collect();
         let all = text.join("\n");
-        assert!(all.contains("--network regtest --data-dir ./data --rpc-addr 127.0.0.1:18443 --listen-addr 0.0.0.0:18444 --noassumevalid"), "{all}");
+        let (rpc, p2p) = (agent.config().rpc_addr.unwrap(), agent.config().p2p_port.unwrap());
+        assert!(
+            all.contains(&format!("--network regtest --data-dir ./data --rpc-addr {rpc} --listen-addr 127.0.0.1:{p2p} --noassumevalid")),
+            "{all}"
+        );
         let net_dir = env.root.join("networks/regtest");
         let net_dir = net_dir.canonicalize().unwrap();
         assert!(all.contains(&format!("cwd={}", net_dir.display())), "{all}");
@@ -2452,7 +2666,7 @@ if [ "$1" = "version" ]; then echo "blvm 9.9.9"; exit 0; fi
 trap 'exit 0' TERM
 if [ ! -f ./crashed-once ]; then touch ./crashed-once; echo "first run crashes"; exit 3; fi
 echo "fake node up: $*"
-while :; do sleep 0.1; done
+while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
 "#;
 
     // ---- the node's RPC login (review B1) ----
@@ -2533,7 +2747,7 @@ while :; do sleep 0.1; done
     async fn a_node_whose_rpc_would_be_open_to_other_containers_is_not_started() {
         let env = setup("login-exposed");
         let mut c = cfg(&env, "run");
-        c.rpc_addr = Some("0.0.0.0:18443".into());
+        c.rpc_addr = Some(format!("0.0.0.0:{}", free_port()));
         let agent = Agent::new(c, fast());
         let e = agent.start().await.unwrap_err();
         assert!(e.contains("without a login") && e.contains("BLVM_RPC_PASS"), "{e}");
@@ -2561,11 +2775,32 @@ while :; do sleep 0.1; done
             return;
         };
         let l = std::net::TcpListener::bind(&addr).unwrap();
+        // Gone with the test program that started it, however that ended.
+        let parent = unsafe { libc::getppid() };
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(200));
+            if unsafe { libc::getppid() } != parent {
+                std::process::exit(0);
+            }
+        });
         println!("fake node up: stub on {addr}");
+        let mut seen = 0u32;
         for conn in l.incoming().flatten() {
             let mut conn = conn;
+            seen += 1;
             let mut b = [0u8; 1024];
             let _ = conn.read(&mut b);
+            // `drop`: hang up on everybody (the node's per-address limit). `drop2`: on the first two callers only.
+            // `by-config`: open without `./blvm.toml` in the working folder, asking for a login with it (what the
+            // real node does with the config file this console writes).
+            let status = match status.as_str() {
+                "drop" => continue,
+                "drop2" if seen <= 2 => continue,
+                "drop2" => "401 Unauthorized",
+                "by-config" if std::path::Path::new("./blvm.toml").exists() => "401 Unauthorized",
+                "by-config" => "200 OK",
+                other => other,
+            };
             let body = "{\"jsonrpc\":\"2.0\",\"result\":0,\"id\":0}";
             let _ = conn.write_all(
                 format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes(),
@@ -2575,17 +2810,7 @@ while :; do sleep 0.1; done
 
     /// A script that is a node: it answers `version`, and otherwise becomes the stub server above.
     fn stub_node(env: &Env, status: &str, addr: &str) -> AgentConfig {
-        let exe = std::env::current_exe().unwrap();
-        let script = env.bin.with_file_name("stub-blvm.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'blvm 9.9.9'; exit 0; fi\nexec '{}' --ignored --exact agent::tests::stub_node_server --nocapture\n",
-                exe.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = testkit::write_stub_node(env.bin.parent().unwrap());
         let mut c = cfg(env, "run");
         c.bin = Some(script);
         c.child_env.insert("BLVM_TEST_STUB_ADDR".into(), addr.into());
@@ -2598,6 +2823,11 @@ while :; do sleep 0.1; done
     fn free_addr() -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().to_string()
+    }
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
     }
 
     #[tokio::test]
@@ -2625,6 +2855,195 @@ while :; do sleep 0.1; done
         agent.start().await.unwrap();
         wait_for("running", || agent.state() == ProcState::Running).await;
         agent.stop_and_wait().await;
+        cleanup(&env);
+    }
+
+    /// Mark the stand-in node as up, the way the poller would once the RPC answered.
+    fn ready_flag() -> (Arc<AtomicBool>, Arc<dyn Fn() -> bool + Send + Sync>) {
+        let f = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::clone(&f);
+        (f, Arc::new(move || f2.load(Ordering::Relaxed)))
+    }
+
+    #[tokio::test]
+    async fn a_node_a_test_leaves_running_is_killed_when_its_fixture_goes() {
+        // R3: a failing assertion unwinds past the `stop` at the end of a test; the fixture's guard must still
+        // take the node (and its group) down.
+        let pid;
+        {
+            let env = setup("reap-guard");
+            let agent = Agent::new(cfg(&env, "run"), fast());
+            agent.start().await.unwrap();
+            wait_up(&agent).await;
+            pid = agent.view().pid.unwrap();
+            assert!(pid_alive(pid));
+            agent.detach();
+            // `env` goes out of scope with the node still running.
+        }
+        wait_for("the node to be gone", || !pid_alive(pid)).await;
+    }
+
+    #[tokio::test]
+    async fn a_node_that_hangs_up_on_the_check_is_not_taken_for_a_locked_one() {
+        // N-a: a dropped connection (the node's limit of connections per address) says nothing about the login.
+        let env = setup("login-drop");
+        let mut t = fast();
+        t.start_timeout = Duration::from_millis(1500);
+        t.start_max = Duration::from_millis(1500);
+        let (up, ready) = ready_flag();
+        let addr = free_addr();
+        let agent = Agent::with_ready(stub_node(&env, "drop", &addr), t, ready);
+        agent.start().await.unwrap();
+        wait_up(&agent).await;
+        up.store(true, Ordering::Relaxed);
+        let end = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < end {
+            assert_ne!(agent.state(), ProcState::Running, "an unanswered check must not make the node `running`");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        wait_for("given up", || agent.state() == ProcState::Crashed).await;
+        assert!(agent.view().last_error.unwrap_or_default().contains("did not answer"), "not the 'no password' text");
+        cleanup(&env);
+
+        // A node that only hangs up on the first callers is asked again, and is `running` once it says 401.
+        let env = setup("login-drop2");
+        let (up, ready) = ready_flag();
+        let addr = free_addr();
+        let agent = Agent::with_ready(stub_node(&env, "drop2", &addr), fast(), ready);
+        agent.start().await.unwrap();
+        wait_up(&agent).await;
+        up.store(true, Ordering::Relaxed);
+        wait_for("running after the retries", || agent.state() == ProcState::Running).await;
+        agent.stop_and_wait().await;
+        cleanup(&env);
+    }
+
+    #[tokio::test]
+    async fn a_start_without_a_login_removes_a_config_file_left_by_an_earlier_start() {
+        // N-b: the node reads ./blvm.toml from its working folder even without --config.
+        let env = setup("login-stale");
+        let dir = env.root.join("networks/regtest");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("blvm.toml"), node_config_toml(&login())).unwrap();
+        let agent = Agent::new(cfg(&env, "run"), fast()); // no login: loopback only
+        agent.start().await.unwrap();
+        wait_up(&agent).await;
+        assert!(!dir.join("blvm.toml").exists(), "the node would have applied the old password");
+        let log: String = agent.logs(None, 50).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
+        assert!(!log.contains("--config"), "{log}");
+        agent.stop_and_wait().await;
+        cleanup(&env);
+    }
+
+    /// An install from before nodes had a login: a node is running without one (so it answers any caller), the
+    /// console has just created a password for it and adopts the node.
+    async fn open_node_adopted_with_a_new_login(env: &Env, flag: bool) -> (Agent, u32, Arc<AtomicBool>) {
+        let addr = free_addr();
+        let mut old = stub_node(env, "by-config", &addr);
+        old.rpc_auth = None;
+        let a = Agent::new(old.clone(), fast());
+        a.start().await.unwrap();
+        wait_up(&a).await;
+        let pid = a.view().pid.unwrap();
+        assert!(!env.root.join("networks/regtest/blvm.toml").exists());
+        assert_eq!(crate::rpc::probe_login(&addr).await, crate::rpc::LoginProbe::Open, "it really is open");
+        a.detach(); // the old console ends; the node outlives it
+        let mut cfg = old;
+        cfg.rpc_auth = Some(login());
+        let (up, ready) = ready_flag();
+        up.store(true, Ordering::Relaxed); // the poller reads it fine: an open node ignores the password
+        let b = Agent::with_ready(cfg, fast(), ready);
+        b.restart_adopted_node_with_login(flag);
+        assert!(b.adopt(), "the running node is adopted");
+        (b, pid, up)
+    }
+
+    #[tokio::test]
+    async fn an_adopted_node_without_a_password_is_restarted_with_one_when_the_login_is_new() {
+        let env = setup("login-upgrade");
+        let (b, old_pid, _up) = open_node_adopted_with_a_new_login(&env, true).await;
+        wait_for("restarted and running", || {
+            let v = b.view();
+            v.state == ProcState::Running && v.pid.is_some_and(|p| p != old_pid)
+        })
+        .await;
+        assert!(!pid_alive(old_pid), "the old node is gone");
+        let v = b.view();
+        assert_eq!(v.notice.as_deref(), Some(LOGIN_RESTART_NOTICE));
+        assert_eq!(v.last_error, None, "this is not a failure");
+        assert!(!v.adopted, "it is the console's own process now");
+        // It was started with the login: the config file is there, and the node says so in its log.
+        let file = env.root.join("networks/regtest/blvm.toml");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), node_config_toml(&login()));
+        let log: String = b.logs(None, 200).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("[console] Restarted the node to turn on its RPC password"), "{log}");
+        assert!(log.contains("--config ./blvm.toml"), "{log}");
+        assert!(!log.contains("p4ss"), "{log}");
+        // The next stop clears the note.
+        b.stop_and_wait().await;
+        assert_eq!(b.view().notice, None);
+        cleanup(&env);
+    }
+
+    #[tokio::test]
+    async fn an_adopted_node_without_a_password_is_stopped_when_the_login_is_not_new() {
+        // The safety net is for a node that SHOULD have a login: it keeps its behaviour and its message.
+        let env = setup("login-no-upgrade");
+        let (b, old_pid, _up) = open_node_adopted_with_a_new_login(&env, false).await;
+        wait_for("stopped for safety", || matches!(b.state(), ProcState::Stopped | ProcState::Crashed)).await;
+        let v = b.view();
+        assert_eq!(v.state, ProcState::Crashed);
+        assert!(v.last_error.unwrap_or_default().contains("without asking for the RPC password"));
+        assert_eq!(v.notice, None);
+        wait_for("old node gone", || !pid_alive(old_pid)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(b.state(), ProcState::Crashed, "nothing restarts it");
+        cleanup(&env);
+    }
+
+    #[tokio::test]
+    async fn the_real_node_started_before_logins_existed_comes_back_with_a_password() {
+        let Some(bin) = real_node() else {
+            eprintln!("SKIPPED: no built blvm (blvm/target/release-fast/blvm or BLVM_TEST_NODE_BIN)");
+            return;
+        };
+        let env = setup("real-upgrade");
+        let rpc = format!("127.0.0.1:{}", free_port());
+        let mut c = cfg(&env, "run");
+        c.bin = Some(bin);
+        c.child_env.clear();
+        c.rpc_addr = Some(rpc.clone());
+        let mut t = fast();
+        t.stop_wait = Duration::from_secs(30);
+        t.kill_wait = Duration::from_secs(10);
+        t.start_timeout = Duration::from_secs(60);
+        // The old console: no login, a node that answers anybody.
+        let a = Agent::new(c.clone(), t.clone());
+        a.start().await.unwrap();
+        let end = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < end && !(std::net::TcpStream::connect(&rpc).is_ok() && raw_rpc(&rpc, None).await.0 == 200) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(raw_rpc(&rpc, None).await.0, 200, "open before the upgrade");
+        let old_pid = a.view().pid.unwrap();
+        a.detach();
+        // The new console: a generated login, saved, and the node adopted.
+        let auth = RpcAuth { user: "commons".into(), pass: "correct-horse-battery".into() };
+        c.rpc_auth = Some(auth.clone());
+        let (up, ready) = ready_flag();
+        up.store(true, Ordering::Relaxed);
+        let b = Agent::with_ready(c, t, ready);
+        b.restart_adopted_node_with_login(true);
+        assert!(b.adopt());
+        wait_for("restarted and running", || {
+            let v = b.view();
+            v.state == ProcState::Running && v.pid.is_some_and(|p| p != old_pid)
+        })
+        .await;
+        assert_eq!(b.view().notice.as_deref(), Some(LOGIN_RESTART_NOTICE));
+        assert_eq!(raw_rpc(&rpc, None).await.0, 401, "now it asks");
+        assert_eq!(raw_rpc(&rpc, Some((&auth.user, &auth.pass))).await.0, 200);
+        b.stop_and_wait().await;
         cleanup(&env);
     }
 
@@ -2663,17 +3082,13 @@ while :; do sleep 0.1; done
             return;
         };
         let env = setup("real-login");
-        let free = || {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let rpc = format!("127.0.0.1:{}", free());
+        let rpc = format!("127.0.0.1:{}", free_port());
         let auth = RpcAuth { user: "commons".into(), pass: "correct-horse-battery".into() };
         let mut c = cfg(&env, "run");
         c.bin = Some(bin);
         c.child_env.clear();
         c.rpc_addr = Some(rpc.clone());
-        c.p2p_port = Some(free());
+        c.p2p_port = Some(free_port()); // and, with it, `--listen-addr 127.0.0.1:<port>`: loopback only
         c.rpc_auth = Some(auth.clone());
         let mut t = fast();
         t.stop_wait = Duration::from_secs(30);
@@ -2706,7 +3121,7 @@ while :; do sleep 0.1; done
         let (code, _) = raw_rpc(&rpc, Some((&auth.user, &auth.pass))).await;
         assert_eq!(code, 200);
         // The agent's own safety check agrees, and lets the node become `running`.
-        assert!(!crate::rpc::answers_without_login(&rpc).await);
+        assert_eq!(crate::rpc::probe_login(&rpc).await, crate::rpc::LoginProbe::Locked);
         ready.store(true, Ordering::Relaxed);
         wait_for("running", || agent.state() == ProcState::Running).await;
         // The console's RPC client, given the login, can poll it too.
@@ -2897,17 +3312,15 @@ while :; do sleep 0.1; done
     #[tokio::test]
     async fn b3_a_foreign_listener_on_the_p2p_port_is_refused_too() {
         let env = setup("b3-p2p");
-        // Signet's P2P port: unlikely to be in use on a dev machine.
-        let Ok(l) = std::net::TcpListener::bind("0.0.0.0:38333") else {
-            cleanup(&env);
-            return; // someone really runs a signet node here; nothing to test
-        };
+        // Any free port will do as the node's P2P port (and the listener that is already there takes it).
+        let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = l.local_addr().unwrap().port();
         let mut c = cfg(&env, "run");
         c.network = networks::by_id("signet");
-        c.rpc_addr = Some("127.0.0.1:38332".into());
+        c.p2p_port = Some(port);
         let agent = Reaper(Agent::new(c, fast()));
         let e = agent.0.start().await.unwrap_err();
-        assert!(e.contains("P2P port 38333 is in use by pid"), "{e}");
+        assert!(e.contains(&format!("P2P port {port} is in use by pid")), "{e}");
         assert!(agent.0.view().conflict);
         drop(l);
         cleanup(&env);
