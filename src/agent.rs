@@ -45,6 +45,11 @@ const TAIL_CHUNK: u64 = 4 * 1024 * 1024;
 const TAIL_MAX_BACKLOG: u64 = 8 * 1024 * 1024;
 const MAX_LINE_CHARS: usize = 4000;
 
+/// Refusal of a start while chain data is being deleted.
+pub const WIPING_MSG: &str = "The chain data is being deleted. Wait for that to finish.";
+/// Refusal of a wipe while a node process may exist.
+pub const STOP_FIRST_MSG: &str = "Stop the node first, then delete the chain data.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProcState {
@@ -175,26 +180,58 @@ fn toml_string(s: &str) -> String {
     out
 }
 
-/// The text of `blvm.toml`. `transport_preference` is the one key the node insists on in a config file (a
-/// file without it is rejected as a whole, and the node then runs with its defaults: no login at all), and
-/// `tcponly` is what it uses when there is no file.
-pub fn node_config_toml(auth: &RpcAuth) -> String {
-    format!(
+/// The text of `blvm.toml`, written before every start. `transport_preference` is the one key the node insists
+/// on in a config file (a file without it is rejected as a whole, and the node then runs with its defaults: no
+/// login at all), and `tcponly` is what it uses when there is no file. Top-level keys come before the first
+/// table. `[rpc_auth]` is present only with a login; `[storage.pruning]` only when `prune_keep_blocks` is set.
+pub fn node_config_toml(auth: Option<&RpcAuth>, prune_keep_blocks: Option<u64>) -> String {
+    let mut out = String::from(
         "# Written by Commons Node View before every start of the node. Changes here are overwritten.\n\
-         transport_preference = \"tcponly\"\n\
+         transport_preference = \"tcponly\"\n",
+    );
+    if let Some(auth) = auth {
+        out.push_str(&format!(
+            "\n[rpc_auth]\nrequired = true\nusername = {}\npassword = {}\n",
+            toml_string(&auth.user),
+            toml_string(&auth.pass)
+        ));
+    }
+    if let Some(n) = prune_keep_blocks {
+        out.push_str(&pruning_toml(n));
+    }
+    out
+}
+
+/// The node's `[storage.pruning]` block for "keep the newest `n` blocks". Every key is written: the node's
+/// parsed defaults differ from the ones in its code. An omitted `mode` becomes Aggressive, which replays the
+/// chain from the first block every 144 blocks, and `auto_prune` and `incremental_prune_during_ibd` default to
+/// false, so the node would store every block while it syncs. `mode` is an internally tagged table
+/// (`type = "normal"`), written as its own sub-table, as upstream's mainnet example does.
+pub fn pruning_toml(n: u64) -> String {
+    format!(
+        "\n[storage.pruning]\n\
+         auto_prune = true\n\
+         auto_prune_interval = 144\n\
+         min_blocks_to_keep = {n}\n\
+         incremental_prune_during_ibd = true\n\
+         prune_window_size = {n}\n\
+         min_blocks_for_incremental_prune = 288\n\
+         prune_on_startup = false\n\
          \n\
-         [rpc_auth]\n\
-         required = true\n\
-         username = {}\n\
-         password = {}\n",
-        toml_string(&auth.user),
-        toml_string(&auth.pass)
+         [storage.pruning.mode]\n\
+         type = \"normal\"\n\
+         keep_from_height = 0\n\
+         min_recent_blocks = {n}\n"
     )
 }
 
 /// Write `<net_dir>/blvm.toml` (mode 0600, replaced atomically).
-pub fn write_node_config(net_dir: &Path, auth: &RpcAuth) -> std::io::Result<()> {
-    crate::fsutil::write_atomic_bytes(&net_dir.join(NODE_CONFIG_FILE), node_config_toml(auth).as_bytes(), Some(0o600))
+pub fn write_node_config(net_dir: &Path, auth: Option<&RpcAuth>, prune_keep_blocks: Option<u64>) -> std::io::Result<()> {
+    crate::fsutil::write_atomic_bytes(
+        &net_dir.join(NODE_CONFIG_FILE),
+        node_config_toml(auth, prune_keep_blocks).as_bytes(),
+        Some(0o600),
+    )
 }
 
 /// Where to dial a node that was told to bind `addr`: the address itself, except that "any address"
@@ -220,18 +257,24 @@ pub struct AgentConfig {
     /// `host:port` for `--rpc-addr`; the network's default when `None`.
     pub rpc_addr: Option<String>,
     pub assume_valid: Option<String>,
+    /// Block pruning: keep the newest N blocks (`None`: every block). Written into the node's `blvm.toml`.
+    pub prune_keep_blocks: Option<u64>,
     pub child_env: BTreeMap<String, String>,
-    /// The RPC login the node is started with. `None`: no config file, the node's RPC has no login (only
-    /// acceptable while it listens on this machine alone: a start with an exposed address is refused).
+    /// The RPC login the node is started with. `None`: the config file has no `[rpc_auth]`, the node's RPC has
+    /// no login (only acceptable while it listens on this machine alone: a start with an exposed address is
+    /// refused).
     pub rpc_auth: Option<RpcAuth>,
     /// Port for `--listen-addr` when not the network's own, and then on loopback only. Tests only: a node in a
     /// test must not take the P2P port that every other test checks for strangers, nor listen to the network.
     pub p2p_port: Option<u16>,
+    /// Port for `--listen-addr` when not the network's own, on `0.0.0.0` like the default (the Umbrel app
+    /// publishes it: `BLVM_AGENT_P2P_PORT_<NET>`). `p2p_port` wins when both are set.
+    pub p2p_listen_port: Option<u16>,
 }
 
 impl AgentConfig {
     pub fn p2p(&self, net: &Network) -> u16 {
-        self.p2p_port.unwrap_or(net.p2p_port)
+        self.p2p_port.or(self.p2p_listen_port).unwrap_or(net.p2p_port)
     }
 
     pub fn net_dir(&self) -> Option<PathBuf> {
@@ -300,10 +343,10 @@ pub fn build_args(cfg: &AgentConfig, net: &Network) -> Vec<String> {
         listen_addr_for(cfg, net),
     ];
     args.extend(assume_valid_args(cfg.assume_valid.as_deref(), net));
-    if cfg.rpc_auth.is_some() {
-        args.push("--config".into());
-        args.push(format!("./{NODE_CONFIG_FILE}"));
-    }
+    // Always: without it the node may pick up `~/.config/blvm/blvm.toml` or `/etc/blvm/blvm.toml` instead of the
+    // file the console wrote (it only looks in its working folder when nothing else is named).
+    args.push("--config".into());
+    args.push(format!("./{NODE_CONFIG_FILE}"));
     args
 }
 
@@ -575,6 +618,9 @@ struct Inner {
     height: Mutex<Option<HeightNote>>,
     /// Supervision was dropped (console quitting): no new process may be started by this agent.
     closed: AtomicBool,
+    /// The console is deleting chain data: no start, restart or automatic restart may go ahead until it lets go
+    /// (see [`Agent::hold_starts`]).
+    hold_starts: AtomicBool,
     /// An agent in another container does the supervising (see [`Agent::external`]).
     external: bool,
     /// SIGTERM to SIGKILL, when the controlling console asked for something other than
@@ -650,11 +696,26 @@ impl Agent {
         self.ext.as_ref().and_then(|e| e.binary_found(&self.inner))
     }
 
+    /// The page size of the computer the node runs on, as the agent in another container reported it in
+    /// `state.json` (`None`: in-process agent, an older agent, or none has reported yet).
+    pub fn platform_facts(&self) -> Option<crate::sysinfo::Facts> {
+        self.ext.as_ref().and_then(|e| e.platform_facts(&self.inner))
+    }
+
     /// The agent process is there and writing its heartbeat (always true for an in-process agent).
     pub fn alive(&self) -> bool {
         match &self.ext {
             Some(e) => e.alive(&self.inner),
             None => true,
+        }
+    }
+
+    /// The refusal to answer a change that needs a stopped node with, when the agent in another container has gone
+    /// quiet (see `Ext::quiet`); `None` for an in-process agent and for one that answers.
+    pub fn quiet_refusal(&self) -> Option<&'static str> {
+        match &self.ext {
+            Some(e) if e.quiet(&self.inner) => Some(external::NOT_ANSWERING),
+            _ => None,
         }
     }
 
@@ -705,6 +766,7 @@ impl Agent {
                 refreshing: AtomicBool::new(false),
                 height: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                hold_starts: AtomicBool::new(false),
                 external,
                 stop_wait_override: Mutex::new(None),
                 upgrade_login: AtomicBool::new(false),
@@ -757,6 +819,15 @@ impl Agent {
         *self.inner.cfg.lock().unwrap() = cfg;
     }
 
+    /// With the agent in another container: save the current config into `desired.json` without restarting
+    /// anything (see `Ext::sync_desired`). Nothing to do for an agent in this process, which keeps the config
+    /// in memory.
+    pub fn sync_desired(&self) {
+        if let Some(e) = &self.ext {
+            e.sync_desired(&self.inner);
+        }
+    }
+
     pub fn view(&self) -> ProcessView {
         if let Some(e) = &self.ext {
             return e.view(&self.inner);
@@ -805,6 +876,9 @@ impl Agent {
     pub async fn start(&self) -> Result<(), String> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err("The console is shutting down.".into());
+        }
+        if self.inner.hold_starts.load(Ordering::SeqCst) {
+            return Err(WIPING_MSG.into());
         }
         if let Some(e) = &self.ext {
             return e.start(&self.inner);
@@ -898,6 +972,9 @@ impl Agent {
 
     /// Stop, then start again. Returns at once.
     pub async fn restart(&self) -> Result<(), String> {
+        if self.inner.hold_starts.load(Ordering::SeqCst) {
+            return Err(WIPING_MSG.into());
+        }
         if let Some(e) = &self.ext {
             return e.restart(&self.inner);
         }
@@ -917,6 +994,25 @@ impl Agent {
         } else {
             self.start().await
         }
+    }
+
+    /// While the console deletes chain data nothing may start a node on it: `true` refuses every start, restart
+    /// and automatic restart of this agent until `false` is passed again.
+    pub fn hold_starts(&self, on: bool) {
+        self.inner.hold_starts.store(on, Ordering::SeqCst);
+    }
+
+    /// Can the chain data be deleted now? `Ok` only when no node process exists. With the agent in another
+    /// container the console cannot see the process, so it also needs a fresh heartbeat and a `state.json` that
+    /// belongs to the last request the console wrote (see `Ext::confirm_stopped`).
+    pub fn confirm_stopped(&self) -> Result<(), String> {
+        if let Some(e) = &self.ext {
+            return e.confirm_stopped(&self.inner);
+        }
+        if self.state().is_active() {
+            return Err(STOP_FIRST_MSG.into());
+        }
+        Ok(())
     }
 
     /// Pick up a node that survived a console crash. `true` when one was adopted.
@@ -988,6 +1084,11 @@ impl Inner {
             return Claim::Cancelled;
         }
         let mut st = self.st.lock().unwrap();
+        // Looked at under the state lock: `Agent::confirm_stopped` reads the state under it too, so a start
+        // either took the slot before that look (and the wipe is refused) or sees the hold already set.
+        if self.hold_starts.load(Ordering::SeqCst) {
+            return Claim::Cancelled;
+        }
         if let Some(e) = auto {
             if st.epoch != e || st.state != ProcState::Crashed || !st.want_run {
                 return Claim::Cancelled;
@@ -1069,34 +1170,32 @@ impl Inner {
             return self.fail_start(epoch, format!("Cannot create {}: {e}", dir.display()));
         }
         let _ = rotate_log(&log_path, self.timings.log_max_bytes);
-        match &cfg.rpc_auth {
-            Some(auth) => {
-                if let Err(e) = write_node_config(&dir, auth) {
+        if cfg.rpc_auth.is_none() && cfg.rpc().as_deref().is_some_and(rpc_exposed) {
+            return self.fail_start(
+                epoch,
+                "The node's RPC would be reachable from other containers without a login, so it was not started. \
+                 Set BLVM_RPC_USER and BLVM_RPC_PASS for the node container."
+                    .into(),
+            );
+        }
+        // The config file is written before every start, with or without a login: the node reads `./blvm.toml`
+        // from its working folder even when it is not told which file to use, so a file left from an earlier
+        // start (with a login, or with pruning) must never be applied by accident.
+        if let Err(e) = write_node_config(&dir, cfg.rpc_auth.as_ref(), cfg.prune_keep_blocks) {
+            return self.fail_start(epoch, format!("Cannot write {}: {e}", dir.join(NODE_CONFIG_FILE).display()));
+        }
+        // Remember in `meta.json` that this folder has been used by a pruning node: the node starts deleting old
+        // blocks from then on, and going back to a full node needs the chain data deleted (see `ran_pruned`).
+        // Written before the node exists, and cleared only by the wipe. The same code runs in the agent container.
+        if cfg.prune_keep_blocks.is_some() {
+            let mut m = networks::read_meta(&cfg.root, net).unwrap_or_default();
+            if m.ran_pruned != Some(true) {
+                m.ran_pruned = Some(true);
+                if let Err(e) = networks::write_meta(&cfg.root, net, &m) {
                     return self.fail_start(
                         epoch,
-                        format!("Cannot write {}: {e}", dir.join(NODE_CONFIG_FILE).display()),
+                        format!("Cannot write {}: {e}", networks::meta_file(&cfg.root, net).display()),
                     );
-                }
-            }
-            None if cfg.rpc().as_deref().is_some_and(rpc_exposed) => {
-                return self.fail_start(
-                    epoch,
-                    "The node's RPC would be reachable from other containers without a login, so it was not started. \
-                     Set BLVM_RPC_USER and BLVM_RPC_PASS for the node container."
-                        .into(),
-                );
-            }
-            None => {
-                // The node also reads `./blvm.toml` from its working folder when it is not told which file to
-                // use. A file left from an earlier start with a login would still be applied, and the node would
-                // then ask for a password this start does not send.
-                if let Err(e) = std::fs::remove_file(dir.join(NODE_CONFIG_FILE)) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return self.fail_start(
-                            epoch,
-                            format!("Cannot remove the old {}: {e}", dir.join(NODE_CONFIG_FILE).display()),
-                        );
-                    }
                 }
             }
         }
@@ -1134,6 +1233,10 @@ impl Inner {
         // the same variable, and a filter that names only the console's crate silences every line the node
         // writes: the Logs page stayed empty. The node gets one only through the Child environment setting.
         cmd.env_remove("RUST_LOG");
+        // The node reads `BLVM_ASSUME_VALID_HEIGHT` before the command line and the config file, so one
+        // inherited from the console's own environment would silently override the user's assume-valid
+        // choice. The node gets one only through the Child environment setting.
+        cmd.env_remove("BLVM_ASSUME_VALID_HEIGHT");
         for (k, v) in child_env(&cfg) {
             match v {
                 Some(v) => {
@@ -2199,7 +2302,7 @@ case "$FAKE_MODE" in
   *) trap 'echo "got TERM"; exit 0' TERM ;;
 esac
 echo "fake node up: $*"
-echo "cwd=$(pwd) schnorr=$BLVM_SCHNORR_PER_SIG leak=[$BLVM_UI_TEST_LEAK]"
+echo "cwd=$(pwd) schnorr=$BLVM_SCHNORR_PER_SIG leak=[$BLVM_UI_TEST_LEAK] av=[$BLVM_ASSUME_VALID_HEIGHT]"
 case "$FAKE_MODE" in
   crash) sleep 0.3; echo "about to crash"; exit 3 ;;
   exit0) sleep 0.3; exit 0 ;;
@@ -2233,12 +2336,14 @@ esac
             root: env.root.clone(),
             network: networks::by_id("regtest"),
             assume_valid: None,
+            prune_keep_blocks: None,
             child_env,
             rpc_auth: None,
             // Never the network's own ports: a regtest node of the person running the tests must not
             // make them fail, and a test must not take a port that somebody else may be about to use.
             rpc_addr: Some(free_addr()),
             p2p_port: Some(free_port()),
+            p2p_listen_port: None,
         }
     }
 
@@ -2266,6 +2371,7 @@ esac
     async fn start_runs_in_the_network_dir_and_stop_is_graceful() {
         let env = setup("start-stop");
         std::env::set_var("BLVM_UI_TEST_LEAK", "secret");
+        std::env::set_var("BLVM_ASSUME_VALID_HEIGHT", "123456");
         let agent = Agent::new(cfg(&env, "run"), fast());
         assert_eq!(agent.state(), ProcState::Stopped);
         agent.start().await.unwrap();
@@ -2293,6 +2399,10 @@ esac
         let net_dir = net_dir.canonicalize().unwrap();
         assert!(all.contains(&format!("cwd={}", net_dir.display())), "{all}");
         assert!(all.contains("leak=[]"), "BLVM_UI_* variables must not reach the node: {all}");
+        assert!(
+            all.contains("av=[]"),
+            "an inherited BLVM_ASSUME_VALID_HEIGHT beats the node's command line, so it must not reach the node: {all}"
+        );
         assert!(net_dir.join("logs/node.log").is_file());
 
         // Graceful stop: SIGTERM, the script says so and exits 0.
@@ -2313,6 +2423,9 @@ esac
         assert_eq!(agent.state(), ProcState::Starting);
         agent.stop_and_wait().await;
         assert_eq!(agent.state(), ProcState::Stopped);
+        // Process-wide, and every other test in this binary starts nodes too (they must not see it either:
+        // the agent removes it for them as well). Do not leave it behind.
+        std::env::remove_var("BLVM_ASSUME_VALID_HEIGHT");
         cleanup(&env);
     }
 
@@ -2640,21 +2753,23 @@ esac
             network: Some(regtest),
             rpc_addr: None,
             assume_valid: None,
+            prune_keep_blocks: None,
             child_env: BTreeMap::new(),
             rpc_auth: None,
             p2p_port: None,
+            p2p_listen_port: None,
         };
         assert_eq!(
             build_args(&c, regtest),
             [
                 "--network", "regtest", "--data-dir", "./data", "--rpc-addr", "127.0.0.1:18443", "--listen-addr", "0.0.0.0:18444",
-                "--noassumevalid"
+                "--noassumevalid", "--config", "./blvm.toml"
             ]
         );
         // Mainnet keeps the node's own assume-valid default; the P2P bind is always stated (B3).
         assert_eq!(
             build_args(&c, mainnet),
-            ["--network", "mainnet", "--data-dir", "./data", "--rpc-addr", "127.0.0.1:8332", "--listen-addr", "0.0.0.0:8333"]
+            ["--network", "mainnet", "--data-dir", "./data", "--rpc-addr", "127.0.0.1:8332", "--listen-addr", "0.0.0.0:8333", "--config", "./blvm.toml"]
         );
         // Overrides.
         c.assume_valid = Some("off".into());
@@ -2664,13 +2779,25 @@ esac
         assert!(a.windows(2).any(|w| w[0] == "--assumevalid" && w[1] == "700000"));
         assert!(!a.contains(&"--noassumevalid".to_string()));
         c.assume_valid = Some("bogus".into());
-        assert_eq!(build_args(&c, mainnet).len(), 8, "an invalid setting falls back to the default");
+        assert_eq!(build_args(&c, mainnet).len(), 10, "an invalid setting falls back to the default (eight options and --config <file>)");
         c.rpc_addr = Some("127.0.0.1:19999".into());
         assert!(build_args(&c, mainnet).contains(&"127.0.0.1:19999".to_string()));
 
         assert!(valid_assume_valid("0") && valid_assume_valid("off") && valid_assume_valid("default"));
         assert!(valid_assume_valid(&"ab".repeat(32)));
         assert!(!valid_assume_valid("12x") && !valid_assume_valid("") && !valid_assume_valid("1234567890"));
+
+        // "default" per network: full validation is stated on Testnet4 and regtest, the node's own default
+        // (no flag) on the others; an explicit height or "off" wins on every network.
+        for net in networks::ALL.iter() {
+            let want: Vec<String> = if net.full_validation { vec!["--noassumevalid".into()] } else { Vec::new() };
+            assert_eq!(assume_valid_args(Some("default"), net), want, "{}", net.id);
+            assert_eq!(assume_valid_args(None, net), want, "{}", net.id);
+            assert_eq!(assume_valid_args(Some("off"), net), ["--noassumevalid"], "{}", net.id);
+            assert_eq!(assume_valid_args(Some("800000"), net), ["--assumevalid", "800000"], "{}", net.id);
+        }
+        assert!(["mainnet", "testnet", "signet"].iter().all(|id| !networks::by_id(id).unwrap().full_validation));
+        assert!(["testnet4", "regtest"].iter().all(|id| networks::by_id(id).unwrap().full_validation));
 
         // Child env: schnorr per-sig on by default, overridable, empty value unsets.
         assert_eq!(child_env(&c), vec![("BLVM_SCHNORR_PER_SIG".to_string(), Some("1".to_string()))]);
@@ -2757,13 +2884,13 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
 
     #[test]
     fn the_node_config_has_the_login_and_the_one_key_the_node_insists_on() {
-        let t = node_config_toml(&login());
+        let t = node_config_toml(Some(&login()), None);
         assert!(t.contains("transport_preference = \"tcponly\"\n"), "{t}");
         assert!(t.contains("[rpc_auth]\nrequired = true\nusername = \"commons\"\npassword = \"p4ss\\\"w\\\\rd\"\n"), "{t}");
         // Top-level keys come before the first table, or they would belong to it.
         assert!(t.find("transport_preference").unwrap() < t.find("[rpc_auth]").unwrap());
         // Control characters cannot break out of the string.
-        let nasty = node_config_toml(&RpcAuth { user: "a\nb".into(), pass: "x\u{1}\ty".into() });
+        let nasty = node_config_toml(Some(&RpcAuth { user: "a\nb".into(), pass: "x\u{1}\ty".into() }), None);
         assert!(nasty.contains("username = \"a\\nb\"") && nasty.contains("password = \"x\\u0001\\ty\""), "{nasty}");
         assert_eq!(nasty.lines().filter(|l| l.starts_with("username")).count(), 1);
         // The password never shows in a Debug print of the config.
@@ -2772,13 +2899,127 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
     }
 
     #[test]
-    fn the_config_option_is_passed_only_when_there_is_a_login() {
+    fn the_config_option_is_always_passed() {
+        // Without it the node may pick up ~/.config/blvm/blvm.toml or /etc/blvm/blvm.toml instead of the file
+        // the console wrote, with or without a login and with or without pruning.
         let regtest = networks::by_id("regtest").unwrap();
         let mut c = cfg(&setup("cfgarg"), "run");
-        assert!(!build_args(&c, regtest).contains(&"--config".to_string()));
+        let has_config = |c: &AgentConfig| {
+            let a = build_args(c, regtest);
+            a.windows(2).any(|w| w[0] == "--config" && w[1] == "./blvm.toml") && a.iter().filter(|x| *x == "--config").count() == 1
+        };
+        assert!(has_config(&c), "no login, no pruning");
         c.rpc_auth = Some(login());
-        let a = build_args(&c, regtest);
-        assert!(a.windows(2).any(|w| w[0] == "--config" && w[1] == "./blvm.toml"), "{a:?}");
+        assert!(has_config(&c), "login");
+        c.prune_keep_blocks = Some(5000);
+        assert!(has_config(&c), "login and pruning");
+        c.rpc_auth = None;
+        assert!(has_config(&c), "pruning only");
+    }
+
+    /// The `[storage.pruning]` block the node must be given for "keep the newest N blocks": every key explicit
+    /// (the node's parsed defaults are unsafe), `mode` as a sub-table of `type = "normal"`.
+    fn pruning_block(n: u64) -> String {
+        format!(
+            "\n[storage.pruning]\nauto_prune = true\nauto_prune_interval = 144\nmin_blocks_to_keep = {n}\n\
+             incremental_prune_during_ibd = true\nprune_window_size = {n}\nmin_blocks_for_incremental_prune = 288\n\
+             prune_on_startup = false\n\n[storage.pruning.mode]\ntype = \"normal\"\nkeep_from_height = 0\n\
+             min_recent_blocks = {n}\n"
+        )
+    }
+
+    #[test]
+    fn the_node_config_has_pruning_only_when_asked_and_a_login_only_when_there_is_one() {
+        let header = "# Written by Commons Node View before every start of the node. Changes here are overwritten.\n\
+                      transport_preference = \"tcponly\"\n";
+        let rpc = "\n[rpc_auth]\nrequired = true\nusername = \"commons\"\npassword = \"p4ss\\\"w\\\\rd\"\n";
+
+        // Nothing configured: the header and the one key the node insists on.
+        assert_eq!(node_config_toml(None, None), header);
+        // A login only.
+        assert_eq!(node_config_toml(Some(&login()), None), format!("{header}{rpc}"));
+        // Pruning only: every key is there and N is substituted in all three places.
+        let p = node_config_toml(None, Some(5000));
+        assert_eq!(p, format!("{header}{}", pruning_block(5000)));
+        assert!(!p.contains("rpc_auth"));
+        for key in [
+            "auto_prune = true",
+            "auto_prune_interval = 144",
+            "min_blocks_to_keep = 5000",
+            "incremental_prune_during_ibd = true",
+            "prune_window_size = 5000",
+            "min_blocks_for_incremental_prune = 288",
+            "prune_on_startup = false",
+            "[storage.pruning.mode]",
+            "type = \"normal\"",
+            "keep_from_height = 0",
+            "min_recent_blocks = 5000",
+        ] {
+            assert!(p.lines().any(|l| l == key), "missing `{key}` in\n{p}");
+        }
+        assert_eq!(p.matches("5000").count(), 3, "N appears in min_blocks_to_keep, prune_window_size and min_recent_blocks");
+        // Both: login first, then pruning; top-level keys stay above every table.
+        let both = node_config_toml(Some(&login()), Some(288));
+        assert_eq!(both, format!("{header}{rpc}{}", pruning_block(288)));
+        assert!(both.find("transport_preference").unwrap() < both.find("[rpc_auth]").unwrap());
+        assert!(both.find("[rpc_auth]").unwrap() < both.find("[storage.pruning]").unwrap());
+        assert!(both.find("[storage.pruning]\n").unwrap() < both.find("[storage.pruning.mode]").unwrap());
+        // `mode` is its own sub-table, with the `type` tag the node's internally tagged enum reads (parsed with a
+        // real TOML parser in `the_generated_config_parses_to_the_tables_the_node_reads`).
+        assert!(both.contains("\n[storage.pruning.mode]\ntype = \"normal\"\n"), "{both}");
+        // The mode table is the last table, so no pruning key can fall under it by accident.
+        assert!(both.rfind("[storage.pruning]").unwrap() < both.rfind("[storage.pruning.mode]").unwrap());
+        assert!(!both["[storage.pruning.mode]".len() + both.rfind("[storage.pruning.mode]").unwrap()..].contains("auto_prune"));
+    }
+
+    /// The text is parsed with a real TOML parser, so a typo that the exact-text test above would repeat (a key
+    /// under the wrong table, a bad escape) shows up as a different structure.
+    #[test]
+    fn the_generated_config_parses_to_the_tables_the_node_reads() {
+        let parse = |t: &str| t.parse::<toml::Table>().unwrap_or_else(|e| panic!("not TOML: {e}\n{t}"));
+
+        // Nothing configured: one top-level key and no tables.
+        let t = parse(&node_config_toml(None, None));
+        assert_eq!(t.get("transport_preference").and_then(|v| v.as_str()), Some("tcponly"));
+        assert!(t.get("rpc_auth").is_none() && t.get("storage").is_none());
+        assert_eq!(t.len(), 1);
+
+        // A login only: the password survives its escapes.
+        let t = parse(&node_config_toml(Some(&login()), None));
+        let auth = t["rpc_auth"].as_table().unwrap();
+        assert_eq!(auth["required"].as_bool(), Some(true));
+        assert_eq!(auth["username"].as_str(), Some("commons"));
+        assert_eq!(auth["password"].as_str(), Some("p4ss\"w\\rd"));
+        assert!(t.get("storage").is_none());
+
+        // Pruning only: `storage.pruning` with every key at its type, `mode` a table tagged `normal`.
+        for n in [288u64, 5000, 100_000_000] {
+            let t = parse(&node_config_toml(None, Some(n)));
+            assert!(t.get("rpc_auth").is_none(), "no login, no [rpc_auth]");
+            let p = t["storage"]["pruning"].as_table().unwrap();
+            assert_eq!(p["auto_prune"].as_bool(), Some(true));
+            assert_eq!(p["auto_prune_interval"].as_integer(), Some(144));
+            assert_eq!(p["min_blocks_to_keep"].as_integer(), Some(n as i64));
+            assert_eq!(p["incremental_prune_during_ibd"].as_bool(), Some(true));
+            assert_eq!(p["prune_window_size"].as_integer(), Some(n as i64));
+            assert_eq!(p["min_blocks_for_incremental_prune"].as_integer(), Some(288));
+            assert_eq!(p["prune_on_startup"].as_bool(), Some(false));
+            let mode = p["mode"].as_table().expect("mode is a table");
+            assert_eq!(mode["type"].as_str(), Some("normal"));
+            assert_eq!(mode["keep_from_height"].as_integer(), Some(0));
+            assert_eq!(mode["min_recent_blocks"].as_integer(), Some(n as i64));
+            assert_eq!(mode.len(), 3, "nothing else under mode: {mode:?}");
+            // Nothing under `storage` but pruning; no key of the block fell out of it.
+            assert_eq!(t["storage"].as_table().unwrap().len(), 1);
+            assert_eq!(p.len(), 8, "seven keys and the mode table: {p:?}");
+        }
+
+        // Both: the login and the same pruning structure, and the top-level key is still top level.
+        let t = parse(&node_config_toml(Some(&login()), Some(288)));
+        assert_eq!(t["transport_preference"].as_str(), Some("tcponly"));
+        assert_eq!(t["rpc_auth"]["username"].as_str(), Some("commons"));
+        assert_eq!(t["storage"]["pruning"]["mode"]["type"].as_str(), Some("normal"));
+        assert_eq!(t["storage"]["pruning"]["min_blocks_to_keep"].as_integer(), Some(288));
     }
 
     #[test]
@@ -2806,7 +3047,7 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         wait_up(&agent).await;
         let file = env.root.join("networks/regtest/blvm.toml");
         let text = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(text, node_config_toml(&login()));
+        assert_eq!(text, node_config_toml(Some(&login()), None));
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         let log: String = agent.logs(None, 200).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
         assert!(log.contains("--config ./blvm.toml"), "{log}");
@@ -2871,13 +3112,14 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
             let mut b = [0u8; 1024];
             let _ = conn.read(&mut b);
             // `drop`: hang up on everybody (the node's per-address limit). `drop2`: on the first two callers only.
-            // `by-config`: open without `./blvm.toml` in the working folder, asking for a login with it (what the
-            // real node does with the config file this console writes).
+            // `by-config`: open without a login in `./blvm.toml` in the working folder, asking for one with it (what
+            // the real node does with the config file this console writes: the file is always there now, and only
+            // its `[rpc_auth]` table turns the login on).
             let status = match status.as_str() {
                 "drop" => continue,
                 "drop2" if seen <= 2 => continue,
                 "drop2" => "401 Unauthorized",
-                "by-config" if std::path::Path::new("./blvm.toml").exists() => "401 Unauthorized",
+                "by-config" if std::fs::read_to_string("./blvm.toml").is_ok_and(|t| t.contains("[rpc_auth]")) => "401 Unauthorized",
                 "by-config" => "200 OK",
                 other => other,
             };
@@ -2995,18 +3237,47 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
     }
 
     #[tokio::test]
-    async fn a_start_without_a_login_removes_a_config_file_left_by_an_earlier_start() {
-        // N-b: the node reads ./blvm.toml from its working folder even without --config.
+    async fn a_start_without_a_login_rewrites_the_config_file_without_rpc_auth() {
+        // The node reads ./blvm.toml from its working folder even without --config, so the console always owns
+        // the file: a login from an earlier start must not survive into a start without one, and the file the
+        // console passes with --config must exist.
+        use std::os::unix::fs::PermissionsExt;
         let env = setup("login-stale");
         let dir = env.root.join("networks/regtest");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("blvm.toml"), node_config_toml(&login())).unwrap();
+        std::fs::write(dir.join("blvm.toml"), node_config_toml(Some(&login()), Some(1000))).unwrap();
         let agent = Agent::new(cfg(&env, "run"), fast()); // no login: loopback only
         agent.start().await.unwrap();
         wait_up(&agent).await;
-        assert!(!dir.join("blvm.toml").exists(), "the node would have applied the old password");
+        let file = dir.join("blvm.toml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text, node_config_toml(None, None), "the old password and the old pruning block are gone");
+        assert!(!text.contains("rpc_auth") && !text.contains("storage.pruning"), "{text}");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         let log: String = agent.logs(None, 50).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
-        assert!(!log.contains("--config"), "{log}");
+        assert!(log.contains("--config ./blvm.toml"), "{log}");
+        agent.stop_and_wait().await;
+        cleanup(&env);
+    }
+
+    #[tokio::test]
+    async fn a_start_with_pruning_writes_the_pruning_block_and_the_next_start_follows_the_setting() {
+        let env = setup("prune-start");
+        let mut c = cfg(&env, "run");
+        c.prune_keep_blocks = Some(300);
+        let agent = Agent::new(c, fast());
+        agent.start().await.unwrap();
+        wait_up(&agent).await;
+        let file = env.root.join("networks/regtest/blvm.toml");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), node_config_toml(None, Some(300)));
+        agent.stop_and_wait().await;
+        // Pruning switched off: the next start writes the file without the block.
+        let mut c2 = agent.config();
+        c2.prune_keep_blocks = None;
+        agent.set_config(c2);
+        agent.start().await.unwrap();
+        wait_up(&agent).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), node_config_toml(None, None));
         agent.stop_and_wait().await;
         cleanup(&env);
     }
@@ -3021,7 +3292,9 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         a.start().await.unwrap();
         wait_up(&a).await;
         let pid = a.view().pid.unwrap();
-        assert!(!env.root.join("networks/regtest/blvm.toml").exists());
+        // A start without a login still writes the file, but without `[rpc_auth]`.
+        let before = std::fs::read_to_string(env.root.join("networks/regtest/blvm.toml")).unwrap();
+        assert!(!before.contains("rpc_auth"), "{before}");
         assert_eq!(crate::rpc::probe_login(&addr).await, crate::rpc::LoginProbe::Open, "it really is open");
         a.detach(); // the old console ends; the node outlives it
         let mut cfg = old;
@@ -3050,7 +3323,7 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         assert!(!v.adopted, "it is the console's own process now");
         // It was started with the login: the config file is there, and the node says so in its log.
         let file = env.root.join("networks/regtest/blvm.toml");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), node_config_toml(&login()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), node_config_toml(Some(&login()), None));
         let log: String = b.logs(None, 200).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
         assert!(log.contains("[console] Restarted the node to turn on its RPC password"), "{log}");
         assert!(log.contains("--config ./blvm.toml"), "{log}");
@@ -3668,6 +3941,34 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         assert!(e.contains("Regtest") && e.contains(&pid.to_string()), "{e}");
         assert_eq!(b.state(), ProcState::Stopped);
         kill_hard(pid);
+        cleanup(&env);
+    }
+    /// N3: the hold is checked again under the lock that `confirm_stopped` reads `desired.running` with. A Start
+    /// that passed the check in `Agent::start` just before the hold went on is refused when it comes to writing
+    /// `desired.json` (the test goes straight to the external client, as that start does after the check).
+    #[tokio::test]
+    async fn n3_an_external_start_or_restart_that_slipped_past_the_hold_check_writes_nothing() {
+        let env = setup("n3-ext-hold");
+        let agent = Agent::external(cfg(&env, "run"), fast());
+        let ext = agent.ext.as_ref().unwrap().clone();
+        agent.hold_starts(true);
+        assert_eq!(ext.start(&agent.inner).unwrap_err(), WIPING_MSG);
+        assert!(crate::control::read_desired(&env.root).is_none(), "no start was written");
+        // A Restart of a node that runs: the same write, with `restart_id`.
+        agent.hold_starts(false);
+        ext.start(&agent.inner).unwrap();
+        let d = crate::control::read_desired(&env.root).unwrap();
+        assert!(d.running);
+        let state = crate::control::StateFile { heartbeat: crate::persist::unix_now(), generation: d.generation, state: "running".into(), ..Default::default() };
+        crate::control::write_state(&env.root, &state).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await; // (state.json is cached for 200 ms)
+        agent.hold_starts(true);
+        assert_eq!(ext.restart(&agent.inner).unwrap_err(), WIPING_MSG);
+        let d2 = crate::control::read_desired(&env.root).unwrap();
+        assert_eq!((d2.generation, d2.restart_id), (d.generation, d.restart_id), "no restart was written");
+        // A Stop and a settings-only write go through under the hold (a wipe allows them).
+        ext.request_stop(&agent.inner);
+        assert!(!crate::control::read_desired(&env.root).unwrap().running, "Stop is not held back");
         cleanup(&env);
     }
 

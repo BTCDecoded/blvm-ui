@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { nodeVersion } from "./format";
+  import { fmt, nodeVersion } from "./format";
   import Icon from "./Icon.svelte";
   import Light from "./Light.svelte";
   import Ring from "./Ring.svelte";
+  import { storageView } from "./pruning";
   import { ui } from "./status.svelte";
 
   const s = $derived(ui.snap);
+  const sv = $derived(storageView(s.pruning, !!s.managed));
   const health = $derived(s.health || "dead");
   const ver = $derived(nodeVersion(s));
   const arrival = $derived(s.arrival?.length ? s.arrival : Array(12).fill(0));
@@ -119,6 +121,11 @@
           >
           <small class="text-muted">{s.disk_used_unit || "GB"}</small>
           <span class="block text-[0.7rem] font-medium tracking-wide text-muted uppercase">Chain Size</span>
+          {#if sv.pruned}
+            <span class="block text-[0.7rem] text-muted"
+              >(pruned: keeps the newest {sv.keep ? `${fmt(sv.keep)} ` : ""}blocks{sv.managed && sv.keepFrom ? `, ${sv.keepFrom}` : ""})</span
+            >
+          {/if}
         </span>
       </div>
       <div class="disk-body">

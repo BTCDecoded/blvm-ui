@@ -17,6 +17,7 @@
 use crate::agent::{Agent, AgentConfig, ProcState, RpcAuth, Timings};
 use crate::control::{self, Desired, StateFile};
 use crate::networks;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -45,6 +46,9 @@ pub struct DaemonOpts {
     pub ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Peer-to-peer port instead of the network's own, on loopback only (tests: see [`AgentConfig::p2p_port`]).
     pub p2p_port: Option<u16>,
+    /// Peer-to-peer port per network id instead of the network's own, listening on `0.0.0.0` like the default
+    /// (`BLVM_AGENT_P2P_PORT_<NET>`, set by the Umbrel app: its Bitcoin Node holds 8333).
+    pub p2p_ports: BTreeMap<String, u16>,
 }
 
 impl DaemonOpts {
@@ -59,10 +63,12 @@ impl DaemonOpts {
             heartbeat: Duration::from_secs(2),
             ready: None,
             p2p_port: None,
+            p2p_ports: BTreeMap::new(),
         }
     }
 
-    /// `BLVM_AGENT_RPC_BIND`, `BLVM_AGENT_BUNDLED_BIN`, `BLVM_RPC_USER` and `BLVM_RPC_PASS`.
+    /// `BLVM_AGENT_RPC_BIND`, `BLVM_AGENT_BUNDLED_BIN`, `BLVM_AGENT_P2P_PORT_<NET>` (`MAINNET`, `TESTNET4`,
+    /// `TESTNET`, `SIGNET`, `REGTEST`), `BLVM_RPC_USER` and `BLVM_RPC_PASS`.
     pub fn from_env(root: PathBuf) -> Self {
         let mut o = Self::new(root);
         if let Some(b) = std::env::var("BLVM_AGENT_RPC_BIND").ok().filter(|b| !b.trim().is_empty()) {
@@ -77,6 +83,7 @@ impl DaemonOpts {
             (Some(user), Some(pass)) => Some(RpcAuth { user, pass }),
             _ => None,
         };
+        o.p2p_ports = networks::p2p_overrides();
         o
     }
 }
@@ -90,10 +97,19 @@ pub struct Daemon {
     pending: Option<Desired>,
     /// `restart_id` the running node was started under.
     running_restart_id: u64,
+    /// `running` and `start_id` of the last generation dealt with. A node that is not running is started for a
+    /// generation only when `running` just turned on, `start_id` or `restart_id` went up: a generation that
+    /// only carries saved settings (the console's Save) must not restart a node that crashed (it would skip the
+    /// crash backoff, or undo the agent giving up) or exited by itself.
+    prev_running: bool,
+    last_start_id: u64,
     boot: bool,
     /// `desired.binary` as last read (what `binary_found` in `state.json` is about).
     last_binary: String,
     last_written: Option<(String, Instant)>,
+    /// Memory page size of this computer and whether the official release can start on it (read once; the
+    /// kernel's page size does not change while the agent runs). Goes into `state.json` for the console.
+    facts: crate::sysinfo::Facts,
 }
 
 impl Daemon {
@@ -104,15 +120,17 @@ impl Daemon {
             network: None,
             rpc_addr: None,
             assume_valid: None,
+            prune_keep_blocks: None,
             child_env: Default::default(),
             rpc_auth: opts.rpc_auth.clone(),
             p2p_port: opts.p2p_port,
+            p2p_listen_port: None,
         };
         let agent = match &opts.ready {
             Some(r) => Agent::with_ready(cfg, opts.timings.clone(), Arc::clone(r)),
             None => Agent::new(cfg, opts.timings.clone()),
         };
-        Self { opts, agent, applied: 0, pending: None, running_restart_id: 0, boot: true, last_binary: control::DEFAULT_BINARY.into(), last_written: None }
+        Self { opts, agent, applied: 0, pending: None, running_restart_id: 0, prev_running: false, last_start_id: 0, boot: true, last_binary: control::DEFAULT_BINARY.into(), last_written: None, facts: crate::sysinfo::Facts::detect() }
     }
 
     pub fn agent(&self) -> Agent {
@@ -143,9 +161,11 @@ impl Daemon {
             network: net,
             rpc_addr: net.map(|n| format!("{}:{}", self.opts.rpc_bind, d.rpc_port.unwrap_or(n.rpc_port))),
             assume_valid: d.assume_valid.clone(),
+            prune_keep_blocks: d.prune_keep_blocks,
             child_env: d.env.clone(),
             rpc_auth: self.opts.rpc_auth.clone(),
             p2p_port: self.opts.p2p_port,
+            p2p_listen_port: net.and_then(|n| self.opts.p2p_ports.get(n.id).copied()),
         }
     }
 
@@ -164,6 +184,8 @@ impl Daemon {
             if self.agent.adopt() {
                 tracing::info!("agent: took over the node that was still running");
                 self.running_restart_id = d.restart_id;
+                self.prev_running = d.running;
+                self.last_start_id = d.start_id;
                 self.applied = if d.running { d.generation } else { 0 };
             }
         }
@@ -173,6 +195,8 @@ impl Daemon {
         let Some(p) = self.pending.clone() else { return };
         if self.step(&p).await {
             self.applied = p.generation;
+            self.prev_running = p.running;
+            self.last_start_id = p.start_id;
             self.pending = None;
         }
     }
@@ -195,10 +219,18 @@ impl Daemon {
                 self.agent.request_stop();
                 return false;
             }
+            // The node keeps running as it is; a rewrite of `desired.json` without a `restart_id` bump (a
+            // saved setting) only changes what the agent's own restart after a crash starts it with.
+            self.agent.set_config(self.config_for(d));
             return view.state != ProcState::Stopping;
         }
-        // Not running: start it.
+        // Not running. Start it when it is asked for; a generation that only carries saved settings changes what
+        // the agent's own restart will use, and nothing else (a crashed node keeps its backoff).
         self.agent.set_config(self.config_for(d));
+        let asked = !self.prev_running || d.start_id != self.last_start_id || d.restart_id != self.running_restart_id;
+        if !asked {
+            return true;
+        }
         self.running_restart_id = d.restart_id;
         match self.agent.start().await {
             Ok(()) => {
@@ -243,6 +275,7 @@ impl Daemon {
                 self.resolve_bin(&Desired { binary: self.last_binary.clone(), ..Default::default() }).display().to_string(),
             ),
             restart_id: self.running_restart_id,
+            platform: Some(self.facts.clone()),
         }
     }
 
@@ -275,6 +308,13 @@ impl Daemon {
         let pid_path = control::dir(&self.opts.root).join("agent.pid");
         let _ = std::fs::write(&pid_path, std::process::id().to_string());
         tracing::info!(root = %self.opts.root.display(), "agent: running");
+        match self.facts.page_size {
+            Some(n) => tracing::info!("agent: page size {n} bytes"),
+            None => tracing::info!("agent: page size unknown"),
+        }
+        if let Some(why) = self.facts.reason.as_deref().filter(|_| !self.facts.runs_here) {
+            tracing::warn!("agent: the official node release does not run on this computer: {why}");
+        }
         let prober = self.spawn_prober();
         tokio::pin!(shutdown);
         let mut tick = tokio::time::interval(self.opts.poll);
@@ -574,9 +614,11 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
                 network: networks::by_id(net),
                 rpc_addr: networks::by_id(net).map(|_| format!("127.0.0.1:{}", e.rpc_port)),
                 assume_valid: None,
+                prune_keep_blocks: None,
                 child_env: Default::default(),
                 rpc_auth: None,
                 p2p_port: None,
+                p2p_listen_port: None,
             },
             fast(),
         )
@@ -604,6 +646,10 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         assert_eq!(web.state(), ProcState::Stopped);
         // The agent reports the program before anything is asked.
         assert_eq!(web.binary_found(), Some(false), "default bin/blvm does not exist in this data folder");
+        // ... and the memory page size of its computer, which the console reads through the same file.
+        let facts = web.platform_facts().expect("state.json carries the platform");
+        assert_eq!(facts.page_size, crate::sysinfo::page_size());
+        assert!(facts.page_size.is_some_and(u64::is_power_of_two));
 
         // Start: the view says `starting` at once, from the request alone.
         web.start().await.unwrap();
@@ -656,19 +702,21 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         web.stop_and_wait().await;
         let mut cfg = web.config();
         cfg.network = networks::by_id("signet");
-        cfg.rpc_addr = Some(networks::default_rpc(networks::by_id("signet").unwrap()));
+        // Free ports, never the networks' own: a node of the person running the tests may hold 18443 or 38332.
+        let signet_port = free_port();
+        cfg.rpc_addr = Some(format!("127.0.0.1:{signet_port}"));
         web.set_config(cfg);
         web.start().await.unwrap();
         wait_for("signet", || web.state() == ProcState::Running && web.view().network == Some("signet")).await;
         let d = control::read_desired(&e.root).unwrap();
-        assert_eq!((d.network.as_deref(), d.running, d.rpc_port), (Some("signet"), true, Some(38332)));
+        assert_eq!((d.network.as_deref(), d.running, d.rpc_port), (Some("signet"), true, Some(signet_port)));
         let st = control::read_state(&e.root).unwrap();
         assert_eq!(st.network.as_deref(), Some("signet"));
         wait_for("log of the signet start", || web.logs(None, 400).iter().any(|l| l.text.contains("--network signet"))).await;
         // A switch from the console without stopping first: the agent does it.
         let mut cfg = web.config();
         cfg.network = networks::by_id("regtest");
-        cfg.rpc_addr = Some(networks::default_rpc(networks::by_id("regtest").unwrap()));
+        cfg.rpc_addr = Some(format!("127.0.0.1:{}", e.rpc_port));
         web.set_config(cfg);
         web.restart().await.unwrap();
         wait_for("back on regtest", || web.state() == ProcState::Running && web.view().network == Some("regtest")).await;
@@ -685,6 +733,224 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         assert_eq!((st.state.as_str(), st.pid), ("stopped", None));
         assert!(control::read_desired(&e.root).unwrap().running, "the next container start brings the node back");
         let _ = std::fs::remove_dir_all(&e.dir);
+    }
+
+    /// A changed assume-valid (or pruning) setting reaches the agent's node in two steps. Saving it rewrites
+    /// `desired.json` with the new value and the same `restart_id`, so the running node is left alone but a
+    /// start the agent makes by itself (here: after a crash) uses it. Restart bumps `restart_id` and the agent's
+    /// new node is started with the matching flag.
+    #[tokio::test]
+    async fn a_saved_setting_reaches_the_agents_node_at_a_crash_and_a_restart_does_at_once() {
+        let e = env("assume-valid-restart");
+        let ready = Arc::new(AtomicBool::new(true));
+        let agent = Running::spawn(opts(&e, Arc::clone(&ready)));
+        let web = client(&e, "regtest");
+        wait_for("alive", || web.alive()).await;
+        web.start().await.unwrap();
+        wait_for("running", || web.state() == ProcState::Running).await;
+        let first = web.view().pid.unwrap();
+        let d = control::read_desired(&e.root).unwrap();
+        assert_eq!((d.assume_valid.clone(), d.prune_keep_blocks), (None, None));
+        // Regtest with the setting left at its default: full validation is stated.
+        wait_for("--noassumevalid in the log", || web.logs(None, 200).iter().any(|l| l.text.contains("--noassumevalid"))).await;
+
+        // The settings change (as `patch_settings` does: `reresolve` hands the agent the config, then the
+        // desired file is brought in line).
+        let mut cfg = web.config();
+        cfg.assume_valid = Some("800000".into());
+        cfg.prune_keep_blocks = Some(1000);
+        web.set_config(cfg);
+        assert_eq!(control::read_desired(&e.root).unwrap().assume_valid, None, "set_config alone writes nothing");
+        web.sync_desired();
+        let d2 = control::read_desired(&e.root).unwrap();
+        assert_eq!(d2.assume_valid.as_deref(), Some("800000"), "a saved value is in desired.json");
+        assert_eq!(d2.prune_keep_blocks, Some(1000));
+        assert_eq!(d2.restart_id, d.restart_id, "but it asks for no restart");
+        assert_eq!(d2.generation, d.generation + 1);
+        assert!(d2.running);
+        // Saving the same thing again writes nothing.
+        web.sync_desired();
+        assert_eq!(control::read_desired(&e.root).unwrap().generation, d2.generation);
+        // The agent deals with the new generation and leaves the running node alone.
+        wait_for("generation applied", || control::read_state(&e.root).is_some_and(|s| s.generation == d2.generation)).await;
+        assert_eq!(web.view().pid, Some(first), "the node was not restarted");
+        assert_eq!(web.state(), ProcState::Running);
+
+        // The node dies by itself (kill -9): the agent starts it again, now with the saved values.
+        let killed = std::process::Command::new("kill").args(["-9", &first.to_string()]).status().unwrap();
+        assert!(killed.success());
+        wait_for("restarted by the agent", || web.state() == ProcState::Running && web.view().pid.is_some_and(|p| p != first)).await;
+        let second = web.view().pid.unwrap();
+        wait_for("--assumevalid 800000 after the crash restart", || {
+            web.logs(None, 400).iter().any(|l| l.text.contains("--assumevalid 800000") && !l.text.contains("--noassumevalid"))
+        })
+        .await;
+        let toml = std::fs::read_to_string(networks::dir(&e.root, networks::by_id("regtest").unwrap()).join("blvm.toml")).unwrap();
+        assert!(toml.contains("min_blocks_to_keep = 1000"), "pruning too: {toml}");
+
+        // A further change, then Restart: the same write bumps restart_id and the node is replaced.
+        let mut cfg = web.config();
+        cfg.assume_valid = Some("900000".into());
+        web.set_config(cfg);
+        web.sync_desired();
+        let d3 = control::read_desired(&e.root).unwrap();
+        assert_eq!((d3.assume_valid.as_deref(), d3.restart_id), (Some("900000"), d.restart_id));
+        web.restart().await.unwrap();
+        let d4 = control::read_desired(&e.root).unwrap();
+        assert_eq!(d4.assume_valid.as_deref(), Some("900000"));
+        assert_eq!(d4.restart_id, d.restart_id + 1, "Restart bumps restart_id");
+        wait_for("restarted", || web.state() == ProcState::Running && web.view().pid.is_some_and(|p| p != second)).await;
+        wait_for("--assumevalid 900000 in the log", || {
+            web.logs(None, 400).iter().any(|l| l.text.contains("--assumevalid 900000") && !l.text.contains("--noassumevalid"))
+        })
+        .await;
+        // What the daemon builds from the file.
+        let daemon_cfg = Daemon::new(opts(&e, Arc::clone(&ready))).config_for(&d4);
+        assert!(crate::agent::build_args(&daemon_cfg, networks::by_id("regtest").unwrap())
+            .windows(2)
+            .any(|w| w[0] == "--assumevalid" && w[1] == "900000"));
+
+        web.stop_and_wait().await;
+        agent.terminate();
+        let _ = std::fs::remove_dir_all(&e.dir);
+    }
+
+    /// S3: a Save is a new generation of `desired.json` with `running` as it was. For a node that is not running
+    /// (here: it exited by itself while the file still says "run") it must not be a start; a Start must be.
+    #[tokio::test]
+    async fn a_settings_only_generation_does_not_start_a_node_that_is_not_running_but_a_start_does() {
+        let e = env("save-no-start");
+        let flag = e.dir.join("exit-now");
+        std::fs::write(
+            &e.bin,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"version\" ] || [ \"$1\" = \"--version\" ]; then echo \"blvm 9.9.9\"; exit 0; fi\n\
+                 trap 'exit 0' TERM\necho \"fake node up: $*\"\n\
+                 while [ ! -f \"{}\" ] && kill -0 $PPID 2>/dev/null; do sleep 0.1; done\nexit 0\n",
+                flag.display()
+            ),
+        )
+        .unwrap();
+        let ready = Arc::new(AtomicBool::new(true));
+        let agent = Running::spawn(opts(&e, Arc::clone(&ready)));
+        let web = client(&e, "regtest");
+        wait_for("alive", || web.alive()).await;
+        web.start().await.unwrap();
+        wait_for("running", || web.state() == ProcState::Running).await;
+        let ups = || {
+            let log = networks::dir(&e.root, networks::by_id("regtest").unwrap()).join("logs/node.log");
+            std::fs::read_to_string(log).unwrap_or_default().matches("fake node up").count()
+        };
+        wait_for("one start in the log", || ups() == 1).await;
+
+        // The node ends itself (exit 0): stopped, no restart, and desired.json still says run.
+        std::fs::write(&flag, "x").unwrap();
+        wait_for("stopped by itself", || web.state() == ProcState::Stopped && !web.view().pid.is_some()).await;
+        assert!(control::read_desired(&e.root).unwrap().running);
+
+        // Save: the generation goes up with the new value, running stays as it was.
+        let mut cfg = web.config();
+        cfg.assume_valid = Some("800000".into());
+        web.set_config(cfg);
+        let before = control::read_desired(&e.root).unwrap();
+        web.sync_desired();
+        let after = control::read_desired(&e.root).unwrap();
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!((after.running, after.start_id, after.restart_id), (before.running, before.start_id, before.restart_id));
+        wait_for("generation applied", || control::read_state(&e.root).is_some_and(|s| s.generation == after.generation)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(ups(), 1, "the Save did not start the node");
+        assert_eq!(web.state(), ProcState::Stopped);
+
+        // Start does.
+        std::fs::remove_file(&flag).unwrap();
+        web.start().await.unwrap();
+        wait_for("running again", || web.state() == ProcState::Running).await;
+        assert_eq!(ups(), 2);
+        let logs: String = web.logs(None, 400).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
+        assert!(logs.contains("--assumevalid 800000"), "with the saved value: {logs}");
+
+        web.stop_and_wait().await;
+        agent.terminate();
+        let _ = std::fs::remove_dir_all(&e.dir);
+    }
+
+    /// `BLVM_AGENT_P2P_PORT_<NET>` (the Umbrel app moves mainnet off 8333, which its Bitcoin Node holds): read
+    /// for the five networks, garbage ignored, and the node of the desired network listens on that port on
+    /// every interface (the app publishes it), while the test-only `p2p_port` still means loopback.
+    #[test]
+    fn the_p2p_port_comes_from_the_environment_per_network_and_listens_on_every_interface() {
+        let _lock = networks::P2P_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let vars = [
+            ("BLVM_AGENT_P2P_PORT_MAINNET", "8334"),
+            ("BLVM_AGENT_P2P_PORT_TESTNET4", "48334"),
+            ("BLVM_AGENT_P2P_PORT_TESTNET", "18334"),
+            ("BLVM_AGENT_P2P_PORT_SIGNET", "38334"),
+            ("BLVM_AGENT_P2P_PORT_REGTEST", "18445"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        let o = DaemonOpts::from_env(PathBuf::from("/nonexistent-agent-root"));
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        let want: BTreeMap<String, u16> = [("mainnet", 8334), ("testnet4", 48334), ("testnet", 18334), ("signet", 38334), ("regtest", 18445)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        assert_eq!(o.p2p_ports, want);
+        assert_eq!(o.p2p_port, None, "the loopback-only test port is never set from the environment");
+
+        // Garbage and out-of-range values are ignored; the rest still counts.
+        std::env::set_var("BLVM_AGENT_P2P_PORT_MAINNET", "eight-three-three-four");
+        std::env::set_var("BLVM_AGENT_P2P_PORT_SIGNET", "99999");
+        std::env::set_var("BLVM_AGENT_P2P_PORT_REGTEST", "");
+        std::env::set_var("BLVM_AGENT_P2P_PORT_TESTNET4", "0");
+        std::env::set_var("BLVM_AGENT_P2P_PORT_TESTNET", "18334");
+        let o2 = DaemonOpts::from_env(PathBuf::from("/nonexistent-agent-root"));
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        assert_eq!(o2.p2p_ports, BTreeMap::from([("testnet".to_string(), 18334u16)]));
+        assert!(DaemonOpts::from_env(PathBuf::from("/nonexistent-agent-root")).p2p_ports.is_empty());
+
+        // `config_for` takes the port of the desired network only.
+        let mut o = DaemonOpts::new(PathBuf::from("/nonexistent-agent-root"));
+        o.p2p_ports = want;
+        let daemon = Daemon::new(o);
+        let desired = |net: &str| Desired { network: Some(net.into()), running: true, ..Default::default() };
+        let listen = |net: &str| {
+            let cfg = daemon.config_for(&desired(net));
+            let n = networks::by_id(net).unwrap();
+            let args = crate::agent::build_args(&cfg, n);
+            let at = args.iter().position(|a| a == "--listen-addr").expect("--listen-addr is always stated");
+            (cfg, args[at + 1].clone())
+        };
+        let (cfg, addr) = listen("mainnet");
+        assert_eq!((cfg.p2p_listen_port, cfg.p2p_port), (Some(8334), None));
+        assert_eq!(addr, "0.0.0.0:8334", "reachable through the published port");
+        assert_eq!(listen("testnet").1, "0.0.0.0:18334");
+        assert_eq!(listen("signet").1, "0.0.0.0:38334");
+        assert_eq!(listen("testnet4").1, "0.0.0.0:48334");
+        assert_eq!(listen("regtest").1, "0.0.0.0:18445");
+        // A network without a variable keeps its own port.
+        let mut o = DaemonOpts::new(PathBuf::from("/nonexistent-agent-root"));
+        o.p2p_ports = BTreeMap::from([("mainnet".to_string(), 8334)]);
+        let daemon = Daemon::new(o);
+        let cfg = daemon.config_for(&desired("signet"));
+        assert_eq!(cfg.p2p_listen_port, None);
+        assert_eq!(crate::agent::build_args(&cfg, networks::by_id("signet").unwrap())[7], "0.0.0.0:38333");
+        // The agent's own port check looks at the port the node will use.
+        assert_eq!(daemon.config_for(&desired("mainnet")).p2p(networks::by_id("mainnet").unwrap()), 8334);
+
+        // The test convention is unchanged: `p2p_port` is loopback only, and it wins over the listen port.
+        let mut o = DaemonOpts::new(PathBuf::from("/nonexistent-agent-root"));
+        o.p2p_port = Some(45678);
+        o.p2p_ports = BTreeMap::from([("mainnet".to_string(), 8334)]);
+        let cfg = Daemon::new(o).config_for(&desired("mainnet"));
+        let args = crate::agent::build_args(&cfg, networks::by_id("mainnet").unwrap());
+        assert!(args.windows(2).any(|w| w[0] == "--listen-addr" && w[1] == "127.0.0.1:45678"), "{args:?}");
     }
 
     #[tokio::test]
@@ -867,6 +1133,47 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         let _ = std::fs::remove_dir_all(&e.dir);
     }
 
+    /// The node container writes `blvm.toml` itself, so the pruning choice has to travel in `desired.json`: the
+    /// console's config reaches the file with the start, the agent's node gets `[storage.pruning]`, and a later
+    /// restart with the setting off writes the file without it.
+    #[tokio::test]
+    async fn a_pruning_setting_travels_in_desired_json_into_the_agents_node_config() {
+        let e = env("prune");
+        let ready = Arc::new(AtomicBool::new(true));
+        let agent = Running::spawn(opts(&e, Arc::clone(&ready)));
+        let web = client(&e, "regtest");
+        wait_for("alive", || web.alive()).await;
+        let mut cfg = web.config();
+        cfg.prune_keep_blocks = Some(5000);
+        web.set_config(cfg);
+        web.start().await.unwrap();
+        assert_eq!(control::read_desired(&e.root).unwrap().prune_keep_blocks, Some(5000), "the start writes it");
+        wait_for("started", || control::read_state(&e.root).is_some_and(|s| s.pid.is_some())).await;
+        let file = e.root.join("networks/regtest/blvm.toml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text, crate::agent::node_config_toml(None, Some(5000)), "{text}");
+        wait_for("--config in the log", || web.logs(None, 200).iter().any(|l| l.text.contains("--config ./blvm.toml"))).await;
+
+        // What the daemon builds from the file.
+        let d = control::read_desired(&e.root).unwrap();
+        let daemon_cfg = Daemon::new(opts(&e, Arc::clone(&ready))).config_for(&d);
+        assert_eq!(daemon_cfg.prune_keep_blocks, Some(5000));
+
+        // Pruning switched off: the next restart writes the file without the block.
+        let first = web.view().pid.unwrap();
+        let mut cfg = web.config();
+        cfg.prune_keep_blocks = None;
+        web.set_config(cfg);
+        web.restart().await.unwrap();
+        assert_eq!(control::read_desired(&e.root).unwrap().prune_keep_blocks, None);
+        wait_for("restarted", || web.state() == ProcState::Running && web.view().pid.is_some_and(|p| p != first)).await;
+        wait_for("rewritten", || std::fs::read_to_string(&file).is_ok_and(|t| t == crate::agent::node_config_toml(None, None))).await;
+
+        web.stop_and_wait().await;
+        agent.terminate();
+        let _ = std::fs::remove_dir_all(&e.dir);
+    }
+
     #[test]
     fn a_second_agent_on_the_same_data_folder_is_refused_and_the_lock_goes_with_the_first() {
         let e = env("lock");
@@ -877,7 +1184,19 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         let other = env("lock2");
         assert!(take_lock(&other.root).is_ok());
         drop(first);
-        assert!(take_lock(&e.root).is_ok(), "the lock is released when the first agent ends");
+        // The lock is a flock on an open file. While other tests of this process spawn nodes, a child between
+        // fork and exec briefly holds a copy of every open descriptor of the process, and so the lock, for a few
+        // milliseconds after the first agent let go (the one flake seen: it failed under a full parallel run and
+        // passed 20 of 20 alone). A real agent is a process of its own, so only the test needs the bounded wait.
+        let end = Instant::now() + Duration::from_secs(3);
+        let again = loop {
+            match take_lock(&e.root) {
+                Ok(l) => break Ok(l),
+                Err(m) if Instant::now() >= end => break Err(m),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        assert!(again.is_ok(), "the lock is released when the first agent ends: {:?}", again.err());
         let _ = std::fs::remove_dir_all(&e.dir);
         let _ = std::fs::remove_dir_all(&other.dir);
     }

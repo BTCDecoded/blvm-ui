@@ -23,6 +23,10 @@ const PENDING_GRACE_SECS: u64 = 15;
 /// How often the console refreshes `meta.json` (last height) for a node it does not run.
 const META_EVERY: Duration = Duration::from_secs(60);
 
+/// Refusal of a change that needs a stopped node (a wipe, another network, folder or program) while the agent is
+/// quiet: nobody can say whether a node runs, and a request written now would be carried out when the agent returns.
+pub const NOT_ANSWERING: &str = "The node agent is not answering; try again when it is back.";
+
 pub(super) const NO_AGENT: &str =
     "The node agent is not responding. Check that the node container is running, then try again.";
 
@@ -36,6 +40,9 @@ struct ExtSt {
     desired: Desired,
     /// Generation of a restart request the agent has not dealt with yet.
     restart_gen: Option<u64>,
+    /// Generation of the last write that asked for something to happen (start, stop, restart), as opposed to
+    /// one that only carried saved settings. Once the agent has dealt with it, a stopped node stays stopped.
+    request_gen: u64,
     cache: Option<(Instant, Option<StateFile>)>,
     last_meta: Option<Instant>,
 }
@@ -47,6 +54,7 @@ impl Ext {
                 root: None,
                 desired: Desired::default(),
                 restart_gen: None,
+                request_gen: 0,
                 cache: None,
                 last_meta: None,
             }),
@@ -58,6 +66,8 @@ impl Ext {
     fn sync(s: &mut ExtSt, root: &Path) {
         if s.root.as_deref() != Some(root) {
             s.desired = control::read_desired(root).unwrap_or_default();
+            // Not known after a restart of the console: any generation may have been a request.
+            s.request_gen = s.desired.generation;
             s.root = Some(root.to_path_buf());
             s.cache = None;
             s.restart_gen = None;
@@ -163,6 +173,14 @@ impl Ext {
         Self::state_file(&mut s, &root).map(|f| f.binary_found)
     }
 
+    /// The platform facts (page size) the agent wrote, if it is a version that writes them.
+    pub(super) fn platform_facts(&self, inner: &Arc<Inner>) -> Option<crate::sysinfo::Facts> {
+        let root = inner.cfg.lock().unwrap().root.clone();
+        let mut s = self.st.lock().unwrap();
+        Self::sync(&mut s, &root);
+        Self::state_file(&mut s, &root).and_then(|f| f.platform)
+    }
+
     pub(super) fn installed(&self, inner: &Arc<Inner>) -> Option<Installed> {
         let root = inner.cfg.lock().unwrap().root.clone();
         let mut s = self.st.lock().unwrap();
@@ -178,12 +196,32 @@ impl Ext {
         })
     }
 
-    /// Replace `desired.json`. `restart` also bumps `restart_id`: the agent restarts a running node.
-    fn write(&self, inner: &Arc<Inner>, running: bool, restart: bool) -> Result<(), String> {
+    /// Replace `desired.json`. `restart` also bumps `restart_id`: the agent restarts a running node. `start` bumps
+    /// `start_id`: the agent starts a node that is not running.
+    fn write(&self, inner: &Arc<Inner>, running: bool, restart: bool, start: bool) -> Result<(), String> {
         let cfg = inner.cfg.lock().unwrap().clone();
-        let now = Inner::now();
         let mut s = self.st.lock().unwrap();
         Self::sync(&mut s, &cfg.root);
+        Self::write_locked(&mut s, inner, &cfg, running, restart, start, true)
+    }
+
+    /// [`Self::write`] with the lock already held. `request` is false for a write that only carries saved settings.
+    fn write_locked(
+        s: &mut ExtSt,
+        inner: &Arc<Inner>,
+        cfg: &AgentConfig,
+        running: bool,
+        restart: bool,
+        start: bool,
+        request: bool,
+    ) -> Result<(), String> {
+        // A start or restart is checked against the wipe hold here, under the same lock `confirm_stopped` reads
+        // `desired.running` with: a start that passed the check in `Agent::start` just before the hold went on
+        // either wrote `running: true` first (the wipe then says "stop the node first") or is refused now.
+        if request && running && inner.hold_starts.load(Ordering::SeqCst) {
+            return Err(super::WIPING_MSG.into());
+        }
+        let now = Inner::now();
         let prev = &s.desired;
         let d = Desired {
             generation: prev.generation + 1,
@@ -195,18 +233,71 @@ impl Ext {
             },
             env: cfg.child_env.clone(),
             assume_valid: cfg.assume_valid.clone(),
+            prune_keep_blocks: cfg.prune_keep_blocks,
             stop_grace_secs: inner.stop_wait().as_secs().max(1),
             rpc_port: cfg.rpc().as_deref().and_then(port_of),
             restart_id: prev.restart_id + u64::from(restart),
+            start_id: prev.start_id + u64::from(start),
             updated: now,
         };
         control::write_desired(&cfg.root, &d).map_err(|e| {
             format!("Cannot write {}: {e}", control::dir(&cfg.root).join(control::DESIRED_FILE).display())
         })?;
         s.restart_gen = restart.then_some(d.generation);
+        if request {
+            s.request_gen = d.generation;
+        }
         s.desired = d;
         s.cache = None;
         Ok(())
+    }
+
+    /// A setting changed (assume-valid, pruning, environment ...): put the resolved config into `desired.json`
+    /// without a `restart_id` or `start_id` bump and with `running` as it is. The running node is left alone (the
+    /// agent only restarts on a new `restart_id` or network), a node that is not running stays as it is (the agent
+    /// starts one only for a Start, see `Desired::start_id`), but a start the agent makes by itself later, after
+    /// a crash or a restart of its container, uses what was saved. Nothing is written before the first request,
+    /// or when the file already says the same. `running` is read and written under one lock: a Stop in between
+    /// cannot be overwritten.
+    pub(super) fn sync_desired(&self, inner: &Arc<Inner>) {
+        let cfg = inner.cfg.lock().unwrap().clone();
+        let mut s = self.st.lock().unwrap();
+        Self::sync(&mut s, &cfg.root);
+        let d = &s.desired;
+        let network = cfg.network.map(|n| n.id.to_string()).or_else(|| d.network.clone());
+        let binary = match &cfg.bin {
+            Some(p) => p.strip_prefix(&cfg.root).unwrap_or(p).display().to_string(),
+            None => control::DEFAULT_BINARY.into(),
+        };
+        let same = d.network == network
+            && d.binary == binary
+            && d.env == cfg.child_env
+            && d.assume_valid == cfg.assume_valid
+            && d.prune_keep_blocks == cfg.prune_keep_blocks
+            && d.rpc_port == cfg.rpc().as_deref().and_then(port_of);
+        if d.generation == 0 || same {
+            return;
+        }
+        let running = d.running;
+        if let Err(e) = Self::write_locked(&mut s, inner, &cfg, running, false, false, false) {
+            tracing::warn!("node agent (external): {e}");
+        }
+    }
+
+    /// The agent has gone quiet while something could still be running or waiting for it: it wrote
+    /// `state.json` once and the heartbeat is stale, or the console asked for something and no agent ever
+    /// answered. A change that needs a stopped node must wait (the console cannot see the node, and what it
+    /// wrote would be carried out when the agent returns).
+    pub(super) fn quiet(&self, inner: &Arc<Inner>) -> bool {
+        let root = inner.cfg.lock().unwrap().root.clone();
+        let mut s = self.st.lock().unwrap();
+        Self::sync(&mut s, &root);
+        s.cache = None;
+        let generation = s.desired.generation;
+        match Self::state_file(&mut s, &root) {
+            Some(f) => !f.alive(Inner::now()),
+            None => generation > 0,
+        }
     }
 
     fn desired_running(&self, inner: &Arc<Inner>) -> bool {
@@ -228,7 +319,7 @@ impl Ext {
         // A reading from before this start must not count as "the new node answers".
         inner.rpc_ok.store(false, Ordering::Relaxed);
         *inner.height.lock().unwrap() = None;
-        self.write(inner, true, false)?;
+        self.write(inner, true, false, true)?;
         inner.ensure_tailer();
         Ok(())
     }
@@ -238,7 +329,7 @@ impl Ext {
         if !state.is_active() && state != ProcState::Crashed && !self.desired_running(inner) {
             return; // already off, and nobody asked for it to be on
         }
-        if let Err(e) = self.write(inner, false, false) {
+        if let Err(e) = self.write(inner, false, false, false) {
             tracing::warn!("node agent (external): {e}");
         }
     }
@@ -247,19 +338,50 @@ impl Ext {
         match self.view(inner).state {
             ProcState::Starting | ProcState::Running | ProcState::Stopping => {
                 inner.rpc_ok.store(false, Ordering::Relaxed);
-                self.write(inner, true, true)
+                self.write(inner, true, true, false)
             }
             ProcState::Stopped | ProcState::Crashed => self.start(inner),
         }
     }
 
-    /// A crashed node waiting for the agent's automatic restart: ask for it to stay off.
+    /// A crashed node waiting for the agent's automatic restart: ask for it to stay off. Only a live agent can
+    /// have a restart pending: for one that went quiet "crashed" is the console's own conclusion, the node may
+    /// well be running, and a request to stay off would stop it the moment the agent returns.
     pub(super) fn abandon_restart(&self, inner: &Arc<Inner>) {
-        if self.view(inner).state == ProcState::Crashed {
-            if let Err(e) = self.write(inner, false, false) {
+        if self.alive(inner) && self.view(inner).state == ProcState::Crashed {
+            if let Err(e) = self.write(inner, false, false, false) {
                 tracing::warn!("node agent (external): {e}");
             }
         }
+    }
+
+    /// May the chain data be deleted? The console cannot see the node process, so the agent has to say so:
+    /// it must be alive (a fresh heartbeat), `state.json` must belong to the last request written to
+    /// `desired.json` (the agent dealt with that generation), and the node must not be starting, running or
+    /// stopping. A crashed node that the agent has already dealt with has no process either.
+    pub(super) fn confirm_stopped(&self, inner: &Arc<Inner>) -> Result<(), String> {
+        let root = inner.cfg.lock().unwrap().root.clone();
+        let mut s = self.st.lock().unwrap();
+        Self::sync(&mut s, &root);
+        s.cache = None; // read the file now, not a copy from 200 ms ago
+        let Some(f) = Self::state_file(&mut s, &root) else {
+            return Err(NOT_ANSWERING.into());
+        };
+        if !f.alive(Inner::now()) {
+            return Err(NOT_ANSWERING.into());
+        }
+        // `desired.json` must not ask for the node either: a node that exited by itself while the file still says
+        // "run" would be started again when the agent's container restarts.
+        if s.desired.running || f.proc_state().is_active() {
+            return Err(super::STOP_FIRST_MSG.into());
+        }
+        // The agent must have dealt with the last request. A save after that (settings only, no start or stop)
+        // does not matter: it cannot start a node (`Desired::start_id`), so a stopped node is still stopped
+        // while the agent has not yet read it.
+        if f.generation < s.request_gen {
+            return Err(super::STOP_FIRST_MSG.into());
+        }
+        Ok(())
     }
 
     /// Refresh `meta.json` (the agent, which cannot see the chain height, leaves `last_height` alone).

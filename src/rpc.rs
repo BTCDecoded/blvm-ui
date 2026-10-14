@@ -60,6 +60,16 @@ pub async fn call_batch(rpc_addr: &str, methods: &[&str]) -> Result<Vec<Option<V
 
 /// One TCP round-trip for mixed methods/params (needed for `getblockhash`).
 pub async fn call_batch_calls(rpc_addr: &str, calls: &[RpcCall]) -> Result<Vec<Option<Value>>> {
+    Ok(call_batch_results(rpc_addr, calls)
+        .await?
+        .into_iter()
+        .map(|r| r.and_then(Result::ok))
+        .collect())
+}
+
+/// Like [`call_batch_calls`], but an error answer keeps its error object: `Some(Ok(result))`,
+/// `Some(Err(error))`, or `None` when the node left that call out of its answer.
+pub async fn call_batch_results(rpc_addr: &str, calls: &[RpcCall]) -> Result<Vec<Option<std::result::Result<Value, Value>>>> {
     let payload = Value::Array(
         calls
             .iter()
@@ -82,7 +92,10 @@ pub async fn call_batch_calls(rpc_addr: &str, calls: &[RpcCall]) -> Result<Vec<O
     for item in arr {
         let id = item.get("id").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
         if id < out.len() {
-            out[id] = result_of(item);
+            out[id] = match result_of(item) {
+                Some(r) => Some(Ok(r)),
+                None => item.get("error").cloned().map(Err),
+            };
         }
     }
     Ok(out)

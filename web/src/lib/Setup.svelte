@@ -21,10 +21,14 @@
   import { moduleReason, moduleTitle } from "./modules";
   import { diskWords, fmtBytes, NETWORKS, networkById } from "./networks";
   import { applySnap, setPage, ui } from "./status.svelte";
-  import type { InstallJob, ModulesResponse, NetworkId, ReleaseInfo, SetupRequest, SetupTestResponse } from "./types";
+  import type { AssumeValidDefault, ConsoleSettings, InstallJob, ModulesResponse, NetworkId, ReleaseInfo, SetupRequest, SetupTestResponse } from "./types";
+  import PrunePicker from "./PrunePicker.svelte";
+  import { keepMax, keepSummary, neededBytes, neededWords, PRUNE_DEFAULT, toKeep, validKeep, type StorageChoice } from "./pruning";
+  import ValidationPicker from "./ValidationPicker.svelte";
+  import { HASH_NOTE, knownMax, parseSetting, summaryText, toSetting, validHeight, type ValidationChoice } from "./validation";
 
   // Design K: first-run wizard. Shown instead of the dashboard (see App.svelte), skippable, never deletes data.
-  type StepId = "welcome" | "mode" | "network" | "get" | "storage" | "modules" | "summary";
+  type StepId = "welcome" | "mode" | "network" | "validation" | "pruning" | "get" | "storage" | "modules" | "summary";
   type Mode = "managed" | "standalone";
 
   const s = $derived(ui.snap);
@@ -44,7 +48,15 @@
     start: true,
     stopOnExit: true,
     modules: [] as string[],
+    // Assume-valid for the chosen network: "default" | "off" | a height (see validation.ts).
+    assumeChoice: "default" as ValidationChoice,
+    assumeHeight: 0 as number | null,
+    // Block pruning for the chosen network: every block, or only the newest `keep` (see pruning.ts).
+    storage: "full" as StorageChoice,
+    keep: PRUNE_DEFAULT as number | null,
   });
+  // What the host already has (a re-run is prefilled from it) and the node's built-in heights.
+  let saved = $state<ConsoleSettings>({});
 
   let test = $state<SetupTestResponse | null>(null);
   let testing = $state(false);
@@ -60,14 +72,36 @@
 
   const steps = $derived.by<StepId[]>(() => {
     const get: StepId[] = needGet ? ["get"] : [];
-    if (external) return ["welcome", "network", ...get, "summary"];
+    if (external) return ["welcome", "network", "validation", "pruning", ...get, "summary"];
     return w.mode === "managed"
-      ? ["welcome", "mode", "network", ...get, "storage", "modules", "summary"]
+      ? ["welcome", "mode", "network", "validation", "pruning", ...get, "storage", "modules", "summary"]
       : ["welcome", "mode", "summary"];
   });
   const cur = $derived(steps[Math.min(w.step, steps.length - 1)]);
   const net = $derived(networkById(w.network));
-  const tooSmall = $derived(!!net?.diskBytes && freeBytes > 0 && freeBytes < net.diskBytes);
+  const avDef = $derived<AssumeValidDefault | undefined>(w.network ? saved.assume_valid_defaults?.[w.network] : undefined);
+  // An older file may hold a block hash for this network (the page never offers one): the step says so.
+  const storedHash = $derived(
+    !!w.network && parseSetting(saved.assume_valid_by_network?.[w.network] ?? saved.assume_valid ?? "default", 0).choice === "hash",
+  );
+  const avKnown = $derived(net ? knownMax(net, s, avDef) : { max: 0, live: false });
+  const assumeValid = $derived(toSetting(w.assumeChoice, w.assumeHeight));
+  const pruneKnown = $derived(net ? keepMax(net, s) : { max: 0, live: false });
+  const pruneKeep = $derived(toKeep(w.storage, w.keep));
+  // Switching on pruning (or lowering it) for a network that already holds chain data makes the node convert the
+  // store at its next start. The host says so too; the summary warns before the user presses Start.
+  const savedKeep = $derived(w.network ? (saved.prune_by_network?.[w.network] ?? null) : null);
+  const hasChainData = $derived(!!(w.network && s.managed?.networks.find((n) => n.id === w.network)?.has_data));
+  const convertWarn = $derived(hasChainData && typeof pruneKeep === "number" && (savedKeep === null || pruneKeep < savedKeep));
+  // Only chain data that a pruning node has worked on needs deleting to go back to a full node (the host knows this
+  // for the network it manages; for another one the host's 409 says so when the wizard is finished).
+  const hasPrunedData = $derived(saved.prune_effective?.network === w.network && !!saved.prune_effective?.has_pruned_data);
+  const wipeNeeded = $derived(hasChainData && pruneKeep === null && savedKeep !== null && hasPrunedData);
+  // Disk the choice needs: the whole chain, or for a pruned node the newest blocks plus a fixed allowance for the
+  // UTXO set and indexes (approximate).
+  const needBytes = $derived(net ? neededBytes(net, w.storage, w.keep) : 0);
+  const needWords = $derived(net ? neededWords(net, w.storage, w.keep) : "—");
+  const tooSmall = $derived(needBytes > 0 && freeBytes > 0 && freeBytes < needBytes);
 
   onMount(() => {
     needGet = s.mode === "managed" && s.bundle_available === false;
@@ -84,8 +118,30 @@
         if (c.network && rerun) w.network = c.network;
         if (c.data_root) w.dataRoot = c.data_root;
         if (c.stop_node_on_exit !== undefined) w.stopOnExit = c.stop_node_on_exit;
+        saved = c;
       })
       .catch(() => {});
+  });
+
+  // The validation choice follows the network: what is saved for that network (else the global setting, else the
+  // node's default), so a re-run shows the current choice and a new pick starts from "Node default".
+  $effect(() => {
+    const id = w.network;
+    if (!id) return;
+    const p = parseSetting(saved.assume_valid_by_network?.[id] ?? saved.assume_valid ?? "default", saved.assume_valid_defaults?.[id]?.height ?? 0);
+    // A stored block hash is not offered here; the step starts from the default and saving replaces it (the
+    // step says so: `storedHash`).
+    w.assumeChoice = p.choice === "hash" ? "default" : p.choice;
+    w.assumeHeight = p.height;
+  });
+
+  // Same for the blocks to keep: what is saved for the network, else a full node (a new pick starts from there).
+  $effect(() => {
+    const id = w.network;
+    if (!id) return;
+    const k = saved.prune_by_network?.[id];
+    w.storage = typeof k === "number" ? "pruned" : "full";
+    w.keep = typeof k === "number" ? k : PRUNE_DEFAULT;
   });
 
   // Each step moves focus to its heading, so a keyboard or screen-reader user lands on the new step instead
@@ -152,6 +208,10 @@
   });
   const unsupported = $derived(!!rel && rel.platform === "unsupported");
   const canGet = $derived(!!rel && !unsupported && rel.can_install && !!rel.latest);
+  // The official release cannot start on this computer (16 KB memory pages, Raspberry Pi 5): say so before the
+  // download, and do not offer it. `runs_here` is absent from older hosts, which means "yes".
+  const runsHere = $derived(rel?.runs_here !== false);
+  const noRunText = $derived(rel?.runs_here_reason || "The current official node release does not run on this computer.");
   const mbText = (n: number) => `${(n / 1e6).toFixed(n >= 1e8 ? 0 : 1)} MB`;
 
   function stopPoll() {
@@ -210,20 +270,21 @@
   });
   $effect(() => () => stopPoll());
 
-  async function download() {
+  // `force`: the "Try anyway" button on a device the official release is not built for (16 KB memory pages).
+  async function download(force = false) {
     if (starting || !rel?.latest) return;
     starting = true;
     getErr = "";
     const tag = rel.latest.tag;
     try {
-      const d = await installNode(tag);
+      const d = await installNode(tag, force);
       if (d.ok === false) throw new Error(d.error || "The download could not start.");
       began = true;
       job = normalizeJob({ phase: "download", tag, total: rel.asset?.size ?? 0, ...(d.job ?? {}) });
       if (job.phase === "idle") job = { ...job, phase: "download" };
       startPoll(1800);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
+      if (e instanceof ApiError && e.status === 409 && e.message === "busy") {
         // One is already running (another tab, or a retry that raced): follow it.
         began = true;
         job = normalizeJob({ phase: "download", tag, total: rel.asset?.size ?? 0 });
@@ -241,6 +302,8 @@
   const nextOk = $derived.by(() => {
     if (cur === "mode") return w.mode === "managed" ? canManage : !!w.rpc.trim();
     if (cur === "network") return !!w.network;
+    if (cur === "validation") return w.assumeChoice !== "custom" || validHeight(w.assumeHeight);
+    if (cur === "pruning") return w.storage !== "pruned" || validKeep(w.keep);
     if (cur === "get") return installed;
     return true;
   });
@@ -280,7 +343,14 @@
     const managed = external || w.mode === "managed";
     void finish({
       mode: managed ? "managed" : "standalone",
-      ...(managed ? { network: w.network ?? undefined, ...(w.dataRoot.trim() && !external ? { data_root: w.dataRoot.trim() } : {}) } : { rpc: w.rpc.trim() }),
+      ...(managed
+        ? {
+            network: w.network ?? undefined,
+            assume_valid: assumeValid,
+            ...(pruneKeep !== undefined ? { prune_keep_blocks: pruneKeep } : {}),
+            ...(w.dataRoot.trim() && !external ? { data_root: w.dataRoot.trim() } : {}),
+          }
+        : { rpc: w.rpc.trim() }),
       start: managed ? w.start : false,
       stop_on_exit: w.stopOnExit,
       modules: managed ? w.modules : [],
@@ -464,9 +534,50 @@
         </details>
         {#if tooSmall}
           <p class="ui-warn mt-4 text-[0.95rem]">
-            {net?.label} needs {diskWords(net!)} and this disk has {fmtBytes(freeBytes)} free. Pick a smaller network or
-            free up space.
+            {net?.label} needs {needWords} and this disk has {fmtBytes(freeBytes)} free. Pick a smaller network, keep fewer
+            blocks, or free up space.
           </p>
+        {/if}
+      {:else if cur === "validation"}
+        <h3 class="step-title" tabindex="-1">Validation</h3>
+        <p class="ui-lead max-w-2xl">
+          During the first sync, blocks below the assume-valid height are accepted without re-checking their scripts
+          and signatures; every block above it is fully verified. This makes the first sync much faster. Only use a
+          height you trust.
+        </p>
+        {#if net}
+          <ValidationPicker
+            {net}
+            bind:choice={w.assumeChoice}
+            bind:height={w.assumeHeight}
+            def={avDef}
+            max={avKnown.max}
+            live={avKnown.live}
+            id="setup-av"
+          />
+          {#if storedHash}<p class="ui-note ui-warn mt-3">{HASH_NOTE}</p>{/if}
+        {/if}
+      {:else if cur === "pruning"}
+        <h3 class="step-title" tabindex="-1">Blocks to keep</h3>
+        <p class="ui-lead max-w-2xl">
+          A full node keeps every block ever made. A pruned node keeps the newest blocks only and deletes older ones
+          after they are verified; it still verifies everything and still serves recent blocks to the network, but
+          cannot serve old history.
+        </p>
+        {#if net}
+          <PrunePicker {net} bind:choice={w.storage} bind:keep={w.keep} max={pruneKnown.max} live={pruneKnown.live} id="setup-prune" />
+          {#if convertWarn}
+            <p class="ui-warn mt-3 text-[0.95rem]" role="note">
+              {net.label} already has chain data. The node converts it on its next start: it deletes the old blocks one
+              by one and does not answer meanwhile (minutes on Testnet4, possibly hours on mainnet).
+            </p>
+          {:else if wipeNeeded}
+            <p class="ui-warn mt-3 text-[0.95rem]" role="note">
+              This network is pruned today. A pruned node cannot go back to keeping every block without downloading the
+              chain again, so the console will refuse this change here. Use Settings, Blocks to keep, to delete the
+              chain data and start over.
+            </p>
+          {/if}
         {/if}
       {:else if cur === "get"}
         <h3 class="step-title" tabindex="-1">Get the node</h3>
@@ -546,15 +657,37 @@
           {:else if running && job}
             <InstallProgress {job} />
           {:else}
+            {#if !runsHere}
+              <p id="get-norun" class="ui-warn mt-4 text-[0.95rem]" role="alert">{noRunText}</p>
+            {/if}
             {#if job?.phase === "failed"}
               <p class="ui-bad mt-4 text-[0.95rem]" role="alert" use:reveal={job.error ?? ""}>
                 {job.error || "The download failed."}
-                {job.rolled_back ? " The previous version is back." : " Nothing was installed."}
+                {job.rolled_back ? " The previous version is back." : job.error?.includes("Nothing was installed") ? "" : " Nothing was installed."}
               </p>
             {/if}
-            <button type="button" class="ui-btn mt-4" disabled={starting} onclick={download}>
-              {starting ? "Starting…" : job?.phase === "failed" ? "Retry" : `Download ${withV(rel!.latest!.tag)}`}
-            </button>
+            <div class="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                class="ui-btn"
+                disabled={starting || !runsHere}
+                aria-describedby={runsHere ? undefined : "get-norun"}
+                title={runsHere ? undefined : noRunText}
+                onclick={() => download()}
+              >
+                {starting ? "Starting…" : job?.phase === "failed" ? "Retry" : `Download ${withV(rel!.latest!.tag)}`}
+              </button>
+              {#if !runsHere}
+                <button type="button" class="ui-btn-ghost" disabled={starting} onclick={() => download(true)}>
+                  Try anyway (a newer release may support this device)
+                </button>
+                {#if external}
+                  <button type="button" class="ui-btn-ghost" disabled={saving} onclick={skip}>Skip for now</button>
+                {:else}
+                  <button type="button" class="ui-btn-ghost" onclick={skip}>Finish without a node</button>
+                {/if}
+              {/if}
+            </div>
           {/if}
           {#if getErr}<p class="ui-bad mt-3 text-[0.95rem]" role="alert" use:reveal={getErr}>{getErr}</p>{/if}
         {/if}
@@ -575,7 +708,7 @@
           </p>
           {#if tooSmall}
             <p class="ui-warn mt-2 text-[0.95rem]">
-              {net?.label} needs {diskWords(net!)}. That may not fit here.
+              {net?.label} needs {needWords}. That may not fit here.
             </p>
           {/if}
         </div>
@@ -641,7 +774,9 @@
           {#if external || w.mode === "managed"}
             <div><dt>Node</dt><dd>{needGet && nodeText ? `${nodeText} installed` : "Run by this console"}</dd></div>
             <div><dt>Network</dt><dd>{net?.label ?? "Not chosen"}</dd></div>
-            <div><dt>Disk needed</dt><dd>{net ? diskWords(net) : "—"}{freeBytes > 0 ? ` · ${fmtBytes(freeBytes)} free` : ""}</dd></div>
+            <div><dt>Validation</dt><dd>{summaryText(net, w.assumeChoice, w.assumeHeight, avDef)}</dd></div>
+            <div><dt>Blocks to keep</dt><dd>{keepSummary(net, w.storage, w.keep)}</dd></div>
+            <div><dt>Disk needed</dt><dd>{needWords}{freeBytes > 0 ? ` · ${fmtBytes(freeBytes)} free` : ""}</dd></div>
             {#if !external}
               <div><dt>Data location</dt><dd class="font-mono text-[0.9rem]">{w.dataRoot.trim() || "Default"}</dd></div>
               <div><dt>Start the node on {net?.label ?? "…"}</dt><dd>{w.start ? "Yes, right away" : "No, later from Settings"}</dd></div>
@@ -656,6 +791,12 @@
             <div><dt>RPC address</dt><dd class="font-mono text-[0.9rem]">{w.rpc}</dd></div>
           {/if}
         </dl>
+        {#if (external || w.mode === "managed") && convertWarn}
+          <p class="ui-warn mt-3 text-[0.95rem]" role="note">
+            The node converts the existing {net?.label} store on its next start: it deletes old blocks one by one and does
+            not answer meanwhile.
+          </p>
+        {/if}
         {#if err}<p class="ui-bad mt-4 text-[0.95rem]" role="alert" use:reveal={err}>{err}</p>{/if}
       {/if}
       {#if err && cur !== "summary"}<p class="ui-bad mt-3 text-[0.95rem]" role="alert" use:reveal={err}>{err}</p>{/if}
@@ -670,6 +811,12 @@
         <button type="button" class="ui-btn-ghost" onclick={back}>Back</button>
         <button type="button" class="ui-btn" disabled={!nextOk} onclick={next}>Next</button>
       {:else if cur === "network"}
+        <button type="button" class="ui-btn-ghost" onclick={back}>Back</button>
+        <button type="button" class="ui-btn" disabled={!nextOk} onclick={next}>Next</button>
+      {:else if cur === "validation"}
+        <button type="button" class="ui-btn-ghost" onclick={back}>Back</button>
+        <button type="button" class="ui-btn" disabled={!nextOk} onclick={next}>Next</button>
+      {:else if cur === "pruning"}
         <button type="button" class="ui-btn-ghost" onclick={back}>Back</button>
         <button type="button" class="ui-btn" disabled={!nextOk} onclick={next}>Next</button>
       {:else if cur === "get"}

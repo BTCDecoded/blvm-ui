@@ -24,7 +24,12 @@ export type NetworkInfo = {
   diskKind: "about" | "over" | "under" | "unmeasured";
   /** Shown under "Developer options" in the wizard. */
   developer?: boolean;
+  /** Approximate chain height (see `KNOWN_HEIGHT_AS_OF`); only the floor of the assume-valid slider. */
+  knownHeight: number;
 };
+
+/** When the `knownHeight` figures were set. They are approximate and only used while the live height is unknown. */
+export const KNOWN_HEIGHT_AS_OF = "2026-10-13";
 
 const GB = 1_000_000_000;
 
@@ -40,6 +45,7 @@ export const NETWORKS: NetworkInfo[] = [
     p2pPort: 8333,
     diskBytes: 800 * GB,
     diskKind: "about",
+    knownHeight: 971_325,
   },
   {
     id: "testnet4",
@@ -52,6 +58,7 @@ export const NETWORKS: NetworkInfo[] = [
     p2pPort: 48333,
     diskBytes: null, // no figure published
     diskKind: "unmeasured",
+    knownHeight: 156_470,
   },
   {
     id: "testnet",
@@ -64,6 +71,7 @@ export const NETWORKS: NetworkInfo[] = [
     p2pPort: 18333,
     diskBytes: 100 * GB,
     diskKind: "over",
+    knownHeight: 5_158_765,
   },
   {
     id: "signet",
@@ -76,6 +84,7 @@ export const NETWORKS: NetworkInfo[] = [
     p2pPort: 38333,
     diskBytes: null, // no figure published
     diskKind: "unmeasured",
+    knownHeight: 326_255,
   },
   {
     id: "regtest",
@@ -88,6 +97,7 @@ export const NETWORKS: NetworkInfo[] = [
     p2pPort: 18444,
     diskBytes: 1 * GB,
     diskKind: "under",
+    knownHeight: 0,
     developer: true,
   },
 ];

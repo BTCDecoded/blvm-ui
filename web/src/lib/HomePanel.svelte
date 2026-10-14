@@ -1,16 +1,50 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import BlockRail from "./BlockRail.svelte";
   import Globe, { type GlobeHover, type GlobePeer } from "./Globe.svelte";
   import Icon from "./Icon.svelte";
   import Light from "./Light.svelte";
   import Ring from "./Ring.svelte";
   import { behindLine, fmt, simpleLabel } from "./format";
+  import { blocksStoredText, pendingText, storageText, storageView } from "./pruning";
   import { ui } from "./status.svelte";
+  import { flatFor, pushSample, rateOf, rateText, STALL_MS, type Sample } from "./syncrate";
 
   const s = $derived(ui.snap);
+  // Block pruning: shown for a node this console runs (it knows the setting) and for any node that says it is
+  // pruned. The heights above stay the validated chain; pruning only changes how many old blocks are kept.
+  const sv = $derived(storageView(s.pruning, !!s.managed));
+  const showStored = $derived(!!s.managed || sv.pruned);
   const pct = $derived(
     s.network_height ? Math.min(100, (s.local_height / s.network_height) * 100) : 0,
   );
+  // `s.local_height` is the raw RPC value: the node's `blocks`, the last block it has fully validated and connected
+  // (max of getblockchaininfo.blocks and getblockcount). Nothing here smooths, counts up or fills in between
+  // polls. The rate and the "waiting" hint below are worked out from the heights of the last 30 s of polls and
+  // are shown next to the figure; they never change it.
+  let samples = $state<Sample[]>([]);
+  let sampleRpc = "";
+  $effect(() => {
+    // One run per status poll (each poll is a new snapshot object), also when the height has not moved.
+    const snap = ui.snap;
+    untrack(() => {
+      if (snap.rpc_addr !== sampleRpc) {
+        sampleRpc = snap.rpc_addr;
+        samples = [];
+      }
+      // Only a node that answers has a height worth timing; a gap in the polls must not read as "flat".
+      if (!snap.connected || snap.frozen) {
+        samples = [];
+        return;
+      }
+      samples = pushSample(samples, Date.now(), snap.local_height);
+    });
+  });
+  const syncing = $derived(s.ibd && s.connected && !s.frozen);
+  // Rate: only while the first sync runs. While the waiting hint shows (the height has been flat long enough), the
+  // hint is shown instead of the rate: the 30 s average only reaches 0 after the window empties.
+  const waiting = $derived(syncing && flatFor(samples) >= STALL_MS);
+  const rate = $derived(syncing && !waiting ? rateText(rateOf(samples)) : null);
   const num = $derived(s.sync_pct_num && s.sync_pct_num !== "—" ? s.sync_pct_num : "0");
 
   const globePeers = $derived.by((): GlobePeer[] => [
@@ -72,16 +106,24 @@
             <small class="mb-2 text-[1.95rem] text-muted">%</small>
           </p>
           <p class="mt-[0.65rem] text-[1.1375rem] text-muted">{behindLine(s)}</p>
+          {#if rate}
+            <p class="ui-sub sync-note" aria-label="Sync speed">{rate}</p>
+          {/if}
+          {#if waiting}
+            <p class="ui-sub sync-note" role="status">
+              Waiting for a missing block from a peer; the queue continues when it arrives
+            </p>
+          {/if}
           <div class="mt-[1.3rem] h-[0.4875rem] max-w-xl overflow-hidden rounded-full bg-faint/30">
             <i class="block h-full rounded-full bg-orange" style="width:{pct}%"></i>
           </div>
         </div>
 
         <div class="heights-strip" class:is-stale={s.frozen}>
-          <div class="min-w-0">
+          <div class="min-w-0" title="Blocks the node has fully validated and connected (its blocks count)">
             <span class="flex items-center gap-1.5 text-[0.845rem] font-medium tracking-wide text-muted uppercase">
               <Icon name="pin" class="h-[0.975rem] w-[0.975rem]" />
-              Local Height
+              Validated height
             </span>
             <strong class="mt-1 block truncate text-[1.4625rem] font-medium">{fmt(s.local_height)}</strong>
           </div>
@@ -102,6 +144,22 @@
             <strong class="mt-1 block truncate text-[1.4625rem] font-medium">{s.peers}</strong>
           </div>
         </div>
+        {#if showStored}
+          <div class="stored-line" class:is-stale={s.frozen} aria-label="Blocks stored">
+            <span class="flex items-center gap-1.5 text-[0.845rem] font-medium tracking-wide text-muted uppercase">
+              <Icon name="cube" class="h-[0.975rem] w-[0.975rem]" />
+              Blocks stored
+            </span>
+            <strong class="text-[1.1rem] font-medium">{blocksStoredText(sv, s.local_height)}</strong>
+            {#if sv.pruned}
+              <span class="ui-chip">{storageText(sv)}</span>
+              {#if sv.stored !== null}<span class="stored-src">{sv.source === "verified" ? "verified" : "estimated"}</span>{/if}
+            {/if}
+            {#if sv.pending}
+              <span class="ui-chip">{pendingText(sv)}</span>
+            {/if}
+          </div>
+        {/if}
       </div>
 
       <aside class="p2p-float">
@@ -208,9 +266,14 @@
   }
   .sync-card {
     display: flex;
-    flex: 1 1 auto;
+    /* Grows with the window but never shrinks below its content: stacked (narrow) the card is taller than 24rem
+       and the page scrolls, instead of the panels drawing over each other. */
+    flex: 1 0 auto;
     min-height: 24rem;
     flex-direction: column;
+    /* The card is its own size container, like the Settings sub-page: the layout follows the room the card really
+       has (the window minus the sidebar), not the window width. */
+    container-type: inline-size;
   }
   .sync-inner {
     position: relative;
@@ -250,11 +313,39 @@
     margin-top: 1.3rem;
     display: grid;
     max-width: 36rem;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    /* Three across when they fit; two and one below on a phone, so no figure is cut to "712,...". */
+    grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
     gap: 0.975rem;
     border-radius: 0.975rem;
     background: rgb(5 5 5 / 0.55);
     padding: 0.975rem 1.625rem;
+  }
+  .stored-line {
+    margin-top: 0.65rem;
+    display: flex;
+    max-width: 36rem;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem 0.85rem;
+    border-radius: 0.975rem;
+    background: rgb(5 5 5 / 0.55);
+    padding: 0.7rem 1.625rem;
+  }
+  .sync-note {
+    margin-top: 0.55rem;
+    max-width: 36rem;
+    /* A sentence, not a label: keep the small-print look but not the capitals. */
+    text-transform: none;
+    color: var(--color-muted);
+    letter-spacing: 0.02em;
+    line-height: 1.4;
+  }
+  .stored-src {
+    font-size: 0.78rem;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--color-faint);
   }
   .globe-back {
     pointer-events: none;
@@ -327,5 +418,45 @@
     justify-self: end;
     font-size: 1.4625rem;
     color: var(--color-cream);
+  }
+  /* Side by side only while the card keeps room for both (px, not rem: the root font size scales with the
+     window). Below that the P2P panel goes under the sync figures, at its own height. */
+  @container (max-width: 760px) {
+    .sync-grid {
+      grid-template-columns: minmax(0, 1fr);
+      height: auto;
+      align-items: start;
+    }
+    .sync-main {
+      height: auto;
+    }
+    .sync-readout {
+      margin-top: 1.5rem;
+    }
+    .p2p-float {
+      height: auto;
+      margin-top: 0;
+      align-self: stretch;
+    }
+    .p2p-body {
+      padding-top: 0.9rem;
+    }
+  }
+  @container (min-width: 480px) and (max-width: 760px) {
+    .p2p-body {
+      flex-direction: row;
+      justify-content: space-evenly;
+    }
+    .p2p-stats {
+      width: auto;
+    }
+  }
+  @container (max-width: 479px) {
+    .heights-strip {
+      padding: 0.8rem 1rem;
+    }
+    .stored-line {
+      padding: 0.7rem 1rem;
+    }
   }
 </style>

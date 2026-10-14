@@ -101,6 +101,32 @@ export type Snapshot = {
   /** Design K step 2 / G: a node binary shipped next to the console exists ("Run a node for me" is possible).
    *  Not listed in F; K and G both refer to it as `bundle_available`. */
   bundle_available?: boolean;
+  /** Block pruning (the console's setting for the current network plus what the node and the console's own probe
+   *  say about it). Absent on an older host: treated as a full node. */
+  pruning?: Pruning;
+};
+
+/**
+ * `source`: "estimated" = computed from the setting and the local height; "verified" = the console asked the
+ * node for the blocks around `stored_from_height` and they were (above) and were not (below) there; "unknown" =
+ * nothing to say (pruning off, or the node does not run).
+ */
+export type Pruning = {
+  /** The console's setting for the current network (managed only). */
+  enabled: boolean;
+  keep_blocks: number | null;
+  /** `getblockchaininfo.pruned` from the running node; null while it does not answer. */
+  node_reports_pruned: boolean | null;
+  /** `getpruneinfo.pruning_enabled` of the running node; null while it does not answer. */
+  node_enabled?: boolean | null;
+  /** `getpruneinfo.min_blocks_to_keep` of the running node: the number it keeps now (it may differ from the saved
+   *  setting until the next start); null while it does not answer. */
+  node_keep_blocks?: number | null;
+  /** The saved setting differs from what the running node does (on/off or the number): applies at the next start. */
+  pending_restart?: boolean;
+  stored_from_height: number | null;
+  stored_blocks: number | null;
+  source: "estimated" | "verified" | "unknown";
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -151,6 +177,12 @@ export type ManagedNetwork = {
   /** Unix seconds. */
   last_used: number | null;
   has_data: boolean;
+  /** The console's block-pruning setting for this network; null or absent keeps every block. */
+  prune_keep_blocks?: number | null;
+  /** The chain data of this network is being deleted right now. */
+  wiping?: boolean;
+  /** The port a node on this network listens on for peers (the network's own unless the Umbrel app moved it). */
+  p2p_port?: number;
 };
 
 /**
@@ -229,6 +261,8 @@ export type Managed = {
   switch: ManagedSwitch | null;
   /** `external`: the agent runs in another container (Umbrel). */
   agent: { external: boolean; alive: boolean };
+  /** Memory page size facts: this console's own, and (Umbrel) the node container's. Absent on older hosts. */
+  platform?: PlatformFacts;
   /** Design M.2, optional extra detail. */
   installed?: InstalledBinary | null;
   /** Host only: `X.Y.Z` from `<bin> version`, null until read. */
@@ -321,10 +355,32 @@ export type ReleaseInfo = {
   offline?: boolean;
   /** Optional: same value as `managed.update.channel`. */
   channel?: UpdateChannel;
+  /**
+   * The official release can start on the computer that would run the node. False on a device with 16 KB memory
+   * pages (Raspberry Pi 5), where the release aborts at start. `undefined` from an older host: treated as true.
+   */
+  runs_here?: boolean;
+  /** Plain words for `runs_here === false` (the page size and the two options). */
+  runs_here_reason?: string | null;
+  /** Memory page size, in bytes, of the computer that would run the node; null when unknown. */
+  page_size?: number | null;
+};
+
+/** `managed.platform` in the status: the memory page size and whether the official release can start here. */
+export type PlatformFacts = {
+  /** Page size of the console's own process, in bytes. */
+  page_size: number | null;
+  /** The node's computer (the agent container on Umbrel; the same as the console's otherwise). */
+  node_page_size: number | null;
+  runs_here: boolean;
+  runs_here_reason: string | null;
+  /** What the node container reported, when the node runs in another container. */
+  agent: { page_size: number | null; runs_here: boolean; reason: string | null } | null;
 };
 
 /** POST /api/node/install and /api/node/update: 202 with the job when it started, else `{ok:false,error}`. */
-export type JobRequest = { tag?: string; version?: string };
+/** `force: true` skips the host's 409 `page_size` refusal (the test run still refuses a program that aborts). */
+export type JobRequest = { tag?: string; version?: string; force?: boolean };
 export type JobResponse = { ok?: boolean; error?: string | null; job?: Partial<InstallJob> };
 export type OkResponse = { ok: boolean; error?: string | null };
 
@@ -362,6 +418,26 @@ export type ModulesResponse = {
 export type ModuleAction = "install" | "enable" | "disable" | "remove";
 export type ModuleActionRequest = { name: string };
 
+export type AssumeValidDefault = { height: number; forced_off: boolean };
+export type AssumeValidEffective = {
+  network: NetworkId;
+  value: string | null;
+  argv: string[];
+  /** The variable BLVM_ASSUME_VALID_HEIGHT is set under Child environment: the node uses it instead of `argv`. */
+  overridden_by_env?: boolean;
+  /** Plain sentence for the card when `overridden_by_env` is set. */
+  note?: string;
+};
+/** `prune_effective` in the settings: what the node on the current network will keep. */
+export type PruneEffective = {
+  network: NetworkId;
+  keep_blocks: number | null;
+  /** Chain data exists in the folder. */
+  has_data: boolean;
+  /** Chain data exists AND a node was once started pruned on it: going back to a full node needs it deleted. */
+  has_pruned_data?: boolean;
+};
+
 /**
  * GET/POST(PUT) /api/settings: the persisted `console.json` fields, as the host reads them. Every key is
  * optional (the mock sends a few). `rpc` and `network` are null while unset; `data_root` and `node_bin` are
@@ -389,8 +465,36 @@ export type ConsoleSettings = {
   updates?: UpdateChannel;
   /** Host only. Network id to the node's RPC `host:port` when not the network's default. */
   rpc_overrides?: Partial<Record<NetworkId, string>>;
-  /** Host only. `"default" | "off" | <height> | <64 hex>`; null = the per-network default. */
+  /** Host only. `"default" | "off" | <height> | <64 hex>`; null = the per-network default. A hash is only accepted in this older key. */
   assume_valid?: string | null;
+  /**
+   * Host only. Network id to its assume-valid setting (`"default" | "off" | <height>`); a network without an
+   * entry uses `assume_valid`. A patch sends only the networks it changes; `null` removes an entry.
+   */
+  assume_valid_by_network?: Partial<Record<NetworkId, string | null>>;
+  /** Host only, read-only. The node's built-in height per network, and whether the console runs it with full validation. */
+  assume_valid_defaults?: Partial<Record<NetworkId, AssumeValidDefault>>;
+  /** Host only, read-only. What the node on the current network starts with (`null` before a network is chosen). */
+  assume_valid_effective?: AssumeValidEffective | null;
+  /**
+   * Host only. Network id to the number of newest blocks the node keeps (at least `prune_min_blocks`); a network
+   * without an entry keeps every block. A patch sends only the networks it changes; `null` removes an entry
+   * (pruned to full: refused with 409 `needs: "wipe"` while pruned chain data exists, that is a node was once
+   * started pruned on a non-empty folder, unless `confirm_wipe` is sent; a setting that never ran is a plain save).
+   */
+  prune_by_network?: Partial<Record<NetworkId, number | null>>;
+  /** Host only, read-only. The smallest number of blocks to keep (288). */
+  prune_min_blocks?: number;
+  /** Host only, read-only. What the node on the current network will start with (`null` before a network is chosen). */
+  prune_effective?: PruneEffective | null;
+  /** Host only, read-only. Network id to the P2P port its node listens on (`BLVM_AGENT_P2P_PORT_<NET>` on Umbrel). */
+  p2p_ports?: Partial<Record<NetworkId, number>>;
+  /** Host only, patch only: delete the chain data of a network that goes from pruned back to full. */
+  confirm_wipe?: boolean;
+  /** Host only, in an answer: what the change costs (converting an existing store is slow). */
+  warning?: string;
+  /** Host only, in an answer: something the user should know about the change that was saved. */
+  note?: string;
   /** Host only. Extra environment for the node; an empty value unsets the variable. */
   child_env?: Record<string, string>;
   /** Host only. Setting names pinned by environment variables. */
@@ -412,10 +516,16 @@ export type SetupRequest = {
   /** Host only: alias of `start`. */
   start_now?: boolean;
   stop_on_exit: boolean;
+  /** Host only, managed: `"default" | "off" | <height>` for the chosen network. Left out: unchanged. */
+  assume_valid?: string;
+  /** Host only, managed: keep only the newest N blocks (N >= 288), or `null` for every block. Left out: unchanged. */
+  prune_keep_blocks?: number | null;
+  /** Host only: delete the chain data of a network that goes from pruned back to full (see `confirm_wipe`). */
+  confirm_wipe?: boolean;
   /** Not used by the host yet (modules arrive with U5); sent so the wizard's choice is not lost. */
   modules: string[];
 };
-export type SetupResponse = { ok: boolean; error?: string | null; status?: Snapshot };
+export type SetupResponse = { ok: boolean; error?: string | null; status?: Snapshot; warning?: string; note?: string };
 
 /** Design F/K: POST /api/setup/test. */
 export type SetupTestRequest = { rpc: string; user?: string; pass?: string };

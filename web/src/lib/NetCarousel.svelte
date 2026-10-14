@@ -138,6 +138,8 @@
     overflow: hidden;
     outline: none;
     border-radius: 0.9rem;
+    /* The tiles size from this box (cqw), never from the window. */
+    container-type: inline-size;
   }
   .stage:focus-visible {
     box-shadow: 0 0 0 1px var(--color-orange);
@@ -147,7 +149,7 @@
     top: 50%;
     left: 50%;
     display: flex;
-    width: 11.5rem;
+    width: clamp(8.25rem, 44cqw, 11.5rem);
     height: 8.4rem;
     flex-direction: column;
     align-items: center;
@@ -237,14 +239,11 @@
     width: 1.1rem;
     background: var(--color-orange);
   }
-  /* Phone width: the cards follow the column (never wider than it), the arrows tighten. */
+  /* Phone width: the arrows tighten (the tiles already follow the stage width). */
   @media (max-width: 767px) {
     .carousel {
       max-width: 100%;
       gap: 0.35rem;
-    }
-    .net {
-      width: clamp(8.5rem, 68%, 11.5rem);
     }
   }
   @media (prefers-reduced-motion: reduce) {

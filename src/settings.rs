@@ -100,6 +100,13 @@ pub struct ConsoleSettings {
     /// `None`/`"default"`: per-network default (full validation on Testnet4 and regtest, node
     /// default elsewhere); `"off"`: validate every block; a height or 64-hex block hash.
     pub assume_valid: Option<String>,
+    /// Network id -> assume-valid setting (same values as `assume_valid`). A network without an entry uses
+    /// the global `assume_valid` above, so older files keep working. See [`ConsoleSettings::assume_valid_for`].
+    pub assume_valid_by_network: BTreeMap<String, String>,
+    /// Network id -> number of newest blocks the node keeps (block pruning). A network without an entry keeps
+    /// every block. The API enforces `networks::PRUNE_MIN_BLOCKS` as the minimum; this struct stores what it is
+    /// given. See [`ConsoleSettings::prune_for`].
+    pub prune_by_network: BTreeMap<String, u64>,
     /// Extra environment for the node process; an empty value unsets the variable. The agent adds
     /// `BLVM_SCHNORR_PER_SIG=1` unless it is listed here.
     pub child_env: BTreeMap<String, String>,
@@ -110,6 +117,17 @@ impl ConsoleSettings {
     /// user set it up once and a restart of the computer or the app must not repeat any of it.
     pub fn start_on_boot_effective(&self, managed: bool) -> bool {
         self.start_on_boot.unwrap_or(managed)
+    }
+
+    /// The assume-valid setting a node on network `net_id` starts with: that network's own entry, else the
+    /// global one (`None`: the network's default, see `agent::assume_valid_args`).
+    pub fn assume_valid_for(&self, net_id: &str) -> Option<String> {
+        self.assume_valid_by_network.get(net_id).cloned().or_else(|| self.assume_valid.clone())
+    }
+
+    /// How many of the newest blocks a node on network `net_id` keeps: `None` keeps everything.
+    pub fn prune_for(&self, net_id: &str) -> Option<u64> {
+        self.prune_by_network.get(net_id).copied()
     }
 
     /// The user did not leave the node stopped.
@@ -139,6 +157,8 @@ impl Default for ConsoleSettings {
             updates: "self".into(),
             rpc_overrides: BTreeMap::new(),
             assume_valid: None,
+            assume_valid_by_network: BTreeMap::new(),
+            prune_by_network: BTreeMap::new(),
             child_env: BTreeMap::new(),
         }
     }
@@ -596,6 +616,66 @@ mod console_tests {
         // Garbage falls back to defaults instead of failing.
         std::fs::write(dir.join(CONSOLE_FILE), b"{not json").unwrap();
         assert_eq!(load_console(&dir), ConsoleSettings::default());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `BLVM_UI_STATE_DIR` may name a folder that does not exist yet, several levels deep (the "fresh" launch
+    /// configuration does): the first save creates all of it.
+    #[test]
+    fn saving_creates_a_state_folder_that_does_not_exist_yet() {
+        let base = tmp("state-parents");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("a b").join("blvm-ui-next").join("fresh");
+        assert!(!dir.exists());
+        assert_eq!(load_console(&dir), ConsoleSettings::default(), "a missing folder is a first run");
+        let s = ConsoleSettings { setup_done: true, network: Some("regtest".into()), ..Default::default() };
+        save_console(&dir, &s).unwrap();
+        assert_eq!(load_console(&dir), s);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn assume_valid_by_network_round_trips_falls_back_to_the_global_and_old_files_load() {
+        let dir = tmp("av-map");
+        let mut s = ConsoleSettings { assume_valid: Some("off".into()), ..Default::default() };
+        s.assume_valid_by_network.insert("mainnet".into(), "800000".into());
+        s.assume_valid_by_network.insert("regtest".into(), "default".into());
+        save_console(&dir, &s).unwrap();
+        let back = load_console(&dir);
+        assert_eq!(back, s);
+        // A network with an entry uses it; every other one falls back to the global setting.
+        assert_eq!(back.assume_valid_for("mainnet").as_deref(), Some("800000"));
+        assert_eq!(back.assume_valid_for("regtest").as_deref(), Some("default"));
+        assert_eq!(back.assume_valid_for("signet").as_deref(), Some("off"));
+        // No global and no entry: the network's default.
+        assert_eq!(ConsoleSettings::default().assume_valid_for("signet"), None);
+        // An old file without the key loads, keeps its global and has an empty map.
+        std::fs::write(dir.join(CONSOLE_FILE), r#"{"setup_done":true,"assume_valid":"700000"}"#).unwrap();
+        let old = load_console(&dir);
+        assert!(old.assume_valid_by_network.is_empty());
+        assert_eq!(old.assume_valid_for("mainnet").as_deref(), Some("700000"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prune_by_network_round_trips_stores_what_it_is_given_and_old_files_load() {
+        let dir = tmp("prune-map");
+        let mut s = ConsoleSettings::default();
+        s.prune_by_network.insert("mainnet".into(), 10_000);
+        // The 288-block minimum belongs to the API (`managed::patch_settings`), not to the struct.
+        s.prune_by_network.insert("regtest".into(), 5);
+        save_console(&dir, &s).unwrap();
+        let back = load_console(&dir);
+        assert_eq!(back, s);
+        assert_eq!(back.prune_for("mainnet"), Some(10_000));
+        assert_eq!(back.prune_for("regtest"), Some(5));
+        assert_eq!(back.prune_for("signet"), None, "no entry: keep every block");
+        assert_eq!(ConsoleSettings::default().prune_for("mainnet"), None);
+        // An old file without the key loads with an empty map and the rest intact.
+        std::fs::write(dir.join(CONSOLE_FILE), r#"{"setup_done":true,"assume_valid":"700000"}"#).unwrap();
+        let old = load_console(&dir);
+        assert!(old.prune_by_network.is_empty());
+        assert!(old.setup_done);
         let _ = std::fs::remove_dir_all(dir);
     }
 

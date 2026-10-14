@@ -5,6 +5,7 @@
   import Icon from "./Icon.svelte";
   import Light from "./Light.svelte";
   import { networkText } from "./networks";
+  import { pendingText, storageText, storageView } from "./pruning";
   import { switchRunning, ui } from "./status.svelte";
   import type { ConsoleSettings, NodeAction, ProcessState } from "./types";
 
@@ -33,6 +34,7 @@
   const installed = $derived(installedVersion(m));
   const reports = $derived(nodeReports(s, installed));
   const noNetwork = $derived(m.network === null);
+  const storage = $derived(storageView(s.pruning, true));
   const uptime = $derived(st === "running" && proc.since ? durLabel(Date.now() / 1000 - proc.since) : "—");
 
   let busy = $state(false);
@@ -66,13 +68,15 @@
 
   // Crash block: the last 50 lines, fetched when the node is (or becomes) crashed.
   let crashFor = "";
+  // A plain string (empty unless crashed): `proc` is a new object on every status poll, this changes only with the crash.
+  const crashKey = $derived(st === "crashed" ? `${proc.since}:${proc.restarts}` : "");
   $effect(() => {
-    if (st !== "crashed") {
+    const key = crashKey;
+    if (key === "") {
       crashFor = "";
       crashLog = [];
       return;
     }
-    const key = `${proc.since}:${proc.restarts}`;
     if (crashFor === key) return;
     crashFor = key;
     fetchLogs(undefined, 50)
@@ -112,6 +116,15 @@
 
   <dl class="kv">
     <div><dt>Network</dt><dd>{networkText(m.network)}</dd></div>
+    {#if !noNetwork}
+      <div>
+        <dt>Storage</dt>
+        <dd>
+          {storageText(storage)}
+          {#if storage.pending}<span class="ui-chip ml-2">{pendingText(storage)}</span>{/if}
+        </dd>
+      </div>
+    {/if}
     <div>
       <dt>Installed</dt>
       <dd>

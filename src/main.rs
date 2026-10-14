@@ -44,6 +44,16 @@ async fn main() -> Result<()> {
         setup_done = console.eff.setup_done,
         "console mode"
     );
+    {
+        let facts = console.local_facts();
+        match facts.page_size {
+            Some(n) => tracing::info!("page size {n} bytes"),
+            None => tracing::info!("page size unknown"),
+        }
+        if let Some(why) = facts.reason.as_deref().filter(|_| !facts.runs_here && console.is_managed()) {
+            tracing::warn!("the official node release does not run on this computer: {why}");
+        }
+    }
     let mut live = LiveState::new(console.initial_rpc());
     live.console = console;
     live.restore(persist::load());

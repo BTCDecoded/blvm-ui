@@ -244,7 +244,7 @@ pub async fn preview(state: &Shared, to_id: &str) -> (u16, Value) {
     let to_height = to_meta.last_height.filter(|h| *h > 0 && to_disk.has_data);
 
     let mut warnings: Vec<String> = Vec::new();
-    if assume_valid_args(c.settings.assume_valid.as_deref(), to).iter().any(|a| a == "--noassumevalid")
+    if assume_valid_args(c.settings.assume_valid_for(to.id).as_deref(), to).iter().any(|a| a == "--noassumevalid")
         && to.id != "regtest"
     {
         warnings.push(format!(
@@ -294,6 +294,9 @@ pub async fn begin(state: &Shared, to_id: &str) -> (u16, Value) {
     if g.console.job_active() {
         return (409, json!({ "ok": false, "error": "busy", "reason": "The node is being installed or updated. Wait for that to finish." }));
     }
+    if !g.console.wiping.is_empty() {
+        return (409, json!({ "ok": false, "error": "busy", "reason": crate::agent::WIPING_MSG }));
+    }
     let free = volume_space_at(&g.console.eff.data_root).1;
     let cur = g.console.network();
     if let Some(r) = judge(cur, to, g.console.switch_active(), free) {
@@ -302,6 +305,12 @@ pub async fn begin(state: &Shared, to_id: &str) -> (u16, Value) {
             _ => json!({ "ok": false, "error": r.reason() }),
         };
         return (r.status(), body);
+    }
+    // An agent in another container that has gone quiet cannot be asked to stop the old node or start the new one;
+    // what would be written now is carried out when it returns (see `patch_settings`). Refuse instead of leaving
+    // a "failed" switch behind.
+    if let Some(msg) = agent.quiet_refusal() {
+        return (409, json!({ "ok": false, "error": msg }));
     }
     let from = cur.expect("judge refuses when no network is chosen");
     let phase = if agent.state() == ProcState::Stopped { SwitchPhase::Starting } else { SwitchPhase::Stopping };
@@ -676,7 +685,7 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         networks::write_meta(
             &root,
             reg,
-            &networks::Meta { created: Some(10), last_used: Some(20), last_height: Some(150), last_header: None },
+            &networks::Meta { created: Some(10), last_used: Some(20), last_height: Some(150), last_header: None, ran_pruned: None },
         )
         .unwrap();
 
@@ -700,7 +709,7 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         networks::write_meta(
             &root,
             networks::by_id("signet").unwrap(),
-            &networks::Meta { created: Some(1), last_used: Some(2), last_height: Some(210_000), last_header: None },
+            &networks::Meta { created: Some(1), last_used: Some(2), last_height: Some(210_000), last_header: None, ran_pruned: None },
         )
         .unwrap();
         std::fs::write(networks::dir(&root, networks::by_id("signet").unwrap()).join("data/x"), b"1").unwrap();
@@ -711,6 +720,32 @@ while kill -0 $PPID 2>/dev/null; do sleep 0.1; done
         let (_, v) = preview(&f.state, "signet").await;
         assert_eq!(v["to_height"], 210_000);
         assert_eq!(v["to_last_used"], 2);
+
+        // The warning follows the target network's own assume-valid value, not the global one: a global "off"
+        // does not make Signet "check every block" when Signet has a height of its own, and a Signet "off"
+        // warns without a global value. A network without an entry of its own still follows the global value.
+        {
+            let mut g = f.state.write().await;
+            g.console.settings.assume_valid = Some("off".into());
+            g.console.settings.assume_valid_by_network.insert("signet".into(), "700000".into());
+        }
+        let (_, v) = preview(&f.state, "signet").await;
+        assert_eq!(v["warnings"], json!([]), "signet has its own height; the global \"off\" is not its setting: {v}");
+        let (_, v) = preview(&f.state, "mainnet").await;
+        assert!(v["warnings"][0].as_str().unwrap().contains("Mainnet checks every block in full"), "no entry: the global value applies: {v}");
+        {
+            let mut g = f.state.write().await;
+            g.console.settings.assume_valid = None;
+            g.console.settings.assume_valid_by_network.insert("signet".into(), "off".into());
+        }
+        let (_, v) = preview(&f.state, "signet").await;
+        assert!(v["warnings"][0].as_str().unwrap().contains("Signet checks every block in full"), "{v}");
+        {
+            let mut g = f.state.write().await;
+            g.console.settings.assume_valid_by_network.clear();
+        }
+        let (_, v) = preview(&f.state, "signet").await;
+        assert_eq!(v["warnings"], json!([]), "back to the default: {v}");
 
         // Testnet4 says it validates everything; mainnet carries the design's estimate.
         let (_, v) = preview(&f.state, "testnet4").await;

@@ -152,7 +152,7 @@
   });
 </script>
 
-<article class="panel ui-card grow">
+<article class="panel ui-card">
   <div class="ui-head">
     <h2 class="ui-title"><Icon name="network" class="h-5 w-5 text-muted" /> Network</h2>
     {#if running && shown}
@@ -256,7 +256,6 @@
 
 <style>
   .carousel-wrap {
-    margin-block: auto;
     padding-top: 1.25rem;
   }
   .phase {

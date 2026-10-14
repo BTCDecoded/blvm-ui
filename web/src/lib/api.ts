@@ -86,9 +86,12 @@ export async function callSetting(method: string, params: unknown[]): Promise<vo
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** The host's `needs` field on a refusal (`"wipe"`: the change needs the chain data deleted first). */
+  needs?: string;
+  constructor(status: number, message: string, needs?: string) {
     super(message);
     this.status = status;
+    this.needs = needs;
   }
 }
 
@@ -101,7 +104,7 @@ async function call<T>(path: string, init: RequestInit & { timeout?: number } = 
   const j = (await r.json().catch(() => ({}))) as Record<string, unknown>;
   if (!r.ok) {
     const e = j.error;
-    throw new ApiError(r.status, typeof e === "string" && e ? e : `${path} answered ${r.status}`);
+    throw new ApiError(r.status, typeof e === "string" && e ? e : `${path} answered ${r.status}`, typeof j.needs === "string" ? j.needs : undefined);
   }
   return j as T;
 }
@@ -185,6 +188,10 @@ export function normalizeReleases(j: Record<string, unknown>): ReleaseInfo {
     available: j.available === true,
     offline: j.offline === true || (typeof j.unavailable_reason === "string" && j.unavailable_reason !== ""),
     ...(ch ? { channel: ch } : {}),
+    // Absent on a host from before the page-size check: it then runs everywhere, as before.
+    runs_here: j.runs_here !== false,
+    runs_here_reason: str(j.runs_here_reason),
+    page_size: nn(j.page_size),
   };
 }
 
@@ -202,11 +209,14 @@ export const getReleases = async (force = false): Promise<ReleaseInfo> =>
 export const getInstallJob = async (): Promise<InstallJob> =>
   normalizeJob(await getShaped<Record<string, unknown>>("/api/node/install", (j) => typeof j.phase === "string"));
 
-const jobBody = (tag?: string): JobRequest => (tag ? { tag, version: tag.replace(/^v/, "") } : {});
-/** POST /api/node/install `{tag?}`: first install (or replacing a custom build). 202 + job, or `{ok:false,error}`. */
-export const installNode = (tag?: string) => postJson<JobResponse>("/api/node/install", jobBody(tag));
-/** POST /api/node/update `{tag?}`: replace the installed release. Same answer as install. */
-export const updateNode = (tag?: string) => postJson<JobResponse>("/api/node/update", jobBody(tag));
+const jobBody = (tag?: string, force = false): JobRequest => ({
+  ...(tag ? { tag, version: tag.replace(/^v/, "") } : {}),
+  ...(force ? { force: true } : {}),
+});
+/** POST /api/node/install `{tag?, force?}`: first install (or replacing a custom build). 202 + job, or `{ok:false,error}`. */
+export const installNode = (tag?: string, force = false) => postJson<JobResponse>("/api/node/install", jobBody(tag, force));
+/** POST /api/node/update `{tag?, force?}`: replace the installed release. Same answer as install. */
+export const updateNode = (tag?: string, force = false) => postJson<JobResponse>("/api/node/update", jobBody(tag, force));
 
 export const fetchModules = () =>
   getShaped<ModulesResponse>("/api/modules", (j) => Array.isArray(j.index) && Array.isArray(j.installed));
@@ -216,9 +226,16 @@ export const moduleAction = (action: ModuleAction, name: string) =>
 
 export const getSettings = () => getJson<ConsoleSettings>("/api/settings");
 
-export const patchSettings = (patch: ConsoleSettings) => postJson<ConsoleSettings>("/api/settings", patch);
+/** Deleting chain data (`confirm_wipe`) can take minutes on a big store on a slow disk: the host finishes it
+ *  whatever the page does, but the page should wait for the answer rather than give up after 8 s. */
+const WIPE_TIMEOUT_MS = 10 * 60 * 1000;
+const wipes = (body: unknown): boolean =>
+  typeof body === "object" && body !== null && (body as { confirm_wipe?: unknown }).confirm_wipe === true;
 
-export const runSetup = (req: SetupRequest) => postJson<SetupResponse>("/api/setup", req, 20000);
+export const patchSettings = (patch: ConsoleSettings) =>
+  postJson<ConsoleSettings>("/api/settings", patch, wipes(patch) ? WIPE_TIMEOUT_MS : undefined);
+
+export const runSetup = (req: SetupRequest) => postJson<SetupResponse>("/api/setup", req, wipes(req) ? WIPE_TIMEOUT_MS : 20000);
 
 export const testConnection = (req: SetupTestRequest) => postJson<SetupTestResponse>("/api/setup/test", req, 10000);
 

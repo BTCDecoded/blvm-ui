@@ -97,6 +97,126 @@ pub struct Snapshot {
     pub blvm_version_seen: Option<VersionSeen>,
     /// A node binary is known to this console, so "run a node for me" is possible.
     pub bundle_available: bool,
+    /// Block pruning: the console's setting for the current network, what the node says, and how many blocks
+    /// are stored. See [`PruningView`].
+    pub pruning: PruningView,
+}
+
+/// What the dashboard says about block pruning. The heights (`local_height`, `network_height`) never change
+/// because of pruning: the node validates everything and keeps only the newest blocks' bodies.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PruningView {
+    /// The console's setting for the current network says "pruned" (managed mode only).
+    pub enabled: bool,
+    /// Newest blocks to keep, from the same setting.
+    pub keep_blocks: Option<u64>,
+    /// `getblockchaininfo.pruned` of the running node (`None` while it does not answer).
+    pub node_reports_pruned: Option<bool>,
+    /// `getpruneinfo.pruning_enabled` of the running node (`None` while it does not answer).
+    pub node_enabled: Option<bool>,
+    /// `getpruneinfo.min_blocks_to_keep` of the running node: the number of newest blocks it keeps now, which is
+    /// what it was started with and may differ from the saved setting (`None` while it does not answer).
+    pub node_keep_blocks: Option<u64>,
+    /// The saved setting differs from what the running node reports (pruning on/off or the number): applies at
+    /// the next start. `false` while the node does not answer.
+    pub pending_restart: bool,
+    /// Lowest block height whose body the node still has.
+    pub stored_from_height: Option<u64>,
+    /// Bodies stored: `local_height - stored_from_height + 1`.
+    pub stored_blocks: Option<u64>,
+    /// `"estimated"` (computed from the setting and the heights), `"verified"` (the console asked the node for
+    /// the blocks around `stored_from_height`) or `"unknown"`.
+    pub source: &'static str,
+    /// The keep setting `stored_from_height` was measured for (a probe result is void when the setting changes).
+    #[serde(skip)]
+    pub probed_keep: Option<u64>,
+}
+
+impl Default for PruningView {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keep_blocks: None,
+            node_reports_pruned: None,
+            node_enabled: None,
+            node_keep_blocks: None,
+            pending_restart: false,
+            stored_from_height: None,
+            stored_blocks: None,
+            source: "unknown",
+            probed_keep: None,
+        }
+    }
+}
+
+impl PruningView {
+    /// The node does not answer: nothing it said before is true any more (a stale `true` must not outlive a stop).
+    pub fn forget_node(&mut self) {
+        self.node_reports_pruned = None;
+        self.node_enabled = None;
+        self.node_keep_blocks = None;
+        self.pending_restart = false;
+    }
+}
+
+/// [`finish_pruning`] with what the node itself says: the number of kept blocks the running node reports wins over
+/// the saved setting for the estimate and the probe (a changed setting only applies at the next start), and
+/// `pending_restart` says the two differ. `enabled` and `keep_blocks` stay the saved setting.
+pub fn finish_pruning_with_node(p: &mut PruningView, saved: Option<u64>, local: u64, net_height: u64) {
+    let node_keep = match (p.node_enabled, p.node_keep_blocks) {
+        (Some(true), Some(k)) => Some(k),
+        _ => None,
+    };
+    finish_pruning(p, node_keep.or(saved), local, net_height);
+    p.enabled = saved.is_some();
+    p.keep_blocks = saved;
+    p.pending_restart = match p.node_enabled.or(p.node_reports_pruned) {
+        Some(on) => on != saved.is_some() || (on && saved.is_some() && p.node_keep_blocks.is_some_and(|k| Some(k) != saved)),
+        None => false,
+    };
+}
+
+/// Fill the console-level part of the pruning view and the estimate: `keep` is the console's setting for the
+/// current network (`None`: keep every block, or standalone), `local` the validated height and `net_height` the
+/// best known chain height. The node keeps the newest `keep` blocks counted from the chain tip it knows of, so
+/// while it is still catching up the stored range sits at the top of the chain and may not reach `local` yet
+/// (zero blocks). A measured range (a probe for this same `keep`) replaces the estimate.
+pub fn finish_pruning(p: &mut PruningView, keep: Option<u64>, local: u64, net_height: u64) {
+    p.enabled = keep.is_some();
+    p.keep_blocks = keep;
+    let Some(k) = keep else {
+        // No setting of ours: a node that says it is pruned has a range we cannot estimate.
+        p.stored_from_height = None;
+        p.stored_blocks = None;
+        p.source = "unknown";
+        p.probed_keep = None;
+        return;
+    };
+    if p.node_reports_pruned == Some(false) {
+        // The saved setting has not reached the node yet (it applies at the next start).
+        p.stored_from_height = None;
+        p.stored_blocks = None;
+        p.source = "unknown";
+        p.probed_keep = None;
+        return;
+    }
+    if p.probed_keep == Some(k) && p.stored_from_height.is_some() && matches!(p.source, "verified" | "estimated") {
+        let from = p.stored_from_height.unwrap_or(0);
+        p.stored_blocks = Some(if local >= from { local - from + 1 } else { 0 });
+        return;
+    }
+    p.probed_keep = None;
+    if local == 0 && net_height == 0 {
+        p.stored_from_height = None;
+        p.stored_blocks = None;
+        p.source = "unknown";
+        return;
+    }
+    let anchor = local.max(net_height);
+    let from = (anchor + 1).saturating_sub(k);
+    p.stored_from_height = Some(from);
+    p.stored_blocks = Some(if local >= from { local - from + 1 } else { 0 });
+    p.source = "estimated";
 }
 
 /// What the node last said its version was, and when (unix seconds). Shown only as "last seen".
@@ -166,6 +286,7 @@ impl Snapshot {
             show_logs: false,
             blvm_version_seen: None,
             bundle_available: false,
+            pruning: PruningView::default(),
         }
     }
 }
@@ -193,7 +314,40 @@ struct ChainFeed {
     last_known: Option<crate::persist::LastKnown>,
     /// Version the node itself reported on its last full poll: `(version, unix seconds)`.
     version_seen: Option<(String, u64)>,
+    /// The last check of which blocks the node still has (see [`probe_stored_range`]).
+    prune_probe: Option<PruneProbe>,
 }
+
+/// One run of the stored-range probe: when, for which setting, and what it found.
+#[derive(Debug, Clone)]
+struct PruneProbe {
+    keep: u64,
+    /// The node's validated height at the time.
+    at_local: u64,
+    at: Instant,
+    found: Option<StoredRange>,
+}
+
+/// The lowest height whose block the node still has. `exact`: the block just below is gone (or this is block 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredRange {
+    from: u64,
+    exact: bool,
+}
+
+/// The automatic pruning of the node runs every 144 blocks, so the stored range moves in steps of that size.
+const PRUNE_STEP_BLOCKS: u64 = 144;
+/// Between two probes at least this long (a node that is syncing moves 144 blocks in a second).
+const PRUNE_PROBE_GAP: Duration = Duration::from_secs(20);
+/// After a probe that found nothing usable, wait this long before trying again.
+const PRUNE_PROBE_RETRY: Duration = Duration::from_secs(60);
+/// Whatever the result, look again after this long (the node can also be pruned by hand, or restart with another
+/// window): two small requests.
+const PRUNE_PROBE_REFRESH: Duration = Duration::from_secs(120);
+/// Pause between the requests of one probe (the node's RPC is rate-limited).
+const PRUNE_PROBE_PAUSE: Duration = Duration::from_millis(150);
+/// Refinement rounds after the first look, each two requests.
+const PRUNE_PROBE_ROUNDS: usize = 3;
 
 impl ChainFeed {
     fn new() -> Self {
@@ -213,6 +367,7 @@ impl ChainFeed {
             last_snapshot: None,
             hashed_lo: 0,
             hashed_hi: None,
+            prune_probe: None,
         }
     }
 }
@@ -295,6 +450,47 @@ impl LiveState {
             .collect()
     }
 
+    /// The chain data of the network whose chain is `chain` (`Network::chain`) behind `rpc_addr` was deleted:
+    /// forget its heights, Latest Blocks history, arrival bars and the parked snapshot, so a stopped node does
+    /// not keep showing the old chain. Views are keyed by RPC address; when another network shares the address
+    /// and the view holds that network's chain, it is left alone.
+    pub fn forget_chain(&mut self, rpc_addr: &str, chain: &str) {
+        if self.views.get(rpc_addr).and_then(|c| c.chain.as_deref()).is_some_and(|c| c != chain) {
+            return;
+        }
+        if let Some(c) = self.views.get_mut(rpc_addr) {
+            let version_seen = c.version_seen.take();
+            let chain = c.chain.take();
+            *c = ChainFeed::new();
+            c.version_seen = version_seen;
+            c.chain = chain;
+            c.dirty = true;
+        }
+        if self.rpc_addr == rpc_addr {
+            let s = &mut self.snapshot;
+            s.local_height = 0;
+            s.network_height = 0;
+            s.behind = 0;
+            s.sync_pct = "—".into();
+            s.sync_pct_num = "—".into();
+            s.syncing = false;
+            s.ibd = false;
+            s.ibd_label = "idle".into();
+            s.feed = Vec::new();
+            s.feed_waiting = true;
+            s.arrival = vec![0; HIST_BARS];
+            s.disk_used_bytes = 0;
+            s.disk_used_num = "—".into();
+            s.disk_used_unit = "".into();
+            s.disk_used_label = "—".into();
+            s.pruning.stored_from_height = None;
+            s.pruning.stored_blocks = None;
+            s.pruning.source = "unknown";
+            s.pruning.probed_keep = None;
+            s.pruning.forget_node();
+        }
+    }
+
     pub fn switch_rpc(&mut self, addr: String) {
         self.rpc_addr = addr.clone();
         self.fail_streak = 0;
@@ -306,7 +502,9 @@ impl LiveState {
             .and_then(|c| c.last_snapshot.clone())
             .unwrap_or_else(|| Snapshot::disconnected(&addr));
         self.snapshot.rpc_addr = addr;
-        // The parked snapshot is a memory, not a live answer: no version until this view is polled.
+        // The parked snapshot is a memory, not a live answer: no version, and nothing the node said about
+        // its pruning, until this view is polled.
+        self.snapshot.pruning.forget_node();
         if self.snapshot.blvm_version != "—" {
             let carried = (self.snapshot.blvm_version.clone(), self.snapshot.last_seen.unwrap_or_else(crate::persist::unix_now));
             let seen = chain_mut(self).version_seen.clone().unwrap_or(carried);
@@ -398,15 +596,202 @@ async fn poll_inner(state: &Shared, full: bool) {
     }
 }
 
+
+// ---- Block pruning: which old blocks does the node still have? ------------------------------
+
+/// The console's pruning setting for the network it manages (`None`: keep every block, or not managed).
+fn managed_prune_keep(g: &LiveState) -> Option<u64> {
+    if !g.console.is_managed() {
+        return None;
+    }
+    g.console.network().and_then(|n| g.console.settings.prune_for(n.id))
+}
+
+/// What the node answered about one block body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    Present,
+    Gone,
+    Unknown,
+}
+
+/// The node's answer for a block it does not have, or one that was deleted by pruning: the same error as for an
+/// unknown hash (code -5, "Block not found: <hash>"). Anything else (a timeout, a rate limit, "Loading block
+/// index") says nothing about the block.
+fn block_is_gone(err: &serde_json::Value) -> bool {
+    let code = err.get("code").and_then(|c| c.as_i64());
+    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("").to_ascii_lowercase();
+    code == Some(-5) || msg.contains("block not found")
+}
+
+/// For each height: is its block body in the node's store? Two requests: the hashes, then `getblock` for the
+/// ones the node knows (verbosity 1: the transaction ids only, not the whole block as hex). `None` when the node
+/// did not answer at all.
+async fn bodies_at(rpc_addr: &str, heights: &[u64]) -> Option<Vec<Body>> {
+    let calls: Vec<rpc::RpcCall> = heights
+        .iter()
+        .map(|h| rpc::RpcCall::with_params("getblockhash", serde_json::json!([h])))
+        .collect();
+    let hashes = rpc::call_batch_results(rpc_addr, &calls).await.ok()?;
+    let mut out = vec![Body::Unknown; heights.len()];
+    let mut which: Vec<usize> = Vec::new();
+    let mut block_calls: Vec<rpc::RpcCall> = Vec::new();
+    for (i, r) in hashes.iter().enumerate() {
+        match r {
+            Some(Ok(v)) => {
+                if let Some(h) = v.as_str().filter(|h| h.len() == 64) {
+                    which.push(i);
+                    block_calls.push(rpc::RpcCall::with_params("getblock", serde_json::json!([h, 1])));
+                }
+            }
+            // The height index is kept when bodies go; a height with no hash is not one the node stored.
+            Some(Err(e)) if block_is_gone(e) => out[i] = Body::Gone,
+            _ => {}
+        }
+    }
+    if block_calls.is_empty() {
+        return Some(out);
+    }
+    tokio::time::sleep(PRUNE_PROBE_PAUSE).await;
+    let blocks = rpc::call_batch_results(rpc_addr, &block_calls).await.ok()?;
+    for (j, r) in blocks.iter().enumerate() {
+        out[which[j]] = match r {
+            Some(Ok(v)) if v.is_object() => Body::Present,
+            Some(Err(e)) if block_is_gone(e) => Body::Gone,
+            _ => Body::Unknown,
+        };
+    }
+    Some(out)
+}
+
+/// Find the lowest block the node still has, starting from the console's estimate `lo` (the lowest height the
+/// setting says it keeps). The block at `lo` must be there. If the block just below it is gone, the estimate is
+/// right (`exact`). If it is there too, the node keeps more than the estimate (the node deletes in steps of 144
+/// blocks, so it normally does); then a few more rounds look further down: first at distances 1, 2, 4, ... below,
+/// then between the last block that was gone and the lowest one found. At most 8 batched requests (about 100
+/// calls) in all. `None` when nothing usable came back (the node is still downloading that part of the chain, or
+/// did not answer).
+///
+/// The node never serves the genesis block's body (`getblock` for height 0 answers -5 even on a full store), so
+/// nothing below height 1 is asked for. Block 1 present means the chain is stored from the start, and then the
+/// range is reported as starting at 0: the genesis block counts as stored, so a full node with tip H holds H+1
+/// blocks.
+async fn probe_stored_range(rpc_addr: &str, lo: u64) -> Option<StoredRange> {
+    let from_genesis = Some(StoredRange { from: 0, exact: true });
+    if lo <= 1 {
+        return (bodies_at(rpc_addr, &[1]).await?[0] == Body::Present).then_some(()).and(from_genesis);
+    }
+    let first = bodies_at(rpc_addr, &[lo - 1, lo]).await?;
+    if first[1] != Body::Present {
+        return None;
+    }
+    match first[0] {
+        Body::Gone => return Some(StoredRange { from: lo, exact: true }),
+        Body::Unknown => return None,
+        Body::Present => {}
+    }
+    let mut present_low = lo - 1;
+    let mut gone_high: Option<u64> = None;
+    for _ in 0..PRUNE_PROBE_ROUNDS {
+        if present_low <= 1 {
+            return from_genesis;
+        }
+        let cands = match gone_high {
+            None => {
+                // 1, 2, 4, ... below the lowest block known to be there, and block 1.
+                let mut v: Vec<u64> = (0..17).map(|i| 1u64 << i).filter(|d| *d < present_low).map(|d| present_low - d).collect();
+                if v.last() != Some(&1) {
+                    v.push(1);
+                }
+                v
+            }
+            Some(g) => {
+                // Sixteen points between the last gone block and the lowest present one.
+                let step = ((present_low - g) / 17).max(1);
+                let mut v: Vec<u64> = (1..=16).map(|j| g + j * step).filter(|h| *h > g && *h < present_low).collect();
+                v.sort_unstable_by(|a, b| b.cmp(a));
+                v.dedup();
+                v
+            }
+        };
+        if cands.is_empty() {
+            break;
+        }
+        tokio::time::sleep(PRUNE_PROBE_PAUSE).await;
+        let seen = bodies_at(rpc_addr, &cands).await?;
+        // `cands` is in falling order; the stored range is everything from some height up, so walk down until
+        // the first block that is gone.
+        for (h, b) in cands.iter().zip(seen) {
+            match b {
+                Body::Present => present_low = *h,
+                Body::Gone => {
+                    gone_high = Some(*h);
+                    break;
+                }
+                Body::Unknown => return None,
+            }
+        }
+        match gone_high {
+            Some(g) if present_low - g <= 1 => return Some(StoredRange { from: present_low, exact: true }),
+            None if present_low <= 1 => return from_genesis,
+            _ => {}
+        }
+    }
+    if present_low <= 1 {
+        return from_genesis;
+    }
+    Some(StoredRange { from: present_low, exact: false })
+}
+
+/// Is a new look at the stored range due? When the setting changed or the chain went backwards, at once; after a
+/// result, when the node has had time to prune again (144 blocks) or two minutes have passed; after a failure,
+/// after a minute.
+fn probe_due(prior: Option<&PruneProbe>, keep: u64, local: u64) -> bool {
+    let Some(p) = prior else { return true };
+    if p.keep != keep || local < p.at_local {
+        return true;
+    }
+    let gap = p.at.elapsed();
+    let moved = local >= p.at_local + PRUNE_STEP_BLOCKS;
+    if p.found.is_some() {
+        (moved && gap >= PRUNE_PROBE_GAP) || gap >= PRUNE_PROBE_REFRESH
+    } else {
+        gap >= PRUNE_PROBE_RETRY || (moved && gap >= PRUNE_PROBE_GAP)
+    }
+}
+
+/// The probe result as the part of the pruning view it decides (see [`finish_pruning`]).
+fn probed_view(probe: Option<&PruneProbe>, keep: Option<u64>) -> PruningView {
+    match (probe, keep) {
+        (Some(p), Some(k)) if p.keep == k => match p.found {
+            Some(f) => PruningView {
+                stored_from_height: Some(f.from),
+                source: if f.exact { "verified" } else { "estimated" },
+                probed_keep: Some(k),
+                ..PruningView::default()
+            },
+            None => PruningView::default(),
+        },
+        _ => PruningView::default(),
+    }
+}
+
 async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<()> {
-    let (refine_lo, refine_hi, prev) = {
+    let (refine_lo, refine_hi, prev, prune_keep, prior_probe, managed) = {
         let g = state.read().await;
         let bounds = g
             .views
             .get(rpc_addr)
             .map(|c| (c.hashed_lo, c.hashed_hi))
             .unwrap_or((0, None));
-        (bounds.0, bounds.1, g.snapshot.clone())
+        (
+            bounds.0,
+            bounds.1,
+            g.snapshot.clone(),
+            managed_prune_keep(&g),
+            g.views.get(rpc_addr).and_then(|c| c.prune_probe.clone()),
+            g.console.is_managed(),
+        )
     };
     let probe_heights = if full {
         header_probe_heights(refine_lo, refine_hi)
@@ -428,6 +813,12 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
                 serde_json::json!([h]),
             ));
         }
+    }
+    // What the node says about its own pruning (the number of blocks it keeps now): in the same batch when this
+    // console manages the node, or when the last answer said it is pruned. Last in the batch.
+    let want_prune_info = full && (managed || prev.pruning.node_reports_pruned == Some(true));
+    if want_prune_info {
+        calls.push(rpc::RpcCall::method("getpruneinfo"));
     }
     let mut answers = rpc::call_batch_calls(rpc_addr, &calls).await?;
     {
@@ -463,7 +854,7 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
             .and_then(|v| json_u64(&v))
             .map(|s| format_uptime(Duration::from_secs(s)))
             .unwrap_or_else(|| prev.uptime.clone());
-        let probe_answers = &answers[6..];
+        let probe_answers = &answers[6..6 + probe_heights.len()];
         let hashed_tip = hashed_header_tip(probe_answers, &probe_heights);
         let (next_lo, next_hi) =
             apply_probe_bounds(refine_lo, refine_hi, &probe_heights, probe_answers);
@@ -504,6 +895,43 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
         .unwrap_or("unknown")
         .to_string();
     let size_on_disk = json_u64_field(&chain, "size_on_disk").unwrap_or(0);
+    // Which old blocks does the node still have? Only asked when the console's setting says pruned and the node
+    // does not say otherwise, and not on every poll (see `probe_due`). Heights and sync figures never use it.
+    let node_pruned = chain.get("pruned").and_then(|v| v.as_bool());
+    // `getpruneinfo`: in the batch, or (a standalone console, node says "pruned") one request of its own.
+    let mut prune_info = if want_prune_info {
+        answers.get_mut(6 + probe_heights.len()).and_then(Option::take)
+    } else {
+        None
+    };
+    if full && !want_prune_info && node_pruned == Some(true) {
+        if let Ok(mut a) = rpc::call_batch_calls(rpc_addr, &[rpc::RpcCall::method("getpruneinfo")]).await {
+            prune_info = a.get_mut(0).and_then(Option::take);
+        }
+    }
+    let (node_enabled, node_keep) = if full {
+        let enabled = prune_info.as_ref().and_then(|v| v.get("pruning_enabled")).and_then(|v| v.as_bool()).or(node_pruned);
+        let keep = prune_info.as_ref().and_then(|v| json_u64_field(v, "min_blocks_to_keep")).filter(|_| enabled == Some(true));
+        (enabled, keep)
+    } else {
+        // A cheap tick: keep the last figures for as long as the node still says what it said.
+        match prev.pruning.node_enabled {
+            Some(e) if Some(e) == node_pruned => (Some(e), prev.pruning.node_keep_blocks),
+            _ => (node_pruned, None),
+        }
+    };
+    // The number the running node keeps beats the saved setting for the estimate and the probe.
+    let probe_keep = if managed { node_keep.or(prune_keep) } else { None };
+    let mut probe = prior_probe;
+    if let Some(k) = probe_keep.filter(|_| full && blocks > 0 && node_pruned != Some(false)) {
+        if probe_due(probe.as_ref(), k, blocks) {
+            // The same chain height the dashboard shows, so the estimate and the probe look at the same range.
+            let tip = chain_tip(headers, blocks, peer_tip, hashed_tip, next_lo.max(hashed_tip));
+            let lo = (tip.max(blocks) + 1).saturating_sub(k);
+            let found = probe_stored_range(rpc_addr, lo).await;
+            probe = Some(PruneProbe { keep: k, at_local: blocks, at: Instant::now(), found });
+        }
+    }
 
     let (peers, inbound, outbound, version, peer_rows, banned, network_active) = if full {
         let peers = peer_list.len();
@@ -589,6 +1017,8 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
     if let Some(a) = &g.console.agent {
         a.rpc_flag().store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    let probed_pruning = probed_view(probe.as_ref(), probe_keep);
+    chain_mut(&mut g).prune_probe = probe;
     let (ibd, healing, health, health_label, node_status, feed_waiting, feed_items, arrival, network_height, behind, pct, sync_pct, sync_pct_num) = {
         let c = chain_mut(&mut g);
         c.hashed_lo = next_lo.max(hashed_tip);
@@ -753,7 +1183,14 @@ async fn refresh(rpc_addr: &str, state: &Shared, full: bool) -> anyhow::Result<(
             None
         },
         bundle_available: prev.bundle_available,
+        pruning: PruningView {
+            node_reports_pruned: node_pruned,
+            node_enabled,
+            node_keep_blocks: node_keep,
+            ..probed_pruning
+        },
     };
+    finish_pruning_with_node(&mut g.snapshot.pruning, prune_keep, blocks, network_height);
     stamp_power(&mut g);
     let snap = g.snapshot.clone();
     let lk = crate::persist::LastKnown {
@@ -966,6 +1403,7 @@ fn mark_unreachable(g: &mut LiveState, err: String, listening: bool) {
             .map(|(version, at)| VersionSeen { version, at });
         snap.blvm_version = "—".into();
     }
+    snap.pruning.forget_node();
     snap.error = Some(err);
     snap.rpc_failures = g.fail_streak;
     snap.show_manual = show_manual && !node_up;
@@ -1087,12 +1525,30 @@ fn rpc_header_tip(headers: u64, blocks: u64) -> u64 {
     }
 }
 
+/// How close the node's own `headers` or `blocks` must be to what the peers claim for the node's figure to be
+/// taken as the tip (peers report the height they had when they connected, a few blocks away from now).
+const PEER_TIP_SLACK: u64 = 10;
+
+/// What the peers' tip means for the node: when the node's own `headers` (then `blocks`) are within
+/// [`PEER_TIP_SLACK`] of it, the node's figure is the better one (a node at the tip reads "caught up", not
+/// "3 behind" because a peer connected a few blocks later); otherwise the peers' figure stands.
+fn settle_peer_tip(peer_tip: u64, headers: u64, blocks: u64) -> u64 {
+    if peer_tip == 0 {
+        return 0;
+    }
+    [headers, blocks]
+        .into_iter()
+        .find(|own| *own > 0 && own.abs_diff(peer_tip) <= PEER_TIP_SLACK)
+        .unwrap_or(peer_tip)
+}
+
 /// Best known chain height. `remembered` is the last `getblockhash` header hit
 /// so a later poll that only sees the body cursor cannot reset network height.
+/// `peer_tip` is the peers' agreed figure ([`peer_best_height`]).
 fn chain_tip(headers: u64, blocks: u64, peer_tip: u64, hashed_tip: u64, remembered: u64) -> u64 {
     rpc_header_tip(headers, blocks)
         .max(blocks)
-        .max(peer_tip)
+        .max(settle_peer_tip(peer_tip, headers, blocks))
         .max(hashed_tip)
         .max(remembered)
 }
@@ -1140,10 +1596,18 @@ fn chain_bytes_on_disk(
     }
 }
 
-/// Best advertised height on a peer. Stock BLVM currently hardcodes
-/// `startingheight = 0` / `synced_headers = -1`; ignore non-positive values.
+/// The fewest peers whose claims are trusted for the chain tip.
+const PEER_TIP_MIN_PEERS: usize = 3;
+
+/// The chain height the peers agree on. Each peer claims a height (`startingheight` and friends: stock BLVM
+/// currently hardcodes `startingheight = 0` / `synced_headers = -1`, so non-positive values are ignored). One
+/// peer's claim must not move the figure: a lone peer once claimed 6,000 blocks too many and the page showed
+/// that as the network height. So the figure needs at least [`PEER_TIP_MIN_PEERS`] claims (`0` below that) and is
+/// the median of them (the lower one when even): with three or more claims a lone liar, high or low, is never the
+/// median. (Setting the highest and the lowest claim aside first gives the same number for every input, so it is
+/// not done.)
 fn peer_best_height(peers: &[serde_json::Value]) -> u64 {
-    peers
+    let mut claims: Vec<u64> = peers
         .iter()
         .filter_map(|p| {
             ["startingheight", "synced_headers", "synced_blocks"]
@@ -1151,8 +1615,12 @@ fn peer_best_height(peers: &[serde_json::Value]) -> u64 {
                 .filter_map(|k| json_u64_field(p, k).filter(|h| *h > 0))
                 .max()
         })
-        .max()
-        .unwrap_or(0)
+        .collect();
+    if claims.len() < PEER_TIP_MIN_PEERS {
+        return 0;
+    }
+    claims.sort_unstable();
+    claims[(claims.len() - 1) / 2]
 }
 
 /// Heights to probe with stock `getblockhash`. Some nodes leave
@@ -1950,9 +2418,11 @@ mod tests {
                 network: crate::networks::by_id("regtest"),
                 rpc_addr: Some(addr.to_string()),
                 assume_valid: None,
+                prune_keep_blocks: None,
                 child_env: Default::default(),
                 rpc_auth: None,
                 p2p_port: None,
+                p2p_listen_port: None,
             },
             crate::agent::Timings::default(),
         );
@@ -1995,6 +2465,554 @@ mod tests {
         assert!(!agent.rpc_flag().load(std::sync::atomic::Ordering::Relaxed), "a refused connection clears the signal");
     }
 
+    // ---- block pruning ----
+
+    #[test]
+    fn the_stored_range_estimate_follows_the_setting_and_never_touches_the_heights() {
+        let mut p = PruningView::default();
+        // Setting off: nothing to say, whatever the node reports.
+        finish_pruning(&mut p, None, 110_000, 110_000);
+        assert!(!p.enabled && p.keep_blocks.is_none() && p.stored_from_height.is_none() && p.stored_blocks.is_none());
+        assert_eq!(p.source, "unknown");
+
+        // 2,016 of 110,000: the newest blocks, counted from the tip, the chain height included.
+        finish_pruning(&mut p, Some(2_016), 110_000, 110_000);
+        assert!(p.enabled);
+        assert_eq!((p.keep_blocks, p.stored_from_height, p.stored_blocks), (Some(2_016), Some(107_985), Some(2_016)));
+        assert_eq!(p.source, "estimated");
+        // Idempotent (the estimate is recomputed from the same figures on every status).
+        let again = p.clone();
+        finish_pruning(&mut p, Some(2_016), 110_000, 110_000);
+        assert_eq!(p, again);
+
+        // A young chain: everything is still there (genesis counts), never a negative height.
+        finish_pruning(&mut p, Some(10_000), 150, 150);
+        assert_eq!((p.stored_from_height, p.stored_blocks), (Some(0), Some(151)));
+        // Still catching up (local 50 of 1,000, keep 300): the node keeps the top of the chain, so nothing yet.
+        finish_pruning(&mut p, Some(300), 50, 1_000);
+        assert_eq!((p.stored_from_height, p.stored_blocks), (Some(701), Some(0)));
+        // Nothing known yet: no figures rather than invented ones.
+        finish_pruning(&mut p, Some(300), 0, 0);
+        assert_eq!((p.stored_from_height, p.stored_blocks, p.source), (None, None, "unknown"));
+        // The node says it is not pruned (the saved setting applies at its next start): no estimate.
+        let mut q = PruningView { node_reports_pruned: Some(false), ..Default::default() };
+        finish_pruning(&mut q, Some(300), 1_000, 1_000);
+        assert!(q.enabled && q.stored_from_height.is_none() && q.source == "unknown");
+
+        // A measured range for this same setting beats the estimate, and grows with the local height;
+        // for another setting it is void.
+        let mut m = PruningView { stored_from_height: Some(600), source: "verified", probed_keep: Some(300), ..Default::default() };
+        finish_pruning(&mut m, Some(300), 1_000, 1_000);
+        assert_eq!((m.stored_from_height, m.stored_blocks, m.source), (Some(600), Some(401), "verified"));
+        finish_pruning(&mut m, Some(300), 1_100, 1_100);
+        assert_eq!(m.stored_blocks, Some(501));
+        finish_pruning(&mut m, Some(500), 1_100, 1_100);
+        assert_eq!((m.stored_from_height, m.stored_blocks, m.source), (Some(601), Some(500), "estimated"));
+    }
+
+    #[test]
+    fn a_missing_block_is_told_apart_from_a_node_that_cannot_answer() {
+        assert!(block_is_gone(&serde_json::json!({"code": -5, "message": "Block not found: abcd"})));
+        assert!(block_is_gone(&serde_json::json!({"code": -32603, "message": "Block not found or storage unavailable"})));
+        assert!(!block_is_gone(&serde_json::json!({"code": -28, "message": "Loading block index"})));
+        assert!(!block_is_gone(&serde_json::json!({"code": -32000, "message": "Too many requests"})));
+        assert!(!block_is_gone(&serde_json::json!(null)));
+    }
+
+    /// The counts of the calls a [`fake_pruned_node`] received.
+    #[derive(Default)]
+    struct Seen {
+        getblockhash: std::sync::atomic::AtomicUsize,
+        getblock: std::sync::atomic::AtomicUsize,
+        getpruneinfo: std::sync::atomic::AtomicUsize,
+        /// What `getpruneinfo` answers (None: the method is unknown to this node).
+        info: std::sync::Mutex<Option<serde_json::Value>>,
+    }
+
+    /// A node with a chain of `headers` headers, validated up to `blocks`. Block bodies exist for the heights
+    /// `stored_from..=blocks`; any other `getblock` answers like the real node does for a block it does not have
+    /// (code -5, "Block not found: <hash>"). `pruned` is what `getblockchaininfo` says (None: the key is absent).
+    async fn fake_pruned_node(blocks: u64, headers: u64, stored_from: u64, pruned: Option<bool>, seen: Arc<Seen>) -> std::net::SocketAddr {
+        use std::sync::atomic::Ordering::Relaxed;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        let mut tmp = [0u8; 8192];
+                        let n = match s.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else { continue };
+                        let want: usize = head
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if body.len() < want {
+                            continue;
+                        }
+                        let req: serde_json::Value = serde_json::from_str(body).unwrap();
+                        let out: Vec<serde_json::Value> = req
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|c| {
+                                let id = &c["id"];
+                                let param = |i: usize| c["params"].get(i).cloned().unwrap_or(serde_json::Value::Null);
+                                match c["method"].as_str().unwrap() {
+                                    "getblockchaininfo" => {
+                                        let mut v = serde_json::json!({"chain": "regtest", "blocks": blocks, "headers": headers, "initialblockdownload": false});
+                                        if let Some(p) = pruned {
+                                            v["pruned"] = serde_json::json!(p);
+                                        }
+                                        serde_json::json!({"id": id, "result": v})
+                                    }
+                                    "getblockcount" => serde_json::json!({"id": id, "result": blocks}),
+                                    "getblockhash" => {
+                                        seen.getblockhash.fetch_add(1, Relaxed);
+                                        let h = param(0).as_u64().unwrap_or(u64::MAX);
+                                        if h <= headers {
+                                            serde_json::json!({"id": id, "result": format!("{:064x}", h + 1)})
+                                        } else {
+                                            serde_json::json!({"id": id, "error": {"code": -5, "message": format!("Block not found: at height {h}")}})
+                                        }
+                                    }
+                                    "getblock" => {
+                                        seen.getblock.fetch_add(1, Relaxed);
+                                        let hash = param(0).as_str().unwrap_or("").to_string();
+                                        let h = u64::from_str_radix(&hash, 16).unwrap_or(0).saturating_sub(1);
+                                        // Like the real node: the genesis block's body is never served (-5), even on a full store.
+                                        if h >= stored_from.max(1) && h <= blocks {
+                                            serde_json::json!({"id": id, "result": {"hash": hash, "height": h, "tx": ["aa"]}})
+                                        } else {
+                                            serde_json::json!({"id": id, "error": {"code": -5, "message": format!("Block not found: {hash}")}})
+                                        }
+                                    }
+                                    "getpruneinfo" => {
+                                        seen.getpruneinfo.fetch_add(1, Relaxed);
+                                        match seen.info.lock().unwrap().clone() {
+                                            Some(v) => serde_json::json!({"id": id, "result": v}),
+                                            None => serde_json::json!({"id": id, "error": {"code": -32601, "message": "no"}}),
+                                        }
+                                    }
+                                    "getpeerinfo" | "listbanned" => serde_json::json!({"id": id, "result": []}),
+                                    _ => serde_json::json!({"id": id, "error": {"code": -32601, "message": "no"}}),
+                                }
+                            })
+                            .collect();
+                        let body = serde_json::to_string(&out).unwrap();
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                        if s.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        buf.clear();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// A managed console whose poller follows `addr`, with block pruning set to `keep` for regtest.
+    fn pruning_state(tag: &str, addr: &str, keep: Option<u64>) -> (Shared, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("blvm-state-prune-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = crate::settings::EnvOverrides {
+            mode: Some("managed".into()),
+            data_root: Some(dir.join("root").display().to_string()),
+            ..Default::default()
+        };
+        let mut console = crate::managed::Console::load(Some(dir.join("state")), env, None);
+        console.settings.network = Some("regtest".into());
+        if let Some(k) = keep {
+            console.settings.prune_by_network.insert("regtest".into(), k);
+        }
+        crate::agent::testkit::isolate(&mut console);
+        let mut live = LiveState::new(addr.to_string());
+        live.console = console;
+        (Arc::new(RwLock::new(live)), dir)
+    }
+
+    #[tokio::test]
+    async fn the_stored_range_is_verified_against_the_node_without_touching_the_heights() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Exactly the newest 300 of 1,000 are stored: the block below the estimate is gone, the one at it is there.
+        let seen = Arc::new(Seen::default());
+        let addr = fake_pruned_node(1_000, 1_000, 701, Some(true), Arc::clone(&seen)).await;
+        let (state, dir) = pruning_state("exact", &addr.to_string(), Some(300));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert!(g.snapshot.connected);
+            assert_eq!((p.enabled, p.keep_blocks, p.node_reports_pruned), (true, Some(300), Some(true)));
+            assert_eq!((p.stored_from_height, p.stored_blocks, p.source), (Some(701), Some(300), "verified"));
+            // The validated chain is what it was: pruning changes no height.
+            assert_eq!(g.snapshot.local_height, 1_000);
+            assert!(g.snapshot.network_height >= 1_000);
+            let v = serde_json::to_value(&g.snapshot).unwrap();
+            assert_eq!(v["pruning"]["source"], "verified");
+            assert!(v["pruning"].get("probed_keep").is_none(), "an internal field is not sent");
+        }
+        // A second poll does not look again: the node has not had time to prune once more.
+        let asked = (seen.getblockhash.load(Relaxed), seen.getblock.load(Relaxed));
+        poll_once(&state).await;
+        let after = (seen.getblockhash.load(Relaxed) - asked.0, seen.getblock.load(Relaxed));
+        assert_eq!(seen.getblock.load(Relaxed), asked.1, "no new probe: {after:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The node keeps more than the estimate (it deletes in steps of 144 blocks): found by looking further down.
+        let seen = Arc::new(Seen::default());
+        let addr = fake_pruned_node(1_000, 1_000, 600, Some(true), Arc::clone(&seen)).await;
+        let (state, dir) = pruning_state("slack", &addr.to_string(), Some(300));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.stored_from_height, p.stored_blocks, p.source), (Some(600), Some(401), "verified"));
+        }
+        assert!(seen.getblock.load(Relaxed) <= 2 * 17 + 8, "a bounded number of block requests: {}", seen.getblock.load(Relaxed));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Not pruned yet (a store that still has every block): the range starts at 0, and that is a measurement too.
+        let addr = fake_pruned_node(1_000, 1_000, 0, Some(true), Arc::new(Seen::default())).await;
+        let (state, dir) = pruning_state("all", &addr.to_string(), Some(300));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.stored_from_height, p.stored_blocks, p.source), (Some(0), Some(1_001), "verified"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_node_that_has_not_got_the_blocks_yet_or_does_not_prune_keeps_the_estimate_or_none() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Catching up: validated 50 of 20,050, nothing stored where the newest 300 will be. Nothing to verify
+        // (the block at the estimate is not there), the estimate says zero stored, and the heights are the node's.
+        let addr = fake_pruned_node(50, 20_050, 40, Some(true), Arc::new(Seen::default())).await;
+        let (state, dir) = pruning_state("ibd", &addr.to_string(), Some(300));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.stored_from_height, p.stored_blocks, p.source), (Some(19_751), Some(0), "estimated"));
+            assert_eq!(g.snapshot.local_height, 50);
+            assert_eq!(g.snapshot.network_height, 20_050);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The node says it is not pruned although the setting is (it applies at the next start): no estimate, no probe.
+        let seen = Arc::new(Seen::default());
+        let addr = fake_pruned_node(1_000, 1_000, 0, Some(false), Arc::clone(&seen)).await;
+        let (state, dir) = pruning_state("pending", &addr.to_string(), Some(300));
+        let before = seen.getblock.load(Relaxed);
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.enabled, p.node_reports_pruned, p.stored_from_height, p.source), (true, Some(false), None, "unknown"));
+        }
+        assert_eq!(seen.getblock.load(Relaxed), before, "nothing to probe on a node that is not pruned");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // No setting: the node's own answer is passed on and nothing is probed.
+        let seen = Arc::new(Seen::default());
+        let addr = fake_pruned_node(1_000, 1_000, 0, Some(true), Arc::clone(&seen)).await;
+        let (state, dir) = pruning_state("off", &addr.to_string(), None);
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.enabled, p.keep_blocks, p.node_reports_pruned, p.stored_from_height), (false, None, Some(true), None));
+        }
+        assert_eq!(seen.getblock.load(Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A node from before the field: absent, not false.
+        let addr = fake_pruned_node(1_000, 1_000, 0, None, Arc::new(Seen::default())).await;
+        let (state, dir) = pruning_state("old", &addr.to_string(), None);
+        poll_once(&state).await;
+        assert_eq!(state.read().await.snapshot.pruning.node_reports_pruned, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn prune_info(enabled: bool, keep: u64) -> serde_json::Value {
+        serde_json::json!({"pruning_enabled": enabled, "mode": "normal", "auto_prune": enabled, "min_blocks_to_keep": keep})
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_shows_what_the_running_node_keeps_and_flags_a_changed_setting() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The node was started with 300; the saved setting is 400 now (applies at the next start).
+        let seen = Arc::new(Seen::default());
+        *seen.info.lock().unwrap() = Some(prune_info(true, 300));
+        let addr = fake_pruned_node(1_000, 1_000, 701, Some(true), Arc::clone(&seen)).await;
+        let (state, dir) = pruning_state("nodeN", &addr.to_string(), Some(400));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.enabled, p.keep_blocks), (true, Some(400)), "the saved setting stays visible");
+            assert_eq!((p.node_enabled, p.node_keep_blocks, p.node_reports_pruned), (Some(true), Some(300), Some(true)));
+            assert!(p.pending_restart, "400 saved, 300 running");
+            // The estimate and the probe use the node's 300, not the saved 400.
+            assert_eq!((p.stored_from_height, p.stored_blocks, p.source), (Some(701), Some(300), "verified"));
+            let v = serde_json::to_value(&g.snapshot).unwrap();
+            assert_eq!(v["pruning"]["node_keep_blocks"], 300);
+            assert_eq!(v["pruning"]["pending_restart"], true);
+        }
+        assert_eq!(seen.getpruneinfo.load(Relaxed), 1, "one extra call in the full poll batch");
+        // A cheap tick keeps the figures, and the next full poll asks again.
+        poll_once(&state).await;
+        assert_eq!(state.read().await.snapshot.pruning.node_keep_blocks, Some(300));
+        // The setting follows the node: nothing pending.
+        {
+            let mut g = state.write().await;
+            g.console.settings.prune_by_network.insert("regtest".into(), 300);
+        }
+        for _ in 0..4 {
+            poll_once(&state).await;
+        }
+        {
+            let g = state.read().await;
+            assert!(!g.snapshot.pruning.pending_restart);
+            assert_eq!(g.snapshot.pruning.keep_blocks, Some(300));
+        }
+        // The node dies: nothing it said stays (a stale true must not outlive the stop), nothing is pending.
+        {
+            let mut g = state.write().await;
+            assert_eq!(g.snapshot.pruning.node_reports_pruned, Some(true));
+            mark_unreachable(&mut g, "connection refused".into(), false);
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.node_reports_pruned, p.node_enabled, p.node_keep_blocks, p.pending_restart), (None, None, None, false));
+            assert_eq!(p.keep_blocks, Some(300), "the saved setting is still shown");
+            let v = serde_json::to_value(&g.snapshot).unwrap();
+            assert!(v["pruning"]["node_reports_pruned"].is_null() && v["pruning"]["node_keep_blocks"].is_null());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Pruning saved, node unpruned (it applies at the next start): pending, and no node figure for the number.
+        let seen = Arc::new(Seen::default());
+        let addr = fake_pruned_node(1_000, 1_000, 0, Some(false), Arc::clone(&seen)).await;
+        *seen.info.lock().unwrap() = Some(serde_json::json!({"pruning_enabled": false}));
+        let (state, dir) = pruning_state("nodeoff", &addr.to_string(), Some(300));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.node_enabled, p.node_keep_blocks, p.pending_restart), (Some(false), None, true));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A node without getpruneinfo: `pruned` from getblockchaininfo still decides on/off.
+        let addr = fake_pruned_node(1_000, 1_000, 701, Some(true), Arc::new(Seen::default())).await;
+        let (state, dir) = pruning_state("nodenoinfo", &addr.to_string(), Some(300));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.node_enabled, p.node_keep_blocks, p.pending_restart), (Some(true), None, false));
+            assert_eq!(p.stored_from_height, Some(701));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_console_that_manages_no_node_asks_getpruneinfo_only_of_a_node_that_says_it_is_pruned() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let seen = Arc::new(Seen::default());
+        *seen.info.lock().unwrap() = Some(prune_info(true, 500));
+        let addr = fake_pruned_node(1_000, 1_000, 501, Some(true), Arc::clone(&seen)).await;
+        let state: Shared = Arc::new(RwLock::new(LiveState::new(addr.to_string())));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.enabled, p.keep_blocks), (false, None), "standalone has no saved setting");
+            assert_eq!((p.node_enabled, p.node_keep_blocks, p.pending_restart), (Some(true), Some(500), true));
+        }
+        assert!(seen.getpruneinfo.load(Relaxed) >= 1);
+        // Standalone has no stamp of the managed kind: the failed poll itself must forget the node's answers.
+        {
+            let mut g = state.write().await;
+            mark_unreachable(&mut g, "connection refused".into(), false);
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.node_reports_pruned, p.node_enabled, p.node_keep_blocks, p.pending_restart), (None, None, None, false));
+        }
+
+        let seen = Arc::new(Seen::default());
+        let addr = fake_pruned_node(1_000, 1_000, 0, Some(false), Arc::clone(&seen)).await;
+        let state: Shared = Arc::new(RwLock::new(LiveState::new(addr.to_string())));
+        poll_once(&state).await;
+        assert_eq!(seen.getpruneinfo.load(Relaxed), 0, "an unpruned node is not asked");
+        assert_eq!(state.read().await.snapshot.pruning.node_keep_blocks, None);
+    }
+
+    #[tokio::test]
+    async fn genesis_is_never_asked_for_and_a_full_store_counts_it_as_stored() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The node never serves block 0 (the fake answers -5 for it like the real node). A chain shorter than the
+        // number to keep is stored from the start: block 1 present is enough, and the genesis block counts.
+        let seen = Arc::new(Seen::default());
+        let addr = fake_pruned_node(1_000, 1_000, 0, Some(true), Arc::clone(&seen)).await;
+        let (state, dir) = pruning_state("gen-short", &addr.to_string(), Some(5_000));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.stored_from_height, p.stored_blocks, p.source), (Some(0), Some(1_001), "verified"));
+        }
+        assert_eq!(seen.getblock.load(Relaxed), 1, "one look at block 1, none at block 0");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Exactly as long as the number to keep: the estimate is block 1.
+        let addr = fake_pruned_node(1_000, 1_000, 0, Some(true), Arc::new(Seen::default())).await;
+        let (state, dir) = pruning_state("gen-exact", &addr.to_string(), Some(1_000));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.stored_from_height, p.stored_blocks, p.source), (Some(0), Some(1_001), "verified"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A store pruned up to block 650: the walk down stops at the real edge, and block 0 is never probed.
+        let seen = Arc::new(Seen::default());
+        let addr = fake_pruned_node(1_000, 1_000, 650, Some(true), Arc::clone(&seen)).await;
+        let (state, dir) = pruning_state("gen-pruned", &addr.to_string(), Some(300));
+        poll_once(&state).await;
+        {
+            let g = state.read().await;
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.stored_from_height, p.stored_blocks), (Some(650), Some(351)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Direct: the lowest height ever probed is 1.
+        let addr = fake_pruned_node(50, 50, 0, Some(true), Arc::new(Seen::default())).await;
+        assert_eq!(probe_stored_range(&addr.to_string(), 0).await, Some(StoredRange { from: 0, exact: true }));
+        assert_eq!(probe_stored_range(&addr.to_string(), 1).await, Some(StoredRange { from: 0, exact: true }));
+        assert_eq!(probe_stored_range(&addr.to_string(), 2).await, Some(StoredRange { from: 0, exact: true }));
+        assert_eq!(probe_stored_range(&addr.to_string(), 30).await, Some(StoredRange { from: 0, exact: true }));
+    }
+
+    #[test]
+    fn forgetting_a_chain_drops_its_heights_history_and_parked_snapshot() {
+        let mut g = LiveState::new("127.0.0.1:18443".into());
+        {
+            let c = chain_mut(&mut g);
+            c.feed.push_front(FeedItem::block(863));
+            c.last = Some(863);
+            c.chain = Some("regtest".into());
+            c.last_known = Some(crate::persist::LastKnown {
+                at: 1,
+                local_height: 863,
+                network_height: 863,
+                behind: 0,
+                sync_pct: "100".into(),
+                sync_pct_num: "100".into(),
+                ibd: false,
+                network: "regtest".into(),
+                blvm_version: "v0.1.60".into(),
+            });
+            let mut snap = Snapshot::disconnected("127.0.0.1:18443");
+            snap.local_height = 863;
+            snap.network_height = 863;
+            c.last_snapshot = Some(snap);
+        }
+        g.snapshot.local_height = 863;
+        g.snapshot.network_height = 863;
+        g.snapshot.feed = vec![FeedItem::block(863)];
+        g.snapshot.pruning.stored_blocks = Some(300);
+        // Another chain is not touched.
+        {
+            let other = g.views.entry("127.0.0.1:38332".into()).or_insert_with(ChainFeed::new);
+            other.last = Some(5);
+        }
+        g.forget_chain("127.0.0.1:18443", "regtest");
+        assert_eq!((g.snapshot.local_height, g.snapshot.network_height), (0, 0));
+        assert!(g.snapshot.feed.is_empty() && g.snapshot.feed_waiting);
+        assert_eq!(g.snapshot.pruning.stored_blocks, None);
+        let c = chain_mut(&mut g);
+        assert!(c.feed.is_empty() && c.last.is_none() && c.last_known.is_none() && c.last_snapshot.is_none());
+        assert!(c.dirty, "the empty history is saved too");
+        assert_eq!(g.views["127.0.0.1:38332"].last, Some(5));
+        // A node that is down now shows zeros, not the old chain.
+        mark_unreachable(&mut g, "connection refused".into(), false);
+        assert_eq!((g.snapshot.local_height, g.snapshot.network_height), (0, 0));
+        assert!(g.snapshot.feed.is_empty());
+    }
+
+    #[test]
+    fn forgetting_one_network_leaves_a_view_that_holds_another_networks_chain() {
+        let mut g = LiveState::new("127.0.0.1:8332".into());
+        {
+            let c = chain_mut(&mut g);
+            c.last = Some(500);
+            c.chain = Some("main".into());
+        }
+        g.snapshot.local_height = 500;
+        // Regtest was wiped, and it was configured with the same RPC address: mainnet's history stays.
+        g.forget_chain("127.0.0.1:8332", "regtest");
+        assert_eq!(g.views["127.0.0.1:8332"].last, Some(500));
+        assert_eq!(g.snapshot.local_height, 500);
+        g.forget_chain("127.0.0.1:8332", "main");
+        assert_eq!(g.views["127.0.0.1:8332"].last, None);
+        assert_eq!(g.snapshot.local_height, 0);
+    }
+
+    fn peers_claiming(heights: &[u64]) -> Vec<serde_json::Value> {
+        heights
+            .iter()
+            .map(|h| serde_json::json!({ "addr": "1.2.3.4:8333", "startingheight": h, "synced_headers": -1, "inbound": false }))
+            .collect()
+    }
+
+    #[test]
+    fn one_peer_that_claims_too_much_does_not_move_the_network_height() {
+        // The live bug: one peer claimed 977,107 while the chain was at about 971,333.
+        let mut claims = vec![971_328, 971_330, 971_331, 971_333, 971_333];
+        claims.push(977_333); // a liar, +6,000
+        claims.push(0); // a peer that claims nothing (stock BLVM)
+        let tip = peer_best_height(&peers_claiming(&claims));
+        assert!((971_328..=971_333).contains(&tip), "the liar was ignored: {tip}");
+        // A node at the tip reads "caught up", whatever the peers' figures within a few blocks.
+        assert_eq!(chain_tip(971_333, 971_333, tip, 0, 0), 971_333);
+        // A node far behind (headers track the body cursor) takes the peers' agreed figure, not the liar's.
+        assert_eq!(chain_tip(400_100, 400_000, tip, 0, 0), tip);
+        // Liars at both ends, honest in the middle.
+        let tip = peer_best_height(&peers_claiming(&[1_000, 971_330, 971_331, 971_332, 977_333]));
+        assert_eq!(tip, 971_331);
+        // Three peers: the middle one; a lone liar among them is the top and is set aside.
+        assert_eq!(peer_best_height(&peers_claiming(&[971_330, 971_333, 977_333])), 971_333);
+        // An even number of claims takes the lower middle one, with liars at either end and in any order.
+        assert_eq!(peer_best_height(&peers_claiming(&[977_333, 971_333, 1_000, 971_330])), 971_330);
+        assert_eq!(peer_best_height(&peers_claiming(&[971_333, 971_333, 971_333, 977_333, 1_000, 971_330])), 971_333);
+    }
+
+    #[test]
+    fn fewer_than_three_peers_never_raise_the_network_height() {
+        assert_eq!(peer_best_height(&peers_claiming(&[977_333])), 0);
+        assert_eq!(peer_best_height(&peers_claiming(&[971_333, 977_333])), 0);
+        // A claim of 0 is no claim: two real ones are still two.
+        assert_eq!(peer_best_height(&peers_claiming(&[971_333, 977_333, 0])), 0);
+        assert_eq!(chain_tip(971_333, 971_333, 0, 0, 0), 971_333);
+        // Peers' figures within a few blocks of the node's own are replaced by the node's.
+        assert_eq!(chain_tip(0, 971_333, 971_338, 0, 0), 971_333);
+        assert_eq!(chain_tip(0, 971_333, 971_400, 0, 0), 971_400, "but a clearly higher agreed figure stands");
+    }
+
     #[test]
     fn old_status_fields_are_all_still_serialized() {
         let v = serde_json::to_value(Snapshot::disconnected("127.0.0.1:48332")).unwrap();
@@ -2009,7 +3027,7 @@ mod tests {
         ] {
             assert!(v.get(k).is_some(), "status lost field {k}");
         }
-        for k in ["mode", "setup_done", "managed", "modules_pages", "show_logs", "blvm_version_seen", "bundle_available"] {
+        for k in ["mode", "setup_done", "managed", "modules_pages", "show_logs", "blvm_version_seen", "bundle_available", "pruning"] {
             assert!(v.get(k).is_some(), "status is missing new field {k}");
         }
     }

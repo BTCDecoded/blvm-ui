@@ -8,7 +8,20 @@ export type Page =
   | "logs"
   | "insights"
   | "settings";
-export type Sub = "connection" | "peers" | "network";
+/** The Settings sub-pages (tabs); `#settings/chain` opens one. */
+export type Sub = "node" | "network" | "chain" | "modules" | "console";
+export const SUBS: Sub[] = ["node", "network", "chain", "modules", "console"];
+const SUB_KEY = "blvm-ui-settings-tab";
+
+/** Last tab the viewer used: a per-viewer convenience only, so every access is guarded. */
+function savedSub(): Sub | null {
+  try {
+    const v = localStorage.getItem(SUB_KEY);
+    return SUBS.includes(v as Sub) ? (v as Sub) : null;
+  } catch {
+    return null;
+  }
+}
 
 const PAGES: Page[] = [
   "home",
@@ -26,9 +39,7 @@ function parseHash(): { page: Page; sub: Sub } {
   let page: Page = PAGES.includes(pageName as Page) ? (pageName as Page) : "home";
   // Peer controls moved from Settings to the Network page.
   if (page === "settings" && subName === "peers") page = "network";
-  const sub: Sub = ["connection", "peers", "network"].includes(subName)
-    ? (subName as Sub)
-    : "connection";
+  const sub: Sub = SUBS.includes(subName as Sub) ? (subName as Sub) : (savedSub() ?? "node");
   return { page, sub };
 }
 
@@ -71,17 +82,30 @@ export const modulePages = (s: Snapshot): string[] | null => (Array.isArray(s.mo
 export function setPage(page: Page, sub?: Sub) {
   ui.page = page;
   if (sub) ui.sub = sub;
-  const hash = `#${page}`;
+  const hash = page === "settings" ? `#settings/${ui.sub}` : `#${page}`;
   if (location.hash !== hash) history.replaceState(null, "", hash);
 }
 
 export function setSub(sub: Sub) {
   ui.sub = sub;
+  try {
+    localStorage.setItem(SUB_KEY, sub);
+  } catch {
+    // private window or blocked storage: the tab still works, it is just not remembered
+  }
   if (ui.page === "settings") {
     const hash = `#settings/${sub}`;
     if (location.hash !== hash) history.replaceState(null, "", hash);
   }
 }
+
+// A link or a typed hash (`#settings/chain`) that changes while the page is open. replaceState (our own
+// updates) does not fire this.
+window.addEventListener("hashchange", () => {
+  const h = parseHash();
+  ui.page = h.page;
+  ui.sub = h.sub;
+});
 
 export function applySnap(s: Snapshot) {
   ui.snap = s;

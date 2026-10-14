@@ -34,11 +34,21 @@
 // Control (used by the screenshot script and for hand-testing):
 //   GET /__mock?scenario=ibd&live=0    switch scenario, freeze or unfreeze
 //   extra knobs: fail_verify=1 / fail_test=1 (the next install or update job fails its checksum check / its test run;
-//                an update then reports rolled_back)  channel=self|store|off  platform_supported=0|1  can_install=0|1  platform=aarch64-macos
+//                an update then reports rolled_back; fail_test=pagesize: the test run aborts on the memory page size)  page_size=16384 (the node's computer
+//                uses 16 KB pages: releases say runs_here=false and the install answers 409 unless the body has force:true, which goes on to the test run and fails there with the page-size text; page_fixed=1: a forced install works; page_size=0 clears it)  channel=self|store|off  platform_supported=0|1  can_install=0|1  platform=aarch64-macos
 //                show_logs=1|0 (the Logs page switch; off by default)  future=1|0 (turn the not-yet-in-the-host routes on or off)  port_taken=0|1 (the port-conflict program)
 //                slow=20 (stretch every delay)  free_gb=3  custom=1  fail_start=1 (next start crashes)  stop_stuck=1 (next switch cannot stop the old node)  external=1 (with first-run: Umbrel-style)
 //                agent_alive=0 (external only: the node agent's heartbeat is gone)  offline=1 (GitHub cannot be reached; Try again
 //                asks GET /api/node/releases?force=1, counted in force_checks of this answer)
+//                pruned=5000 (block pruning on for the current network; pruned= clears it; a running node is taken to run with it)
+//                run_keep=300 (the number of blocks the running node was started with; differs from pruned= -> "restart pending"; run_keep= : every block)
+//                has_data=1 (pretend chain data is on disk and that a pruning node worked on it, to try the "delete the chain data" flow)
+//                pruned_data=0|1 (whether that data was ever touched by a pruning node: the host's ran_pruned; only 1 makes the way back to a full node a deletion)
+//                node_pruned=1 (a standalone node that says it is pruned)  pruned_verified=1 (the stored range is "verified")
+//                wiping=1 (the host is deleting the current network's chain data: managed.networks[].wiping, "Deleting the chain data..."; wiping=0 clears it)
+//                ibd=1 (first sync: the chain is reloaded at ~84% of the tip)  ibd=0 (synced: reloaded at the tip)  stall=1 (the validated tip stays flat, like a
+//                missing block that blocks the queue; stall=0 resumes)  crawl=1 (the tip creeps +1..3 blocks a second and the feed has one tile per height, like the host's
+//                feed.rs does for steps under 8; crawl=0 back to the ~40 blocks/s bursts)  tip=1000&height=1000 (a tiny chain, to see "All 1,001 blocks" / "288 of 1,001")
 
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
@@ -49,7 +59,7 @@ import { createManaged, NETS } from "./managed.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST = process.env.MOCK_DIST ? normalize(process.env.MOCK_DIST) : join(HERE, "..", "dist");
 const PORT = Number(process.env.MOCK_PORT || 3850);
-const FALLBACK_TIP = 969_322; // mainnet tip on 2026-09-30
+const FALLBACK_TIP = 971_325; // mainnet tip on 2026-10-13 (mempool.space)
 const BLOCK_SECS = Number(process.env.MOCK_BLOCK_SECS ?? 60);
 
 // Deterministic randomness so every run (and every screenshot) looks the same.
@@ -144,8 +154,9 @@ const started = Date.now();
 const NODE_UP_SECS = 12 * 86400 + 7 * 3600 + 41 * 60; // node has been up ~12 days
 const UI_UP_SECS = 3 * 86400 + 2 * 3600 + 18 * 60;
 
-// Tip heights of the networks other than mainnet are invented; mainnet's comes from mempool.space at start.
-const TIPS = { mainnet: FALLBACK_TIP, testnet4: 126_500, testnet: 4_890_000, signet: 288_000, regtest: 150 };
+// Tip heights as read from mempool.space on 2026-10-13 (the same figures as `knownHeight` in
+// `src/lib/networks.ts`); mainnet's is read again at start. Regtest is invented.
+const TIPS = { mainnet: FALLBACK_TIP, testnet4: 156_470, testnet: 5_158_765, signet: 326_255, regtest: 150 };
 
 const state = {
   scenario: process.env.MOCK_SCENARIO || "synced",
@@ -157,6 +168,8 @@ const state = {
   feed: [],
   arrival: [],
   lastStep: Date.now(),
+  stall: false, // knob stall=1: while syncing, the validated tip does not move
+  crawl: false, // knob crawl=1: while syncing, +1..3 blocks a second with one feed tile per height (the host's feed.rs below 8)
 };
 
 const block = (h) => ({ kind: "block", start: h, end: h, label: String(h), key: `block:${h}` });
@@ -205,10 +218,16 @@ function step() {
     state.arrival[state.arrival.length - 1] += 1;
   } else {
     if (now - state.lastStep < 1000) return;
-    const n = 34 + Math.floor(Math.random() * 14);
+    if (state.stall) {
+      state.lastStep = now;
+      return;
+    }
+    const n = state.crawl ? 1 + Math.floor(Math.random() * 3) : 34 + Math.floor(Math.random() * 14);
     const lo = state.height + 1;
     state.height = Math.min(state.tip, state.height + n);
-    state.feed = [chunk(lo, state.height), ...state.feed].slice(0, 24);
+    // Like feed.rs: a step under 8 blocks is one tile per height (newest first), a bigger one a single "from-to" tile.
+    const fresh = state.crawl ? Array.from({ length: state.height - lo + 1 }, (_, i) => block(state.height - i)) : [chunk(lo, state.height)];
+    state.feed = [...fresh, ...state.feed].slice(0, 24);
     state.arrival[state.arrival.length - 1] += state.height - lo + 1;
     if (state.tip - state.height <= 2) state.chainMode = "synced";
   }
@@ -358,7 +377,23 @@ const SCENARIOS = ["synced", "ibd", "first-run", "managed-stopped", "managed-run
 
 function setScenario(name) {
   state.scenario = name;
+  state.stall = false;
+  state.crawl = false;
   if (!managed.applyScenario(name)) reset();
+}
+
+/** Chain knobs (ibd, stall, crawl, tip, height); the managed ones are in managed.mjs. */
+function chainKnobs(q) {
+  const g = (k) => q.get(k);
+  if (g("stall") !== null) state.stall = g("stall") !== "0";
+  if (g("crawl") !== null) state.crawl = g("crawl") !== "0";
+  if (g("tip") !== null && Number(g("tip")) > 0) TIPS[state.net] = Number(g("tip"));
+  if (g("height") !== null && Number(g("height")) >= 0) loadChain(state.net, Number(g("height")));
+  else if (g("ibd") === "1" && state.chainMode !== "ibd") loadChain(state.net, Math.round(TIPS[state.net] * 0.8412));
+  else if (g("ibd") === "0") loadChain(state.net, TIPS[state.net]);
+  else if (g("tip") !== null) loadChain(state.net, Math.min(state.height, TIPS[state.net]));
+  // A freshly loaded syncing chain has bursty tiles; crawl mode wants per-height ones from the start.
+  if (state.crawl && state.chainMode === "ibd" && state.feed[0]?.kind === "chunk") state.feed = [block(state.height), ...state.feed.slice(1)];
 }
 
 async function readBody(req) {
@@ -380,6 +415,7 @@ const server = createServer(async (req, res) => {
     if (url.searchParams.get("slow")) managed.mg.slow = Number(url.searchParams.get("slow")) || 1;
     if (SCENARIOS.includes(sc)) setScenario(sc);
     managed.knobs(url.searchParams);
+    chainKnobs(url.searchParams);
     const live = url.searchParams.get("live");
     if (live !== null) state.live = live !== "0";
     return json(res, { scenario: state.scenario, live: state.live, tip: state.tip, height: state.height, scenarios: SCENARIOS, force_checks: managed.mg.forceChecks });

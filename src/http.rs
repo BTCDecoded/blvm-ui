@@ -382,7 +382,7 @@ async fn handle(
     Ok(resp)
 }
 
-/// Body `{tag?, version?}` (`{}` or no body: the newest release).
+/// Body `{tag?, version?, downgrade?, force?}` (`{}` or no body: the newest release).
 async fn job_request(req: Request<Incoming>, state: &Shared, kind: installer::Kind) -> Response<Full<Bytes>> {
     let bytes = match read_body(req).await {
         Ok(b) => b,
@@ -400,7 +400,9 @@ async fn job_request(req: Request<Incoming>, state: &Shared, kind: installer::Ki
         .iter()
         .find_map(|k| body.get(*k).and_then(|v| v.as_str()).map(str::trim).filter(|t| !t.is_empty()));
     let downgrade = body.get("downgrade").and_then(|v| v.as_bool()).unwrap_or(false);
-    let (code, v) = installer::begin_with(state, kind, tag, downgrade).await;
+    // `force: true` skips the page-size refusal (409 `page_size`); the test run still guards the install.
+    let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (code, v) = installer::begin_forced(state, kind, tag, downgrade, force).await;
     json_status(code, &v)
 }
 

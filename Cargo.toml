@@ -37,3 +37,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["macros", "rt"] }
+# Tests parse the node config the console writes with a real TOML parser.
+toml = "0.8"

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { cubicOut } from "svelte/easing";
   import BlockCube from "./BlockCube.svelte";
   import Icon from "./Icon.svelte";
@@ -18,7 +19,46 @@
   const PEEK = 0.5;
   const MIN_VISIBLE = 3;
 
-  const pack = $derived((s.feed || []).slice(0, visible + 1));
+  // First sync (`ibd`): the host sends one tile per height while the tip creeps forward by a few blocks per poll,
+  // and each one would slide in over 650 ms, which reads like a counter although the node validated a handful of
+  // blocks in that second. So the rail builds its own list from the polls it sees: at most ONE new tile per poll,
+  // showing the newest height, with "+N" on it when the tip moved by more than one. Near the tip (`ibd` false)
+  // blocks arrive one at a time and the host's tiles are shown as they are.
+  type Tile = FeedItem & { jump?: number };
+  const KEEP = 24;
+  let ibdTiles = $state<Tile[]>([]);
+  let ibdTip = -1;
+  let ibdRpc = "";
+  $effect(() => {
+    // One run per status poll (each poll is a new snapshot object), also when nothing has changed.
+    const snap = ui.snap;
+    untrack(() => {
+      const feed = snap.feed || [];
+      const head = feed[0];
+      if (!snap.ibd || !head) {
+        if (ibdTiles.length) ibdTiles = [];
+        ibdTip = -1;
+        return;
+      }
+      if (snap.rpc_addr !== ibdRpc || ibdTiles.length === 0 || head.end < ibdTip) {
+        // First poll of the sync, another node, or the tip went back (restart, reorg): start from the host's newest tile.
+        ibdRpc = snap.rpc_addr;
+        ibdTiles = [head];
+        ibdTip = head.end;
+        return;
+      }
+      if (head.end > ibdTip) {
+        const jump = head.end - ibdTip;
+        ibdTiles = [
+          { kind: "block", start: head.end, end: head.end, label: String(head.end), key: `ibd:${head.end}`, jump },
+          ...ibdTiles,
+        ].slice(0, KEEP);
+        ibdTip = head.end;
+      }
+    });
+  });
+  const source = $derived<Tile[]>(s.ibd && ibdTiles.length ? ibdTiles : s.feed || []);
+  const pack = $derived(source.slice(0, visible + 1));
   const newestKey = $derived(pack[0]?.key ?? "");
   const waiting = $derived(!!s.feed_waiting);
 
@@ -49,7 +89,7 @@
 
   type Slot =
     | { empty: true; key: string }
-    | { empty: false; key: string; item: FeedItem };
+    | { empty: false; key: string; item: Tile };
 
   // Oldest on the left, newest on the right. Slot 0 is the half block fading out,
   // slot 1 is dimmed a little so the fade reads left to right. Empty blocks pad
@@ -137,6 +177,7 @@
             newest={slot.key === newestKey}
             flow={slot.key === newestKey}
             fresh={i > 0 && !known.has(slot.item.key)}
+            jump={slot.item.jump ?? 0}
           />
         {/if}
       </li>

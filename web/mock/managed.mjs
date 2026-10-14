@@ -9,11 +9,11 @@ export const IDS = ["mainnet", "testnet4", "testnet", "signet", "regtest"];
 // Mock figures only. `size` = bytes at full sync, `estimate` = what /api/network/preview reports
 // (null = "not measured", design C). The estimates are the host's table (src/networks.rs).
 export const NETS = {
-  mainnet: { label: "Mainnet", chain: "main", rpc: 8332, size: 784.6e9, estimate: 800e9, peers: 12 },
-  testnet4: { label: "Testnet4", chain: "testnet4", rpc: 48332, size: 55e9, estimate: null, peers: 6 },
-  testnet: { label: "Testnet3", chain: "test", rpc: 18332, size: 140e9, estimate: 100e9, peers: 4 },
-  signet: { label: "Signet", chain: "signet", rpc: 38332, size: 20e9, estimate: null, peers: 5 },
-  regtest: { label: "Regtest", chain: "regtest", rpc: 18443, size: 0.05e9, estimate: 1e9, peers: 0 },
+  mainnet: { label: "Mainnet", chain: "main", rpc: 8332, p2p: 8333, size: 784.6e9, estimate: 800e9, peers: 12 },
+  testnet4: { label: "Testnet4", chain: "testnet4", rpc: 48332, p2p: 48333, size: 55e9, estimate: null, peers: 6 },
+  testnet: { label: "Testnet3", chain: "test", rpc: 18332, p2p: 18333, size: 140e9, estimate: 100e9, peers: 4 },
+  signet: { label: "Signet", chain: "signet", rpc: 38332, p2p: 38333, size: 20e9, estimate: null, peers: 5 },
+  regtest: { label: "Regtest", chain: "regtest", rpc: 18443, p2p: 18444, size: 0.05e9, estimate: 1e9, peers: 0 },
 };
 
 const LINUX = ["x86_64-linux", "aarch64-linux"];
@@ -47,6 +47,7 @@ export function createManaged(chain) {
     rpc: "127.0.0.1:8332",
     external: false,
     agentAlive: true, // external only: false = the agent's heartbeat is gone (knob agent_alive=0)
+    p2pOverride: {}, // knob p2p_mainnet=8334: the Umbrel app moves the node's P2P port (BLVM_AGENT_P2P_PORT_MAINNET)
     offline: false, // knob offline=1: GitHub cannot be reached (the releases answer says so)
     forceChecks: 0, // how many GET /api/node/releases?force=1 arrived
     proc: { state: "stopped", pid: null, since: null, exit_code: null, restarts: 0, last_error: null },
@@ -64,13 +65,21 @@ export function createManaged(chain) {
     job: idleJob(), // install / update job (design D): the same object feeds /api/node/install and managed.update
     jobEnd: 0, // ms when the job ended (done/failed stay in managed.update for 30 s)
     failVerify: false, // knob: the next job fails its checksum check
-    failTest: false, // knob: the next job's test run fails (the new program does not start)
+    failTest: false, // knob: the next job's test run fails (the new program does not start); fail_test=pagesize: it aborts on the page size
+    pageFixed: false, // knob page_fixed=1: a forced install on a 16 KB device works (a release with 16 KB page support)
+    pageSize: null, // knob page_size=16384: the node's computer uses 16 KB memory pages (Raspberry Pi 5), which the official release cannot start on
     sw: null, // {id, from, to, phase: stopping|starting|done|failed, started, error?, log?}; done/failed linger 30 s
     stopStuck: false, // knob: the next switch cannot stop the old node (fails in the stopping phase)
     installed: [], // {name, version, enabled}
     canInstall: true,
     platform: "x86_64-linux",
-    settings: { version: 1, start_on_boot: true, start_on_launch: true, stop_node_on_exit: true, show_logs: false, updates: "self" },
+    settings: { version: 1, start_on_boot: true, start_on_launch: true, stop_node_on_exit: true, show_logs: false, updates: "self", assume_valid_by_network: {}, prune_by_network: {} },
+    forceData: {}, // knob has_data=1: pretend chain data is on disk for the current network (so the wipe flow can be tried)
+    prunedData: {}, // knob pruned_data=1 (has_data=1 sets it too): a node was started pruned on that data (the host's `ran_pruned`)
+    runKeep: null, // the number of blocks the running node was started with (null: it keeps every block); knob run_keep=300
+    nodePruned: false, // knob node_pruned=1: a standalone node that says it is pruned
+    pruneVerified: false, // knob pruned_verified=1: the stored range is "verified" instead of "estimated"
+    wiping: {}, // knob wiping=1: the host is deleting this network's chain data (managed.networks[].wiping)
     lastRunning: secs(),
     logs: [],
     seq: 0,
@@ -118,6 +127,9 @@ export function createManaged(chain) {
       return;
     }
     mg.proc = { state: "starting", pid: 4000 + Math.floor(Math.random() * 900), since: Date.now(), exit_code: null, restarts: mg.proc.restarts, last_error: null };
+    // The node reads the pruning setting at start, and the folder remembers that a pruning node ran on it.
+    mg.runKeep = mg.settings.prune_by_network?.[net] ?? null;
+    if (mg.runKeep !== null) mg.prunedData[net] = true;
     log(`blvm ${mg.nodeVersion} starting on ${net} (data dir networks/${net}/chain)`);
     log(`rpc listening on 127.0.0.1:${NETS[net].rpc}`);
     later(3000, () => {
@@ -240,7 +252,7 @@ export function createManaged(chain) {
     if (mg.channel === "off") return "Updates are turned off for this console (BLVM_UI_UPDATES=0).";
     return null;
   }
-  function runJob(kind, tag) {
+  function runJob(kind, tag, forcedOnBigPages = false) {
     const ver = tag.replace(/^v/, "");
     const mine = (mg.job = { phase: "download", tag, bytes: 0, total: ASSET_BYTES, error: null, rolled_back: false });
     mg.jobEnd = 0;
@@ -267,9 +279,17 @@ export function createManaged(chain) {
       return;
     }
     step(4000, () => (mine.phase = "test"));
+    // A forced install on a 16 KB device: the current release aborts in the test run (page_fixed=1: a newer one works).
+    if (forcedOnBigPages && !mg.pageFixed && !mg.failTest) {
+      mg.failTest = true;
+      mg.failTestKind = "pagesize";
+    }
     if (mg.failTest) {
+      const pagesize = mg.failTestKind === "pagesize";
       mg.failTest = false;
-      step(5000, () => fail(`${tag} failed to start: version 'GLIBC_2.39' not found (mock fail_test).`));
+      mg.failTestKind = null;
+      const why = pagesize ? `${PAGE_TEXT(mg.pageSize || 16384)} Nothing was installed.` : `${tag} failed to start: version 'GLIBC_2.39' not found (mock fail_test).`;
+      step(5000, () => fail(why));
       return;
     }
     step(5000, () => (mine.phase = "install"));
@@ -288,6 +308,10 @@ export function createManaged(chain) {
     });
   }
   const jobBody = () => ({ ...mg.job });
+  /** The host's text for a device whose memory pages are bigger than the official release's 4 KB. */
+  const PAGE_TEXT = (page) =>
+    `This device uses ${Math.round(page / 1024)} KB memory pages. The current official node release is built for 4 KB pages and does not start here (jemalloc: unsupported system page size). Options: wait for a release built with 16 KB page support, which has been requested from Bitcoin Commons; or, on a Raspberry Pi 5, switch the kernel to 4 KB pages (add kernel=kernel8.img to /boot/firmware/config.txt and reboot; this is a system change, do it only if you know what it means).`;
+  const runsHere = () => !(mg.platformSupported && mg.pageSize && mg.pageSize > 4096);
   /** `managed.update`: the job while it runs, and for 30 s after it ends. */
   const updateBody = () => {
     const shown = jobActive() || (mg.jobEnd && Date.now() - mg.jobEnd < 30000) ? mg.job : idleJob();
@@ -313,17 +337,24 @@ export function createManaged(chain) {
         channel: mg.channel,
         offline: true,
         unavailable_reason: "Could not reach GitHub. Check the internet connection.",
+        runs_here: runsHere(),
+        runs_here_reason: runsHere() ? null : PAGE_TEXT(mg.pageSize),
+        page_size: mg.pageSize ?? 4096,
       };
     }
     return {
       installed: mg.nodeVersion && !mg.custom ? { tag: `v${mg.nodeVersion}`, installed_at: mg.installedAt ?? secs() - 14 * 86400 } : null,
       latest: { tag: `v${mg.latest}`, published_at: secs() - 9 * 86400, notes_url: "https://github.com/BTCDecoded/blvm/releases" },
-      asset: mg.platformSupported ? { name: `blvm-${mg.latest}-linux-x86_64`, size: ASSET_BYTES, platform: "linux-x86_64" } : null,
-      platform: mg.platformSupported ? "linux-x86_64" : "unsupported",
+      asset: mg.platformSupported ? { name: `blvm-${mg.latest}-${mg.pageSize > 4096 ? "linux-aarch64" : "linux-x86_64"}`, size: ASSET_BYTES, platform: mg.pageSize > 4096 ? "linux-aarch64" : "linux-x86_64" } : null,
+      platform: mg.platformSupported ? (mg.pageSize > 4096 ? "linux-aarch64" : "linux-x86_64") : "unsupported",
       can_install: ok,
       reason: ok ? null : installReason(),
       available: !mg.custom && !!mg.nodeVersion && mg.latest !== mg.nodeVersion,
       channel: mg.channel,
+      // Like the host: can_install stays as it is; the page shows the warning and holds the download back.
+      runs_here: runsHere(),
+      runs_here_reason: runsHere() ? null : PAGE_TEXT(mg.pageSize),
+      page_size: mg.pageSize ?? 4096,
     };
   };
 
@@ -364,8 +395,16 @@ export function createManaged(chain) {
   function bytesOf(id) {
     if (!id || !NETS[id]) return 0;
     const h = id === mg.network ? chain.height() : mg.heights[id];
-    return h > 0 ? Math.round(NETS[id].size * Math.min(1, h / chain.tip(id))) : 0;
+    const keep = mg.settings.prune_by_network?.[id];
+    // A pruned node keeps the newest blocks only (about the same bytes per block as the whole chain on average).
+    const stored = keep ? Math.min(h, keep + 144) : h;
+    if (h <= 0) return mg.forceData[id] ? 1_000_000 : 0;
+    return Math.round(NETS[id].size * Math.min(1, stored / chain.tip(id)));
   }
+  const hasData = (id) => bytesOf(id) > 0;
+  /** Chain data that a pruning node has worked on (the host's `has_pruned_data`). */
+  const hasPrunedData = (id) => hasData(id) && mg.prunedData[id] === true;
+  const p2pPort = (id) => (mg.external ? mg.p2pOverride[id] : undefined) ?? NETS[id].p2p;
   function managedBody() {
     const p = mg.proc;
     return {
@@ -389,10 +428,13 @@ export function createManaged(chain) {
           id,
           label: NETS[id].label,
           rpc: `127.0.0.1:${NETS[id].rpc}`,
+          p2p_port: p2pPort(id),
           bytes,
           last_height: h > 0 ? h : null,
           last_used: id === mg.network && ["running", "starting", "stopping"].includes(mg.proc.state) ? secs() : (mg.lastUsed[id] ?? null),
           has_data: bytes > 0,
+          prune_keep_blocks: mg.settings.prune_by_network?.[id] ?? null,
+          wiping: mg.wiping[id] === true,
         };
       }),
       // One text on every card, like the host: the release tag, or the binary's own report for a custom build.
@@ -401,7 +443,44 @@ export function createManaged(chain) {
       update: updateBody(),
       switch: mg.sw ? { ...mg.sw } : null,
       agent: { external: mg.external, alive: mg.external ? mg.agentAlive : true },
+      platform: {
+        page_size: 4096, // this console's own process (the mock web container)
+        node_page_size: mg.pageSize ?? 4096,
+        runs_here: runsHere(),
+        runs_here_reason: runsHere() ? null : PAGE_TEXT(mg.pageSize),
+        agent: mg.external ? { page_size: mg.pageSize ?? 4096, runs_here: runsHere(), reason: runsHere() ? null : PAGE_TEXT(mg.pageSize) } : null,
+      },
     };
+  }
+
+  /** Like the host's `pruning` object: the setting for the current network, the node's answer, the stored range. */
+  function pruningBody(snap) {
+    const keep = mg.network ? (mg.settings.prune_by_network?.[mg.network] ?? null) : null;
+    const running = mg.proc.state === "running";
+    // What the running node says is what it was started with; the saved setting may differ (applies at the next start).
+    const nodeKeep = running ? mg.runKeep : null;
+    const out = {
+      enabled: keep !== null,
+      keep_blocks: keep,
+      node_reports_pruned: running ? nodeKeep !== null : null,
+      node_enabled: running ? nodeKeep !== null : null,
+      node_keep_blocks: running ? nodeKeep : null,
+      pending_restart: running && nodeKeep !== keep,
+      stored_from_height: null,
+      stored_blocks: null,
+      source: "unknown",
+    };
+    const local = snap.local_height ?? 0;
+    const anchor = Math.max(local, snap.network_height ?? 0);
+    // The estimate uses the number the node keeps now, not the saved one.
+    const used = nodeKeep ?? keep;
+    if (used !== null && running && anchor > 0) {
+      const from = Math.max(0, anchor - used + 1);
+      out.stored_from_height = from;
+      out.stored_blocks = local >= from ? local - from + 1 : 0;
+      out.source = mg.pruneVerified ? "verified" : "estimated";
+    }
+    return out;
   }
 
   /** Adds (managed/standalone-with-new-host) fields and the "node is not running" overrides to a snapshot. */
@@ -439,12 +518,25 @@ export function createManaged(chain) {
         });
       }
       out.disk_used_bytes = bytesOf(mg.network);
+      out.pruning = pruningBody(out);
       if (swActive()) {
         out.node_busy = true;
         out.node_power_label = "Switching…";
       }
     } else {
       out.managed = null;
+      // A standalone node that says it is pruned (knob node_pruned=1): the console has no setting to compare with.
+      out.pruning = {
+        enabled: false,
+        keep_blocks: null,
+        node_reports_pruned: mg.nodePruned ? true : null,
+        node_enabled: mg.nodePruned ? true : null,
+        node_keep_blocks: mg.nodePruned ? 5000 : null,
+        pending_restart: mg.nodePruned,
+        stored_from_height: null,
+        stored_blocks: null,
+        source: "unknown",
+      };
       if (!mg.standaloneUp) {
         Object.assign(out, {
           connected: false,
@@ -467,17 +559,100 @@ export function createManaged(chain) {
   }
 
   // ---- scenarios -----------------------------------------------------------
+  // Assume-valid, like the host: the node's built-in height per network (blvm-node default_assume_valid_height_for_network),
+  // Testnet4 and regtest run with full validation, a value is "default" | "off" | a height | a 64-hex hash.
+  const AV_DEFAULTS = {
+    mainnet: { height: 912_683, forced_off: false },
+    testnet4: { height: 0, forced_off: true },
+    testnet: { height: 4_550_000, forced_off: false },
+    signet: { height: 267_665, forced_off: false },
+    regtest: { height: 0, forced_off: true },
+  };
+  // The per-network keys take default | off | a height. A 64-hex hash is read only from the older global key and
+  // from old files (the node's hash form skips nothing), so the API refuses it here; the dev knob below may still
+  // plant one, to show the card's note.
+  const avValid = (v) => typeof v === "string" && /^(default|off|\d{1,9})$/.test(v.trim());
+  const avValidLegacy = (v) => avValid(v) || (typeof v === "string" && /^[0-9a-fA-F]{64}$/.test(v.trim()));
+  const AV_MSG = 'must be "default", "off" or a block height.';
+  const avArgv = (id, v) => {
+    const t = (v ?? "default").trim();
+    if (t === "default") return AV_DEFAULTS[id]?.forced_off ? ["--noassumevalid"] : [];
+    if (t === "off" || t === "0") return ["--noassumevalid"];
+    return ["--assumevalid", t];
+  };
+  const avEffective = () => {
+    if (!mg.network) return null;
+    const value = mg.settings.assume_valid_by_network?.[mg.network] ?? null;
+    return { network: mg.network, value, argv: avArgv(mg.network, value) };
+  };
+
+  // Block pruning, like the host (src/managed.rs): a number of blocks from 288 up, null keeps every block. Pruned -> full
+  // with chain data needs confirm_wipe (and a stopped node); adding or lowering with data carries a warning.
+  const PRUNE_MIN = 288;
+  const PRUNE_MAX = 100_000_000;
+  const PRUNE_WARNING = "The node converts the existing store on its next start: it deletes old blocks one by one from the start of the chain and does not answer meanwhile. Minutes on Testnet4, possibly hours on mainnet.";
+  const PRUNE_NOTE = "Blocks the node has already deleted do not come back. Only the blocks that arrive from now on are kept.";
+  const pruneOk = (v) => v === null || (Number.isInteger(v) && v >= PRUNE_MIN && v <= PRUNE_MAX);
+  const pruneMsg = (what) => `${what} must be null (keep every block) or a whole number from ${PRUNE_MIN} to ${PRUNE_MAX}.`;
+  const active = () => ["running", "starting", "stopping"].includes(mg.proc.state) || swActive();
+  /** Plan one network's change; returns {error, code, body} or {wipe, warning, raised}. */
+  function planPrune(id, oldV, newV, confirm) {
+    const data = hasData(id);
+    // Only data that a pruning node has worked on needs deleting to go back to a full node.
+    if (oldV !== null && newV === null && hasPrunedData(id)) {
+      if (!confirm) {
+        return { error: true, code: 409, body: { ok: false, needs: "wipe", error: `A pruned node cannot go back to keeping every block: the blocks it deleted are gone. The chain data for ${NETS[id].label} has to be deleted and downloaded again.` } };
+      }
+      return { wipe: true };
+    }
+    if (newV !== null && data && (oldV === null || newV < oldV)) return { warning: true };
+    if (oldV !== null && newV !== null && newV > oldV) return { raised: true };
+    return {};
+  }
+  function wipeData(id) {
+    mg.heights[id] = 0;
+    mg.forceData[id] = false;
+    mg.prunedData[id] = false;
+    if (id === mg.network) chain.load(id, 0);
+    log(`chain data for ${id} deleted`);
+  }
+  function patchPrune(body) {
+    const m = body.prune_by_network;
+    if (!m || typeof m !== "object" || Array.isArray(m)) {
+      return { error: true, code: 400, body: { ok: false, error: "prune_by_network must map network ids to a number of blocks (or null to keep every block)." } };
+    }
+    const out = { ...(mg.settings.prune_by_network ?? {}) };
+    const wipes = [];
+    const extra = {};
+    for (const [id, v] of Object.entries(m)) {
+      if (!NETS[id]) return { error: true, code: 400, body: { ok: false, error: `prune_by_network: unknown network "${id}".` } };
+      if (!pruneOk(v)) return { error: true, code: 400, body: { ok: false, error: pruneMsg(`prune_by_network.${id}`) } };
+      const plan = planPrune(id, out[id] ?? null, v, body.confirm_wipe === true);
+      if (plan.error) return plan;
+      if (plan.wipe) wipes.push(id);
+      if (plan.warning) extra.warning = PRUNE_WARNING;
+      if (plan.raised) extra.note = PRUNE_NOTE;
+      if (v === null) delete out[id];
+      else out[id] = v;
+    }
+    if (wipes.length && active()) return { error: true, code: 409, body: { ok: false, error: "Stop the node first, then delete the chain data." } };
+    for (const id of wipes) wipeData(id);
+    mg.settings.prune_by_network = out;
+    return { extra };
+  }
+
   function resetAll() {
     timeline.length = 0;
     Object.assign(mg, {
-      mode: undefined, setupDone: true, bundle: false, standaloneUp: true, external: false, agentAlive: true, offline: false, forceChecks: 0, future: false, portTaken: null,
+      mode: undefined, setupDone: true, bundle: false, standaloneUp: true, external: false, agentAlive: true, p2pOverride: {}, offline: false, forceChecks: 0, future: false, portTaken: null,
       proc: { state: "stopped", pid: null, since: null, exit_code: null, restarts: 0, last_error: null },
       network: "mainnet", heights: { mainnet: 0, testnet4: 0, testnet: 0, signet: 0, regtest: 0 }, lastUsed: {},
       freeBytes: 1_042_500_000_000, nodeVersion: "0.1.60", custom: false, latest: "0.1.60", channel: "self",
       platformSupported: true, sw: null, installed: [], canInstall: true,
       platform: "x86_64-linux", lastRunning: secs(), logs: [], seq: 0, failNextStart: false, stopStuck: false,
-      settings: { version: 1, start_on_boot: true, start_on_launch: true, stop_node_on_exit: true, show_logs: false, updates: "self" },
-      job: idleJob(), jobEnd: 0, failVerify: false, failTest: false,
+      settings: { version: 1, start_on_boot: true, start_on_launch: true, stop_node_on_exit: true, show_logs: false, updates: "self", assume_valid_by_network: {}, prune_by_network: {} },
+      forceData: {}, prunedData: {}, runKeep: null, nodePruned: false, pruneVerified: false, wiping: {},
+      job: idleJob(), jobEnd: 0, failVerify: false, failTest: false, failTestKind: null, pageSize: null,
     });
   }
   const runningSince = (ms) => (mg.proc = { state: "running", pid: 4242, since: Date.now() - ms, exit_code: null, restarts: 0, last_error: null });
@@ -677,10 +852,13 @@ export function createManaged(chain) {
       const tag = String(body?.tag ?? (body?.version ? `v${String(body.version).replace(/^v/, "")}` : LATEST_TAG));
       if (!/^v\d+\.\d+\.\d+$/.test(tag)) return json(res, { ok: false, error: "tag must look like v0.1.60" }, 400), true;
       if (jobActive() || swActive()) return json(res, { ok: false, error: "busy" }, 409), true;
+      // The host's 409 `page_size` refusal is the default; `force: true` goes on to the download and the test run.
+      const forced = body?.force === true;
+      if (!runsHere() && !forced) return json(res, { ok: false, code: "page_size", error: PAGE_TEXT(mg.pageSize) }, 409), true;
       if (!canInstallNow()) return json(res, { ok: false, error: installReason() ?? "Not available on this setup." }, 400), true;
       if (kind === "update" && !mg.nodeVersion) return json(res, { ok: false, error: "No node program is installed yet. Install one first." }, 400), true;
       if (kind === "update" && !mg.custom && tag === `v${mg.nodeVersion}`) return json(res, { ok: false, error: `Already on ${tag}.` }, 400), true;
-      runJob(kind, tag);
+      runJob(kind, tag, forced && !runsHere());
       json(res, { ok: true, job: jobBody() }, 202);
       return true;
     }
@@ -712,12 +890,34 @@ export function createManaged(chain) {
       return true;
     }
     if (p === "/api/settings") {
+      let extra = {};
       if (mg.mode === undefined) {
         // The old-host shape has only the page switch.
         if (mutating && "show_logs" in (body ?? {})) mg.settings.show_logs = body.show_logs === true;
         return json(res, { version: 1, show_logs: mg.settings.show_logs === true }), true;
       }
       if (mutating) {
+        // Validate first, apply after: like the host, a request with a bad value saves nothing at all.
+        let avOut = null;
+        if ("assume_valid_by_network" in (body ?? {})) {
+          const m = body.assume_valid_by_network;
+          if (!m || typeof m !== "object" || Array.isArray(m)) {
+            return json(res, { ok: false, error: "assume_valid_by_network must map network ids to a value (or null to remove it)." }, 400), true;
+          }
+          avOut = { ...(mg.settings.assume_valid_by_network ?? {}) };
+          for (const [id, v] of Object.entries(m)) {
+            if (!NETS[id]) return json(res, { ok: false, error: `assume_valid_by_network: unknown network "${id}".` }, 400), true;
+            if (v === null) delete avOut[id];
+            else if (avValid(v)) avOut[id] = v.trim();
+            else return json(res, { ok: false, error: `assume_valid_by_network.${id} ${AV_MSG}` }, 400), true;
+          }
+        }
+        if ("prune_by_network" in (body ?? {})) {
+          const r = patchPrune(body);
+          if (r.error) return json(res, r.body, r.code), true;
+          extra = r.extra;
+        }
+        if (avOut) mg.settings.assume_valid_by_network = avOut;
         if ("show_logs" in (body ?? {})) mg.settings.show_logs = body.show_logs === true;
         for (const k of ["start_on_launch", "stop_node_on_exit", "updates", "data_root"]) if (k in (body ?? {})) mg.settings[k] = body[k];
         // Skip on Umbrel: only marks setup as done, nothing else moves.
@@ -738,6 +938,14 @@ export function createManaged(chain) {
         node_bin: null,
         rpc_overrides: {},
         assume_valid: null,
+        assume_valid_by_network: mg.settings.assume_valid_by_network ?? {},
+        assume_valid_defaults: AV_DEFAULTS,
+        assume_valid_effective: avEffective(),
+        prune_by_network: mg.settings.prune_by_network ?? {},
+        prune_min_blocks: PRUNE_MIN,
+        p2p_ports: Object.fromEntries(IDS.map((id) => [id, p2pPort(id)])),
+        prune_effective: mg.network ? { network: mg.network, keep_blocks: mg.settings.prune_by_network?.[mg.network] ?? null, has_data: hasData(mg.network), has_pruned_data: hasPrunedData(mg.network) } : null,
+        ...extra,
         child_env: {},
         env_locked: [],
         sources: { mode: "file", node_bin: "none", data_root: "default" },
@@ -754,15 +962,35 @@ export function createManaged(chain) {
     if (p === "/api/setup" && mutating) {
       if (mg.mode === undefined) return json(res, { error: "not found" }, 404), true;
       const b = body ?? {};
+      const setupExtra = {};
       if (mg.external && b.mode === "standalone") {
         return json(res, { ok: false, error: "This app always runs its own node, so it cannot be switched to watching another one. (The mode is fixed by BLVM_UI_MODE.)" }, 409), true;
       }
       if (b.mode === "managed") {
         if (!NETS[b.network]) return json(res, { ok: false, error: "Pick a network first." }, 400), true;
+        if (b.assume_valid !== undefined && b.assume_valid !== null && !avValid(b.assume_valid)) {
+          return json(res, { ok: false, error: `assume_valid ${AV_MSG}` }, 400), true;
+        }
         if (b.start && !mg.nodeVersion) return json(res, { ok: false, error: "No node program is installed yet." }, 400), true;
+        let setupWipe = false;
+        if ("prune_keep_blocks" in b) {
+          if (!pruneOk(b.prune_keep_blocks === undefined ? 0 : b.prune_keep_blocks)) return json(res, { ok: false, error: pruneMsg("prune_keep_blocks") }, 400), true;
+          const plan = planPrune(b.network, mg.settings.prune_by_network?.[b.network] ?? null, b.prune_keep_blocks, b.confirm_wipe === true);
+          if (plan.error) return json(res, plan.body, plan.code), true;
+          if (plan.wipe) setupWipe = true;
+          if (plan.warning) setupExtra.warning = PRUNE_WARNING;
+          if (plan.raised) setupExtra.note = PRUNE_NOTE;
+        }
+        if (setupWipe) wipeData(b.network);
+        if ("prune_keep_blocks" in b) {
+          if (b.prune_keep_blocks === null) delete mg.settings.prune_by_network[b.network];
+          else mg.settings.prune_by_network[b.network] = b.prune_keep_blocks;
+        }
         mg.mode = "managed";
         mg.setupDone = true;
         mg.network = b.network;
+        if (b.assume_valid === null) delete mg.settings.assume_valid_by_network[b.network];
+        else if (b.assume_valid !== undefined) mg.settings.assume_valid_by_network[b.network] = b.assume_valid.trim();
         if (b.data_root) mg.settings.data_root = b.data_root;
         mg.settings.stop_node_on_exit = b.stop_on_exit !== false;
         chain.load(b.network, mg.heights[b.network]);
@@ -778,7 +1006,7 @@ export function createManaged(chain) {
       } else {
         return json(res, { ok: false, error: "mode must be managed or standalone" }, 400), true;
       }
-      json(res, { ok: true, error: null, status: chain.snapshot() });
+      json(res, { ok: true, error: null, status: chain.snapshot(), ...setupExtra });
       return true;
     }
     return false;
@@ -795,12 +1023,50 @@ export function createManaged(chain) {
     if (g("custom") !== null) mg.custom = g("custom") !== "0";
     if (g("fail_start") !== null) mg.failNextStart = g("fail_start") !== "0";
     if (g("fail_verify") !== null) mg.failVerify = g("fail_verify") !== "0";
-    if (g("fail_test") !== null) mg.failTest = g("fail_test") !== "0";
+    if (g("fail_test") !== null) {
+      mg.failTest = g("fail_test") !== "0";
+      mg.failTestKind = g("fail_test") === "pagesize" ? "pagesize" : null;
+    }
+    if (g("page_fixed") !== null) mg.pageFixed = g("page_fixed") !== "0";
+    if (g("page_size") !== null) mg.pageSize = Number(g("page_size")) > 0 ? Number(g("page_size")) : null;
     if (g("stop_stuck") !== null) mg.stopStuck = g("stop_stuck") !== "0";
     if (g("show_logs") !== null) mg.settings.show_logs = g("show_logs") !== "0";
     if (g("future") !== null) mg.future = g("future") !== "0";
     if (g("port_taken") !== null) mg.portTaken = g("port_taken") !== "0" ? { port: NETS[mg.network ?? "testnet4"].rpc, pid: 4242, name: "blvm" } : null;
     if (g("agent_alive") !== null) mg.agentAlive = g("agent_alive") !== "0";
+    // assume_valid=800000 | off | default sets the current network's entry; assume_valid= (empty) clears it.
+    if (g("assume_valid") !== null && mg.network) {
+      const v = g("assume_valid");
+      if (v === "") delete mg.settings.assume_valid_by_network[mg.network];
+      else if (avValidLegacy(v)) mg.settings.assume_valid_by_network[mg.network] = v;
+    }
+    // p2p_mainnet=8334 (Umbrel only): the app's node listens on another port than the network's own.
+    for (const id of IDS) {
+      const v = g(`p2p_${id}`);
+      if (v === null) continue;
+      if (/^\d{1,5}$/.test(v) && Number(v) > 0 && Number(v) < 65536) mg.p2pOverride[id] = Number(v);
+      else delete mg.p2pOverride[id];
+    }
+    // pruned=5000 sets the current network's block-pruning entry; pruned= (empty) clears it.
+    if (g("pruned") !== null && mg.network) {
+      const v = g("pruned");
+      if (v === "") delete mg.settings.prune_by_network[mg.network];
+      else if (Number(v) >= 288) mg.settings.prune_by_network[mg.network] = Number(v);
+      // A node that is already up is taken to run with it (use run_keep= to make the two differ).
+      if (mg.proc.state === "running") mg.runKeep = mg.settings.prune_by_network[mg.network] ?? null;
+    }
+    // run_keep=300 / run_keep= : the number of blocks the running node was started with (empty: every block).
+    if (g("run_keep") !== null) mg.runKeep = g("run_keep") === "" ? null : Number(g("run_keep"));
+    // has_data=1 pretends there is chain data (and that a pruning node worked on it); pruned_data=0 makes it a full store.
+    if (g("has_data") !== null && mg.network) {
+      mg.forceData[mg.network] = g("has_data") !== "0";
+      mg.prunedData[mg.network] = g("has_data") !== "0";
+    }
+    if (g("pruned_data") !== null && mg.network) mg.prunedData[mg.network] = g("pruned_data") !== "0";
+    if (g("node_pruned") !== null) mg.nodePruned = g("node_pruned") !== "0";
+    if (g("pruned_verified") !== null) mg.pruneVerified = g("pruned_verified") !== "0";
+    // wiping=1: the current network's chain data is being deleted right now ("Deleting the chain data..."); wiping=0 clears it.
+    if (g("wiping") !== null && mg.network) mg.wiping[mg.network] = g("wiping") !== "0";
     if (g("offline") !== null) mg.offline = g("offline") !== "0";
     if (g("external") !== null) {
       mg.external = g("external") !== "0";

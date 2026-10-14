@@ -24,6 +24,7 @@
 use crate::agent::{parse_version_output, Agent, ProcState};
 use crate::releases::{self, asset_name, net_error, InstalledRecord, Release};
 use crate::state::{stamp_power, Shared};
+use crate::sysinfo;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -215,7 +216,14 @@ pub async fn begin(state: &Shared, kind: Kind, tag_in: Option<&str>) -> (u16, Va
 
 /// [`begin`], where `downgrade` allows an explicit tag that is older than the installed release.
 pub async fn begin_with(state: &Shared, kind: Kind, tag_in: Option<&str>, downgrade: bool) -> (u16, Value) {
-    let (agent, channel, platform, root, cell, cache, timings, pinned, switching, managed) = {
+    begin_forced(state, kind, tag_in, downgrade, false).await
+}
+
+/// [`begin_with`], where `force` skips the page-size refusal and goes on to the download and the test run. The test
+/// run still refuses a program that aborts on this computer's page size, so nothing wrong can be installed; the
+/// escape hatch is for a newer release that does support the page size.
+pub async fn begin_forced(state: &Shared, kind: Kind, tag_in: Option<&str>, downgrade: bool, force: bool) -> (u16, Value) {
+    let (agent, channel, platform, root, cell, cache, timings, pinned, switching, managed, facts) = {
         let g = state.read().await;
         let c = &g.console;
         (
@@ -229,6 +237,7 @@ pub async fn begin_with(state: &Shared, kind: Kind, tag_in: Option<&str>, downgr
             c.env.node_bin.is_some(),
             c.switch_active(),
             c.is_managed(),
+            c.node_facts(),
         )
     };
     let Some(agent) = agent.filter(|_| managed) else {
@@ -243,6 +252,13 @@ pub async fn begin_with(state: &Shared, kind: Kind, tag_in: Option<&str>, downgr
     let installed = releases::read_installed(&root).filter(|_| releases::installed_bin_ok(&root));
     if let Some(why) = releases::static_block(true, &channel, &platform, pinned, installed.is_some()) {
         return refuse(400, "unavailable", why);
+    }
+    // The official release aborts at its first allocation on a kernel with 16 KB memory pages (Raspberry Pi 5):
+    // refuse before anything is downloaded, unless the caller sent `force: true`.
+    if !facts.runs_here && !force {
+        let why = facts.reason.unwrap_or_else(|| sysinfo::page_size_message(facts.page_size));
+        tracing::warn!(page_size = ?facts.page_size, "installer: refused, the official release does not run on this computer");
+        return refuse(409, "page_size", why);
     }
     if kind == Kind::Update && installed.is_none() {
         return refuse(400, "nothing_installed", "No node has been installed by the console yet. Install one first.");
@@ -770,6 +786,13 @@ async fn test_run(bin: &Path, limit: Duration, platform: &str) -> Result<String,
             first_problem.get_or_insert_with(|| format!("The new program ran but printed no version ({}).", short(&text)));
         } else {
             let stderr = String::from_utf8_lossy(&out.stderr);
+            if text.to_ascii_lowercase().contains(sysinfo::PAGE_SIZE_ERROR_TEXT) {
+                // The raw jemalloc lines go to the log; the page gets the plain explanation.
+                tracing::warn!(page_size = ?sysinfo::page_size(), raw = %short(&text), "installer: the new program aborted on the memory page size");
+                // (A size of 4 KB or less here would contradict the program: name no size rather than a wrong one.)
+                let page = sysinfo::page_size().filter(|p| *p > sysinfo::RELEASE_PAGE_SIZE);
+                return Err(format!("{} Nothing was installed.", sysinfo::page_size_message(page)));
+            }
             let msg = format!(
                 "The new program does not run on this computer: {}",
                 short(if stderr.trim().is_empty() { &text } else { &stderr })
@@ -1408,6 +1431,173 @@ mod tests {
         assert_eq!(releases::read_installed(&f.root).unwrap().tag, "v0.1.59");
         assert!(!f.root.join("bin/staging").exists());
         assert!(!f.root.join("bin/blvm-v0.1.60").exists());
+        f.clean();
+    }
+
+    #[tokio::test]
+    async fn a_program_that_aborts_on_the_memory_page_size_gets_the_plain_explanation_and_nothing_is_installed() {
+        let f = fixture("pagesize").await;
+        f.publish("v0.1.59", script("0.1.59", None));
+        f.begin(Kind::Install, Some("v0.1.59")).await;
+        assert_eq!(f.wait_job("first").await.phase, "done");
+
+        // What the official linux-aarch64 build prints on a 16 KB kernel (Raspberry Pi 5), on both attempts.
+        let aborts = b"#!/bin/sh\necho '<jemalloc>: Unsupported system page size' >&2\necho '<jemalloc>: Unsupported system page size' >&2\necho 'memory allocation of 16 bytes failed' >&2\nexit 134\n".to_vec();
+        f.publish("v0.1.60", aborts);
+        let (code, _) = f.begin(Kind::Update, None).await;
+        assert_eq!(code, 202);
+        let j = f.wait_job("pagesize").await;
+        assert_eq!(j.phase, "failed");
+        let e = j.error.unwrap();
+        let page = sysinfo::page_size().filter(|p| *p > sysinfo::RELEASE_PAGE_SIZE);
+        assert_eq!(e, format!("{} Nothing was installed.", sysinfo::page_size_message(page)));
+        assert!(e.starts_with("This device uses ") && e.contains("memory pages."), "{e}");
+        assert!(e.contains("kernel=kernel8.img") && e.ends_with("Nothing was installed."), "{e}");
+        assert!(!e.contains("<jemalloc>") && !e.contains("memory allocation of 16 bytes") && !e.contains("does not run on this computer"), "{e}");
+        assert!(!j.rolled_back, "nothing had been replaced yet");
+        assert_eq!(f.link_target().as_deref(), Some("blvm-v0.1.59"), "the old program is still current");
+        assert!(!f.root.join("bin/blvm-v0.1.60").exists() && !f.root.join("bin/staging").exists());
+
+        // The same text for the raw lines in any order or case, from stdout as well.
+        let t = Duration::from_secs(5);
+        let aborts2 = f.dir.join("aborts2.sh");
+        std::fs::write(&aborts2, "#!/bin/sh\necho '<jemalloc>: UNSUPPORTED SYSTEM PAGE SIZE'\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&aborts2, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = test_run(&aborts2, t, "linux-aarch64").await.unwrap_err();
+        assert!(e.contains("memory pages") && e.ends_with("Nothing was installed."), "{e}");
+        // Other failures keep their own text.
+        let other = f.dir.join("other.sh");
+        std::fs::write(&other, "#!/bin/sh\necho 'boom' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = test_run(&other, t, "linux-aarch64").await.unwrap_err();
+        assert!(e.starts_with("The new program does not run on this computer: boom"), "{e}");
+        f.clean();
+    }
+
+    #[tokio::test]
+    async fn a_16k_kernel_refuses_the_install_over_http_with_409_before_any_download() {
+        let f = fixture("pagesize-http").await;
+        f.publish("v0.1.60", script(VER, None));
+        {
+            let mut g = f.state.write().await;
+            g.console.platform_override = Some("linux-aarch64".into());
+            g.console.page_size_override = Some(16384);
+        }
+        let hits_before = f.fake.hits.lock().unwrap().len();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let st = Arc::clone(&f.state);
+        tokio::spawn(async move {
+            let _ = crate::http::serve_listener(l, st).await;
+        });
+        let post = |path: &'static str| async move {
+            let body = "{}";
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-BLVM-UI: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            raw(addr, req).await
+        };
+        let (c, v) = raw(addr, format!("GET /api/node/releases HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")).await;
+        assert_eq!(c, 200);
+        assert_eq!((v["runs_here"].clone(), v["page_size"].clone(), v["can_install"].clone()), (json!(false), json!(16384), json!(false)), "{v}");
+        // (can_install is false here only because the fake release list has no linux-aarch64 asset.)
+        assert!(v["runs_here_reason"].as_str().unwrap().contains("16 KB memory pages"), "{v}");
+        let hits = f.fake.hits.lock().unwrap().len();
+        for path in ["/api/node/install", "/api/node/update"] {
+            let (c, v) = post(path).await;
+            assert_eq!(c, 409, "{path}: {v}");
+            assert_eq!(v["ok"], false);
+            assert_eq!(v["error"].as_str().unwrap(), sysinfo::page_size_message(Some(16384)));
+        }
+        assert_eq!(f.fake.hits.lock().unwrap().len(), hits, "nothing was fetched for the refused requests");
+        assert!(hits >= hits_before);
+        f.snapshot().await; // (the status is the last snapshot the poll stamped)
+        let (c, v) = raw(addr, format!("GET /api/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")).await;
+        assert_eq!(c, 200);
+        assert_eq!(v["managed"]["platform"]["page_size"], 16384);
+        assert_eq!(v["managed"]["platform"]["runs_here"], false);
+        f.clean();
+    }
+
+    /// N5: `force: true` skips the 409 `page_size` refusal and goes on to download and test run; the test run
+    /// still refuses a program that aborts on the page size, so nothing wrong is installed.
+    #[tokio::test]
+    async fn force_true_skips_the_page_size_refusal_but_the_test_run_still_guards_the_install() {
+        let f = fixture("pagesize-force").await;
+        {
+            let mut g = f.state.write().await;
+            g.console.platform_override = Some("linux-aarch64".into());
+            g.console.page_size_override = Some(16384);
+        }
+        // Releases built for this (pretend) platform: v0.1.60 starts, v0.1.61 aborts on the page size.
+        let aborts = b"#!/bin/sh\necho '<jemalloc>: Unsupported system page size' >&2\nexit 134\n".to_vec();
+        let releases: Vec<(&str, Vec<u8>)> = vec![("v0.1.61", aborts), ("v0.1.60", script("0.1.60", None))];
+        let mut items = Vec::new();
+        for (tag, body) in &releases {
+            let name = format!("blvm-{}-linux-aarch64", tag.trim_start_matches('v'));
+            f.fake.set(&format!("/dl/{tag}/{name}"), Resp::ok(body.clone()));
+            f.fake.set(&format!("/dl/{tag}/checksums.sha256"), Resp::ok(format!("{}  {name}\n", sha(body))));
+            items.push(json!({
+                "tag_name": tag, "draft": false, "prerelease": false, "published_at": "2026-10-12T03:33:10Z",
+                "html_url": format!("https://github.com/BTCDecoded/blvm/releases/tag/{tag}"),
+                "assets": [
+                    {"name": name, "size": body.len(), "browser_download_url": f.fake.url(&format!("/dl/{tag}/{name}"))},
+                    {"name": "checksums.sha256", "size": 100, "browser_download_url": f.fake.url(&format!("/dl/{tag}/checksums.sha256"))},
+                ]
+            }));
+        }
+        f.fake.set("/api/releases", Resp::ok(serde_json::to_vec(&items).unwrap()));
+        {
+            let mut g = f.state.write().await;
+            let src = g.console.releases.source().clone();
+            g.console.releases = Cache::new(src);
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let st = Arc::clone(&f.state);
+        tokio::spawn(async move {
+            let _ = crate::http::serve_listener(l, st).await;
+        });
+        let post = |path: &'static str, body: &'static str| async move {
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-BLVM-UI: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            raw(addr, req).await
+        };
+
+        // Without force (absent, or false): the 409, and nothing is fetched.
+        let hits = f.fake.hits.lock().unwrap().len();
+        for body in ["{}", r#"{"force":false}"#, r#"{"force":"yes"}"#] {
+            let (c, v) = post("/api/node/install", body).await;
+            assert_eq!((c, v["code"].as_str()), (409, Some("page_size")), "{body}: {v}");
+        }
+        assert_eq!(f.fake.hits.lock().unwrap().len(), hits, "refused requests fetch nothing");
+        assert_eq!(f.state.read().await.console.job.lock().unwrap().phase, "idle");
+
+        // With force: the install goes on to the download and the test run, and a program that starts is installed.
+        let (c, v) = post("/api/node/install", r#"{"tag":"v0.1.60","force":true}"#).await;
+        assert_eq!(c, 202, "{v}");
+        let j = f.wait_job("forced install").await;
+        assert_eq!((j.phase, j.error), ("done", None));
+        assert_eq!(f.link_target().as_deref(), Some("blvm-v0.1.60"));
+        assert!(f.fake.hits.lock().unwrap().len() > hits, "the release was fetched");
+
+        // Update without force: still the 409. With force: the test run refuses the program that aborts on the
+        // page size, with the plain explanation, and the old program stays current.
+        let (c, v) = post("/api/node/update", "{}").await;
+        assert_eq!((c, v["code"].as_str()), (409, Some("page_size")), "{v}");
+        let (c, v) = post("/api/node/update", r#"{"force":true}"#).await;
+        assert_eq!(c, 202, "{v}");
+        let j = f.wait_job("forced update").await;
+        assert_eq!(j.phase, "failed");
+        let e = j.error.unwrap();
+        assert!(e.contains("memory pages") && e.ends_with("Nothing was installed."), "{e}");
+        assert!(!e.contains("<jemalloc>"), "{e}");
+        assert_eq!(f.link_target().as_deref(), Some("blvm-v0.1.60"), "the working program is still current");
+        assert_eq!(releases::read_installed(&f.root).unwrap().tag, "v0.1.60");
         f.clean();
     }
 

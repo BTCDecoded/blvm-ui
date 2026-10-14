@@ -13,6 +13,7 @@ use crate::releases;
 use crate::settings::{self, ConsoleSettings, EnvOverrides, Effective, Mode};
 use crate::state::{stamp_power, LiveState, Shared, Snapshot, VersionSeen};
 use crate::switch::{SwitchState, SwitchView};
+use crate::sysinfo;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -75,6 +76,8 @@ pub struct Console {
     pub installer_timings: installer::Timings,
     /// Pretend to be this platform (`linux-x86_64` ...) instead of `releases::platform()`. Tests.
     pub platform_override: Option<String>,
+    /// Pretend the memory page size is this many bytes instead of reading it. Tests.
+    pub page_size_override: Option<u64>,
     /// Look for a newer release in the background (set by the real process, never by tests).
     pub auto_check: bool,
     /// Hand the node's RPC login to the process-wide RPC client (set by the real process, never by tests:
@@ -88,6 +91,9 @@ pub struct Console {
     pub p2p_port: Option<u16>,
     disk: Arc<Mutex<DiskCache>>,
     last_pid: Option<u32>,
+    /// Networks whose chain data is being deleted right now (the delete runs without the console's lock, so
+    /// everything that could start a node or change the settings checks this).
+    pub wiping: std::collections::BTreeSet<&'static str>,
 }
 
 impl Console {
@@ -111,12 +117,14 @@ impl Console {
             releases: releases::Cache::new(releases::Source::default()),
             installer_timings: installer::Timings::default(),
             platform_override: None,
+            page_size_override: None,
             auto_check: false,
             publish_rpc_login: false,
             login_unsaved: std::sync::atomic::AtomicBool::new(false),
             p2p_port: None,
             disk: Arc::new(Mutex::new(DiskCache::default())),
             last_pid: None,
+            wiping: Default::default(),
         }
     }
 
@@ -139,12 +147,14 @@ impl Console {
             releases: releases::Cache::new(releases::Source::default()),
             installer_timings: installer::Timings::default(),
             platform_override: None,
+            page_size_override: None,
             auto_check: false,
             publish_rpc_login: false,
             login_unsaved: std::sync::atomic::AtomicBool::new(false),
             p2p_port: None,
             disk: Arc::new(Mutex::new(DiskCache::default())),
             last_pid: None,
+            wiping: Default::default(),
         };
         c.releases.set_dir(c.state_dir.clone());
         c.reresolve();
@@ -219,9 +229,32 @@ impl Console {
         self.platform_override.clone().unwrap_or_else(releases::platform)
     }
 
+    /// Platform facts of the computer this process runs on (memory page size and what follows from it).
+    pub fn local_facts(&self) -> sysinfo::Facts {
+        sysinfo::Facts::for_page(&self.platform(), self.page_size_override.or_else(sysinfo::page_size))
+    }
+
+    /// Platform facts of the computer that runs (or would run) the node: what the agent in the node container
+    /// wrote to `state.json` when it is another container, else this process's own.
+    pub fn node_facts(&self) -> sysinfo::Facts {
+        let agent = if self.is_external() { self.agent.as_ref().and_then(Agent::platform_facts) } else { None };
+        agent.unwrap_or_else(|| self.local_facts())
+    }
+
     /// The node runs under the agent in another container.
     pub fn is_external(&self) -> bool {
         self.is_managed() && self.env.agent_external
+    }
+
+    /// The P2P port the node of this network listens on, for display. With the agent in another container it
+    /// reads the same `BLVM_AGENT_P2P_PORT_<NET>` variables as the agent (the Umbrel app gives both containers
+    /// the same values); a node this process starts itself uses the network's own port.
+    pub fn p2p_port_for(&self, net: &Network) -> u16 {
+        if self.is_external() {
+            networks::effective_p2p_port(net)
+        } else {
+            net.p2p_port
+        }
     }
 
     /// The installer's record, when the program in use is the one it installed.
@@ -289,11 +322,18 @@ impl Console {
             root: self.eff.data_root.clone(),
             network: net,
             rpc_addr: net.map(|n| self.rpc_for(n)),
-            assume_valid: self.settings.assume_valid.clone(),
+            // This network's own setting, else the global one (an older console.json).
+            assume_valid: match net {
+                Some(n) => self.settings.assume_valid_for(n.id),
+                None => self.settings.assume_valid.clone(),
+            },
+            // This network's own block-pruning setting (`None`: keep every block).
+            prune_keep_blocks: net.and_then(|n| self.settings.prune_for(n.id)),
             child_env: self.settings.child_env.clone(),
             // A node this process starts gets a login too (the agent of another container has its own).
             rpc_auth: self.rpc_auth(),
             p2p_port: self.p2p_port,
+            p2p_listen_port: None,
         }
     }
 
@@ -338,6 +378,15 @@ impl Console {
 
     pub fn invalidate_disk(&self) {
         self.disk.lock().unwrap().at = None;
+    }
+
+    /// Measure one network's folder now and put the result into the cached table (after its chain data was deleted,
+    /// so the status does not show the old size and heights until the next full measurement).
+    pub fn refresh_net_disk(&self, root: &Path, net: &Network) {
+        let dir = networks::dir(root, net);
+        let bytes = if dir.is_dir() { crate::node_ctl::dir_allocated_bytes(&dir) } else { 0 };
+        let d = NetDisk { bytes, has_data: chain_has_data(&dir), meta: networks::read_meta(root, net) };
+        self.disk.lock().unwrap().nets.insert(net.id, d);
     }
 
     /// A size measurement to run on a blocking thread, when one is due.
@@ -395,11 +444,17 @@ pub struct NetRow {
     pub id: &'static str,
     pub label: &'static str,
     pub rpc: String,
+    /// The port a node on this network listens on for peers (the network's own unless the Umbrel app moved it).
+    pub p2p_port: u16,
     pub bytes: u64,
     /// From `networks/<id>/meta.json` (the live height for the running network).
     pub last_height: Option<u64>,
     pub last_used: Option<u64>,
     pub has_data: bool,
+    /// The console's block-pruning setting for this network (`None`: keeps every block).
+    pub prune_keep_blocks: Option<u64>,
+    /// The chain data of this network is being deleted right now.
+    pub wiping: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -433,6 +488,27 @@ pub struct AgentView {
     pub alive: bool,
 }
 
+/// What the node container's agent reported about its computer.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentPlatformView {
+    pub page_size: Option<u64>,
+    pub runs_here: bool,
+    pub reason: Option<String>,
+}
+
+/// `managed.platform` in `/api/status`: the memory page size, and whether the official node release can start.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlatformView {
+    /// Page size of the console's own process, in bytes.
+    pub page_size: Option<u64>,
+    /// Page size of the computer that runs the node (the agent's when it is in another container).
+    pub node_page_size: Option<u64>,
+    pub runs_here: bool,
+    pub runs_here_reason: Option<String>,
+    /// What the node container's agent wrote to `state.json`; `None` when the node runs in this process.
+    pub agent: Option<AgentPlatformView>,
+}
+
 /// `managed` in `/api/status` (design F). Extras beyond F: `installed_version`, `crash_log`, and
 /// `process.exit_signal` / `process.conflict`. Paths: only the data root (the log file is named by
 /// `/api/node/logs`, the node binary by nothing: the status is readable by every page on this host).
@@ -456,6 +532,7 @@ pub struct ManagedView {
     pub update: UpdateView,
     pub switch: Option<SwitchView>,
     pub agent: AgentView,
+    pub platform: PlatformView,
     pub crash_log: Vec<String>,
 }
 
@@ -502,10 +579,13 @@ fn managed_view(c: &Console, view: ProcessView, agent: &Agent, live_height: Opti
                 id: n.id,
                 label: n.label,
                 rpc: c.rpc_for(n),
+                p2p_port: c.p2p_port_for(n),
                 bytes: d.bytes,
                 last_height: meta.last_height,
                 last_used: meta.last_used,
                 has_data: d.has_data,
+                prune_keep_blocks: c.settings.prune_for(n.id),
+                wiping: c.wiping.contains(n.id),
             };
             // The network the node is on right now: what the poll just read beats the file.
             if c.network().is_some_and(|cur| cur.id == n.id) {
@@ -544,6 +624,18 @@ fn managed_view(c: &Console, view: ProcessView, agent: &Agent, live_height: Opti
         },
         switch: c.switch.as_ref().map(SwitchState::view),
         agent: AgentView { external: agent.is_external(), alive: agent.alive() },
+        platform: {
+            let local = c.local_facts();
+            let remote = if c.is_external() { agent.platform_facts() } else { None };
+            let node = remote.clone().unwrap_or_else(|| local.clone());
+            PlatformView {
+                page_size: local.page_size,
+                node_page_size: node.page_size,
+                runs_here: node.runs_here,
+                runs_here_reason: node.reason.clone(),
+                agent: remote.map(|f| AgentPlatformView { page_size: f.page_size, runs_here: f.runs_here, reason: f.reason }),
+            }
+        },
     }
 }
 
@@ -715,6 +807,13 @@ pub fn stamp(g: &mut LiveState) {
         snap.node_busy = true;
         snap.node_power_label = "Switching…".into();
     }
+    // The console's block-pruning setting for this network decides `pruning.enabled`, also while the node is down.
+    // What the node said about its own pruning counts only while it answers.
+    let keep = c.network().and_then(|n| c.settings.prune_for(n.id));
+    if !snap.connected {
+        snap.pruning.forget_node();
+    }
+    crate::state::finish_pruning_with_node(&mut snap.pruning, keep, snap.local_height, snap.network_height);
     let live_height = (snap.connected && snap.local_height > 0).then_some(snap.local_height);
     snap.managed = Some(managed_view(c, view, &agent, live_height));
 }
@@ -934,6 +1033,13 @@ pub fn settings_json(c: &Console) -> Value {
         "updates": c.updates_channel(),
         "rpc_overrides": s.rpc_overrides,
         "assume_valid": s.assume_valid,
+        "assume_valid_by_network": s.assume_valid_by_network,
+        "assume_valid_defaults": assume_valid_defaults_json(),
+        "assume_valid_effective": assume_valid_effective_json(c),
+        "prune_by_network": s.prune_by_network,
+        "prune_min_blocks": networks::PRUNE_MIN_BLOCKS,
+        "prune_effective": prune_effective_json(c),
+        "p2p_ports": networks::ALL.iter().map(|n| (n.id.to_string(), c.p2p_port_for(n))).collect::<BTreeMap<_, _>>(),
         "child_env": s.child_env,
         "env_locked": c.eff.env_locked,
         "sources": {
@@ -944,6 +1050,240 @@ pub fn settings_json(c: &Console) -> Value {
     })
 }
 
+/// `{ "<net id>": { "height": <node's built-in default>, "forced_off": <console runs it with full validation> } }`.
+fn assume_valid_defaults_json() -> Value {
+    let mut m = serde_json::Map::new();
+    for n in networks::ALL.iter() {
+        m.insert(
+            n.id.to_string(),
+            json!({ "height": networks::assume_valid_default_height(n), "forced_off": n.full_validation }),
+        );
+    }
+    Value::Object(m)
+}
+
+/// What the node on the current network will be started with: `{ network, value, argv }`
+/// (`null` before a network is chosen). `value` is the stored setting (`null`: the network's default).
+fn assume_valid_effective_json(c: &Console) -> Value {
+    let Some(n) = c.network() else { return Value::Null };
+    let value = c.settings.assume_valid_for(n.id);
+    let argv = crate::agent::assume_valid_args(value.as_deref(), n);
+    let mut out = json!({ "network": n.id, "value": value, "argv": argv });
+    // The node reads this variable after the command line, so a value set under Child environment wins.
+    if c.settings.child_env.contains_key("BLVM_ASSUME_VALID_HEIGHT") {
+        out["overridden_by_env"] = json!(true);
+        out["note"] = json!(ASSUME_VALID_ENV_NOTE);
+    }
+    out
+}
+
+const ASSUME_VALID_ENV_NOTE: &str = "The variable BLVM_ASSUME_VALID_HEIGHT is set under Child environment. When it holds a block height, the node uses that instead of this setting.";
+
+/// What the node on the current network will be started with as far as pruning goes:
+/// `{ network, keep_blocks: <u64|null>, has_data, has_pruned_data }` (`null` before a network is chosen).
+/// `has_data` and `has_pruned_data` are read from the folder now (not from the cached sizes), because the page
+/// decides on them whether to warn or ask first. `has_pruned_data`: chain data exists AND a node was once started
+/// pruned on it, so going back to a full node needs the data deleted.
+fn prune_effective_json(c: &Console) -> Value {
+    let Some(n) = c.network() else { return Value::Null };
+    let dir = networks::dir(&c.eff.data_root, n);
+    let has_data = chain_has_data(&dir);
+    json!({
+        "network": n.id,
+        "keep_blocks": c.settings.prune_for(n.id),
+        "has_data": has_data,
+        "has_pruned_data": has_data && ran_pruned(&c.eff.data_root, n),
+    })
+}
+
+/// A node was started with block pruning on this network's folder (`meta.json` `ran_pruned`).
+fn ran_pruned(root: &Path, net: &Network) -> bool {
+    networks::read_meta(root, net).is_some_and(|m| m.ran_pruned == Some(true))
+}
+
+/// One assume-valid value from a request: a string the node accepts (trimmed), else `None`.
+fn parse_assume_valid(v: &Value) -> Option<String> {
+    v.as_str().map(str::trim).filter(|a| valid_assume_valid_per_network(a)).map(str::to_string)
+}
+
+/// `default`, `off` or a block height (1-9 digits). A block hash is not accepted for the per-network keys: the
+/// node reads one as height 0, so nothing would be skipped. [`crate::agent::valid_assume_valid`] (with the
+/// hash) is kept for the older global `assume_valid` key and for files written by older consoles.
+fn valid_assume_valid_per_network(v: &str) -> bool {
+    v == "default" || v == "off" || (!v.is_empty() && v.len() <= 9 && v.bytes().all(|b| b.is_ascii_digit()))
+}
+
+const ASSUME_VALID_MSG: &str = "must be \"default\", \"off\" or a block height.";
+
+/// Shown when block pruning is switched on (or lowered) for a network whose chain data already exists.
+const PRUNE_CONVERT_WARNING: &str = "The node converts the existing store on its next start: it deletes old blocks one by one from the start of the chain and does not answer meanwhile. Minutes on Testnet4, possibly hours on mainnet.";
+/// Sent when the number of kept blocks is raised.
+const PRUNE_RAISE_NOTE: &str = "Blocks the node has already deleted do not come back. Only the blocks that arrive from now on are kept.";
+
+/// A `prune_by_network` / `prune_keep_blocks` value: `Some(None)` for `null` (keep every block), `Some(Some(n))`
+/// for a whole number within the allowed range, `None` for anything else.
+fn parse_prune(v: &Value) -> Option<Option<u64>> {
+    if v.is_null() {
+        return Some(None);
+    }
+    v.as_u64().filter(|n| (networks::PRUNE_MIN_BLOCKS..=networks::PRUNE_MAX_BLOCKS).contains(n)).map(Some)
+}
+
+fn prune_range_msg(what: &str) -> String {
+    format!(
+        "{what} must be null (keep every block) or a whole number from {} to {}.",
+        networks::PRUNE_MIN_BLOCKS,
+        networks::PRUNE_MAX_BLOCKS
+    )
+}
+
+/// What a change of the pruning setting means for chain data that is already on disk.
+#[derive(Default)]
+struct PruneOutcome {
+    /// Networks whose chain data must be deleted (pruned -> full node, confirmed).
+    wipe: Vec<&'static Network>,
+    /// The node will convert an existing store on its next start (slow).
+    warning: bool,
+    /// The number of kept blocks went up.
+    raised: bool,
+}
+
+impl PruneOutcome {
+    /// Fields of the response for the changes above.
+    fn add_to(&self, body: &mut Value) {
+        if let Some(m) = body.as_object_mut() {
+            if self.warning {
+                m.insert("warning".into(), json!(PRUNE_CONVERT_WARNING));
+            }
+            if self.raised {
+                m.insert("note".into(), json!(PRUNE_RAISE_NOTE));
+            }
+        }
+    }
+}
+
+/// Decide what changing one network's pruning setting from `old` to `new` needs, given the chain data under
+/// `root`. A node that was pruned and is switched to a full node would silently advertise blocks it no longer
+/// has, so that change is refused (409, `needs: "wipe"`) until the caller confirms the deletion of the data.
+/// "Was pruned" means a node was actually started with pruning on that folder (`meta.json` `ran_pruned`): a
+/// setting that was saved and never used, over a full store, is taken back with a plain save.
+fn plan_prune_change(
+    root: &Path,
+    net: &'static Network,
+    old: Option<u64>,
+    new: Option<u64>,
+    confirm_wipe: bool,
+    out: &mut PruneOutcome,
+) -> Result<(), (u16, Value)> {
+    let has_data = || chain_has_data(&networks::dir(root, net));
+    match (old, new) {
+        (Some(_), None) if has_data() && ran_pruned(root, net) => {
+            if !confirm_wipe {
+                return Err((
+                    409,
+                    json!({
+                        "ok": false,
+                        "needs": "wipe",
+                        "error": format!(
+                            "A pruned node cannot go back to keeping every block: the blocks it deleted are gone. \
+                             The chain data for {} has to be deleted and downloaded again.",
+                            net.label
+                        ),
+                    }),
+                ));
+            }
+            out.wipe.push(net);
+        }
+        (None, Some(_)) if has_data() => out.warning = true,
+        (Some(o), Some(n)) if n < o && has_data() => out.warning = true,
+        (Some(o), Some(n)) if n > o => out.raised = true,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Tests: how long the delete under a data folder takes (a big store on a slow disk).
+#[cfg(test)]
+static SLOW_WIPE: Mutex<BTreeMap<PathBuf, Duration>> = Mutex::new(BTreeMap::new());
+
+/// Delete `<root>/networks/<id>/data` and nothing else (`meta.json`, `logs/` and `blvm.toml` stay) and forget the
+/// heights and `ran_pruned` in `meta.json`.
+fn wipe_chain_data(root: &Path, net: &Network) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(d) = SLOW_WIPE.lock().unwrap().get(root).copied() {
+        std::thread::sleep(d); // a big store on a slow disk
+    }
+    match std::fs::remove_dir_all(networks::dir(root, net).join("data")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if let Some(mut m) = networks::read_meta(root, net) {
+        m.last_height = None;
+        m.last_header = None;
+        m.ran_pruned = None;
+        let _ = networks::write_meta(root, net, &m);
+    }
+    Ok(())
+}
+
+async fn wipe_all(root: &Path, nets: &[&'static Network]) -> Result<(), (u16, Value)> {
+    for net in nets {
+        let (r, n) = (root.to_path_buf(), *net);
+        match tokio::task::spawn_blocking(move || wipe_chain_data(&r, n)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err((500, json!({ "ok": false, "error": format!("Could not delete the {} chain data: {e}", net.label) }))),
+            Err(e) => return Err((500, json!({ "ok": false, "error": format!("Could not delete the {} chain data: {e}", net.label) }))),
+        }
+    }
+    Ok(())
+}
+
+/// First half of a wipe, with the console locked, in this order: stop anything from starting a node (and cancel a
+/// pending automatic restart), look again whether a node process can exist, mark the networks as being wiped.
+/// The caller then lets go of the lock for the delete and calls [`end_wipe`]. `Err` is the 409 to answer with;
+/// nothing is left marked then.
+fn begin_wipe(c: &mut Console, nets: &[&'static Network]) -> Result<(), (u16, Value)> {
+    if c.job_active() {
+        return Err((409, json!({ "ok": false, "error": JOB_RUNNING })));
+    }
+    if let Some(a) = &c.agent {
+        // (1) No start of any kind from here on, and a crashed node waiting for its restart stays down.
+        a.hold_starts(true);
+        a.abandon_restart();
+        // (2) Only now is "no node" a fact: a restart that fired a moment ago shows up as a process or a pending start.
+        let verdict = if c.switch_active() { Err(crate::agent::STOP_FIRST_MSG.to_string()) } else { a.confirm_stopped() };
+        if let Err(msg) = verdict {
+            a.hold_starts(false);
+            return Err((409, json!({ "ok": false, "error": msg })));
+        }
+    }
+    for n in nets {
+        c.wiping.insert(n.id);
+    }
+    Ok(())
+}
+
+/// Second half of a wipe, with the console locked again after the delete (done or failed): starts are allowed
+/// again, the folder facts are measured anew, and the chain data's heights and Latest Blocks history are
+/// forgotten for each wiped network.
+fn end_wipe(g: &mut crate::state::LiveState, root: &Path, nets: &[&'static Network]) {
+    for n in nets {
+        g.console.wiping.remove(n.id);
+    }
+    if g.console.wiping.is_empty() {
+        if let Some(a) = &g.console.agent {
+            a.hold_starts(false);
+        }
+    }
+    for n in nets {
+        g.console.refresh_net_disk(root, n);
+        let addr = g.console.rpc_for(n);
+        g.forget_chain(&addr, n.chain);
+    }
+    g.console.invalidate_disk();
+}
+
 /// Refusal for a mode change when the environment fixes the mode (the Umbrel app always runs its own node).
 const MODE_LOCKED: &str = "This app always runs its own node, so it cannot be switched to watching another one. (The mode is fixed by BLVM_UI_MODE.)";
 const JOB_RUNNING: &str = "The node is being installed or updated. Wait for that to finish.";
@@ -952,16 +1292,114 @@ fn node_is_active(c: &Console) -> bool {
     c.switch_active() || c.agent.as_ref().is_some_and(|a| a.state().is_active())
 }
 
+/// Held from `begin_wipe` to `end_wipe`. If the section between them is left any other way (a panic, an early
+/// return added later, a dropped future), its drop does what `end_wipe` does, in a task of its own because
+/// dropping cannot wait for the console lock: `wiping` is cleared and starts are allowed again. On the normal path
+/// [`WipeGuard::finish`] runs `end_wipe` and disarms it.
+struct WipeGuard {
+    state: Shared,
+    root: PathBuf,
+    nets: Vec<&'static Network>,
+    armed: bool,
+}
+
+impl WipeGuard {
+    fn new(state: &Shared, root: &Path, nets: &[&'static Network]) -> Self {
+        Self { state: state.clone(), root: root.to_path_buf(), nets: nets.to_vec(), armed: true }
+    }
+
+    fn finish(mut self, g: &mut crate::state::LiveState) {
+        end_wipe(g, &self.root, &self.nets);
+        self.armed = false;
+    }
+}
+
+impl Drop for WipeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::error!("the chain data delete section was left without finishing; releasing the hold");
+        let (state, root, nets) = (self.state.clone(), self.root.clone(), self.nets.clone());
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(async move {
+                    let mut g = state.write().await;
+                    end_wipe(&mut g, &root, &nets);
+                });
+            }
+            Err(_) => {
+                if let Ok(mut g) = state.try_write() {
+                    end_wipe(&mut g, &root, &nets);
+                }
+            }
+        }
+    }
+}
+
+/// Tests: panic in the wipe section of the request (after the delete, before `end_wipe`) for this data folder.
+#[cfg(test)]
+static PANIC_AFTER_WIPE: Mutex<std::collections::BTreeSet<PathBuf>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Run a state-changing request to completion in a task of its own. hyper drops the handler's future when the
+/// client goes away (a page reload, a closed tab, the page's own fetch timeout), and a future dropped between
+/// `begin_wipe` and `end_wipe` would leave the console refusing everything ("being deleted") until it restarts and
+/// the setting unsaved. The task finishes whatever happens to the handler; the next poll shows the result.
+async fn run_to_completion<F>(job: F) -> (u16, Value)
+where
+    F: std::future::Future<Output = (u16, Value)> + Send + 'static,
+{
+    match tokio::spawn(job).await {
+        Ok(out) => out,
+        Err(e) => err(500, format!("The request could not be completed: {e}")),
+    }
+}
+
+/// Settings after a wipe: the delete ran without the console's lock, so something may have been saved meanwhile
+/// (a Stop writes `node_wanted`). Start from what is saved now and apply only the keys this request changed
+/// (`patched` against `before`, the settings the request started from).
+fn merge_after_wipe(now: &ConsoleSettings, before: &ConsoleSettings, patched: ConsoleSettings) -> ConsoleSettings {
+    let (Ok(Value::Object(mut now_v)), Ok(Value::Object(before_v)), Ok(Value::Object(patched_v))) =
+        (serde_json::to_value(now), serde_json::to_value(before), serde_json::to_value(&patched))
+    else {
+        return patched;
+    };
+    for (k, v) in &patched_v {
+        if before_v.get(k) != Some(v) {
+            now_v.insert(k.clone(), v.clone());
+        }
+    }
+    for k in before_v.keys() {
+        if !patched_v.contains_key(k) {
+            now_v.remove(k);
+        }
+    }
+    serde_json::from_value(Value::Object(now_v)).unwrap_or(patched)
+}
+
 /// Apply a patch to `console.json`. Returns `(http status, body)`.
 pub async fn patch_settings(state: &Shared, body: &Value) -> (u16, Value) {
+    let (state, body) = (state.clone(), body.clone());
+    run_to_completion(async move { patch_settings_inner(&state, &body).await }).await
+}
+
+async fn patch_settings_inner(state: &Shared, body: &Value) -> (u16, Value) {
     let Some(obj) = body.as_object() else {
         return err(400, "Send a JSON object.");
     };
     let mut g = state.write().await;
+    if !g.console.wiping.is_empty() {
+        return err(409, crate::agent::WIPING_MSG);
+    }
     let active = node_is_active(&g.console);
     let mut s = g.console.settings.clone();
+    let before = s.clone();
     let before_rpc = g.console.initial_rpc();
     let mut needs_stopped = false;
+    let confirm_wipe = obj.get("confirm_wipe").and_then(Value::as_bool).unwrap_or(false);
+    let mut prune = PruneOutcome::default();
+    // Pruning changes are judged after the loop, against the data folder this patch leaves in force.
+    let mut prune_changes: Vec<(&'static Network, Option<u64>, Option<u64>)> = Vec::new();
 
     for (k, v) in obj {
         match k.as_str() {
@@ -1097,6 +1535,47 @@ pub async fn patch_settings(state: &Shared, body: &Value) -> (u16, Value) {
                     return err(400, "assume_valid must be \"default\", \"off\", a block height or a block hash.");
                 }
             }
+            "assume_valid_by_network" => {
+                let Some(map) = v.as_object() else {
+                    return err(400, "assume_valid_by_network must map network ids to a value (or null to remove it).");
+                };
+                // A patch: listed networks change, the others keep their entry; `null` removes one.
+                let mut out = s.assume_valid_by_network.clone();
+                for (id, val) in map {
+                    let Some(n) = networks::by_id(id) else {
+                        return err(400, format!("assume_valid_by_network: unknown network \"{id}\"."));
+                    };
+                    if val.is_null() {
+                        out.remove(n.id);
+                    } else if let Some(a) = parse_assume_valid(val) {
+                        out.insert(n.id.to_string(), a);
+                    } else {
+                        return err(400, format!("assume_valid_by_network.{id} {ASSUME_VALID_MSG}"));
+                    }
+                }
+                s.assume_valid_by_network = out;
+            }
+            "prune_by_network" => {
+                let Some(map) = v.as_object() else {
+                    return err(400, "prune_by_network must map network ids to a number of blocks (or null to keep every block).");
+                };
+                // A patch: listed networks change, the others keep their entry; `null` removes one.
+                let mut out = s.prune_by_network.clone();
+                for (id, val) in map {
+                    let Some(n) = networks::by_id(id) else {
+                        return err(400, format!("prune_by_network: unknown network \"{id}\"."));
+                    };
+                    let Some(new) = parse_prune(val) else {
+                        return err(400, prune_range_msg(&format!("prune_by_network.{id}")));
+                    };
+                    prune_changes.push((n, g.console.settings.prune_for(n.id), new));
+                    match new {
+                        Some(k) => out.insert(n.id.to_string(), k),
+                        None => out.remove(n.id),
+                    };
+                }
+                s.prune_by_network = out;
+            }
             "child_env" => {
                 let Some(map) = v.as_object().filter(|m| m.len() <= 64) else {
                     return err(400, "child_env must map variable names to values.");
@@ -1116,11 +1595,32 @@ pub async fn patch_settings(state: &Shared, body: &Value) -> (u16, Value) {
             _ => {}
         }
     }
+    // The data folder after this patch (a patch that moves it and removes pruning is judged on the new one).
+    let new_root = settings::resolve_in(&s, &g.console.env, g.console.exe_dir.as_deref(), g.console.facts).data_root;
+    for (n, old, new) in prune_changes {
+        if let Err(refusal) = plan_prune_change(&new_root, n, old, new, confirm_wipe, &mut prune) {
+            return refusal;
+        }
+    }
     if needs_stopped && active {
         return err(409, "Stop the node first, then change this setting.");
     }
     if needs_stopped && g.console.job_active() {
         return err(409, JOB_RUNNING);
+    }
+    // Deleting chain data needs the node stopped (and no install or update running).
+    if !prune.wipe.is_empty() && active {
+        return err(409, crate::agent::STOP_FIRST_MSG);
+    }
+    if !prune.wipe.is_empty() && g.console.job_active() {
+        return err(409, JOB_RUNNING);
+    }
+    // With the agent in another container that has gone quiet nobody can say whether a node runs, and what is
+    // written now would be carried out when the agent returns (the node on the new network, folder or program).
+    if needs_stopped || !prune.wipe.is_empty() {
+        if let Some(msg) = g.console.agent.as_ref().and_then(Agent::quiet_refusal) {
+            return err(409, msg);
+        }
     }
     // A crashed node waiting for its automatic restart counts as idle above, but it must not come back
     // on the new network, folder or binary: the change cancels the pending restart (S1 of the review).
@@ -1129,18 +1629,45 @@ pub async fn patch_settings(state: &Shared, body: &Value) -> (u16, Value) {
             a.abandon_restart();
         }
     }
+    if !prune.wipe.is_empty() {
+        // Cancel a pending restart, look again that no node exists, mark the wipe; then delete without the
+        // console's lock (a status poll must not wait for the delete) and finish with the lock again.
+        if let Err(refusal) = begin_wipe(&mut g.console, &prune.wipe) {
+            return refusal;
+        }
+        let guard = WipeGuard::new(state, &new_root, &prune.wipe);
+        drop(g);
+        let result = wipe_all(&new_root, &prune.wipe).await;
+        g = state.write().await;
+        #[cfg(test)]
+        if PANIC_AFTER_WIPE.lock().unwrap().contains(&new_root) {
+            panic!("test: the wipe section unwinds");
+        }
+        guard.finish(&mut g);
+        if let Err(refusal) = result {
+            return refusal;
+        }
+        s = merge_after_wipe(&g.console.settings, &before, s);
+    }
 
     g.console.settings = s;
     if let Err(e) = g.console.save() {
         return err(500, format!("Could not save settings: {e}"));
     }
     g.console.reresolve();
+    // An agent in another container reads `desired.json` when it starts a node by itself (after a crash or a
+    // restart of its container): a saved value has to be in it already, but the running node is not restarted.
+    if let Some(a) = &g.console.agent {
+        a.sync_desired();
+    }
     let after_rpc = g.console.initial_rpc();
     if after_rpc != before_rpc {
         g.switch_rpc(after_rpc);
     }
     stamp_power(&mut g);
-    (200, settings_json(&g.console))
+    let mut body = settings_json(&g.console);
+    prune.add_to(&mut body);
+    (200, body)
 }
 
 // ---- POST /api/setup ------------------------------------------------------------------------
@@ -1148,6 +1675,11 @@ pub async fn patch_settings(state: &Shared, body: &Value) -> (u16, Value) {
 /// The wizard's result. Validates, writes `console.json`, creates the folders, and starts the node
 /// only when asked to. A network is required for managed mode; there is no default.
 pub async fn setup(state: &Shared, body: &Value) -> (u16, Value) {
+    let (state, body) = (state.clone(), body.clone());
+    run_to_completion(async move { setup_inner(&state, &body).await }).await
+}
+
+async fn setup_inner(state: &Shared, body: &Value) -> (u16, Value) {
     let Some(obj) = body.as_object() else {
         return err(400, "Send a JSON object.");
     };
@@ -1164,6 +1696,9 @@ pub async fn setup(state: &Shared, body: &Value) -> (u16, Value) {
     if g.console.eff.env_locked.contains(&"mode") && mode != g.console.eff.mode {
         return err(409, MODE_LOCKED);
     }
+    if !g.console.wiping.is_empty() {
+        return err(409, crate::agent::WIPING_MSG);
+    }
     if node_is_active(&g.console) {
         return err(409, "Stop the node before running setup again.");
     }
@@ -1171,7 +1706,11 @@ pub async fn setup(state: &Shared, body: &Value) -> (u16, Value) {
         return err(409, JOB_RUNNING);
     }
     let before_rpc = g.console.initial_rpc();
+    let confirm_wipe = obj.get("confirm_wipe").and_then(Value::as_bool).unwrap_or(false);
+    let mut prune = PruneOutcome::default();
+    let mut wipe_root: Option<PathBuf> = None;
     let mut s = g.console.settings.clone();
+    let before = s.clone();
     s.mode = Some(mode.as_str().into());
     s.setup_done = true;
     if let Some(b) = stop_on_exit {
@@ -1224,6 +1763,36 @@ pub async fn setup(state: &Shared, body: &Value) -> (u16, Value) {
                     None => return err(400, "node_bin must be a string."),
                 }
             }
+            // Assume-valid for the chosen network ("default", "off" or a height; `null` clears the entry).
+            match obj.get("assume_valid") {
+                None => {}
+                Some(Value::Null) => {
+                    s.assume_valid_by_network.remove(net.id);
+                }
+                Some(v) => match parse_assume_valid(v) {
+                    Some(a) => {
+                        s.assume_valid_by_network.insert(net.id.to_string(), a);
+                    }
+                    None => return err(400, format!("assume_valid {ASSUME_VALID_MSG}")),
+                },
+            }
+            // Block pruning for the chosen network: `null` keeps every block, a number keeps the newest blocks.
+            // Left out: unchanged. The same rules as the Settings page apply to chain data already on disk.
+            if let Some(v) = obj.get("prune_keep_blocks") {
+                let Some(new) = parse_prune(v) else {
+                    return err(400, prune_range_msg("prune_keep_blocks"));
+                };
+                let root = settings::resolve_in(&s, &g.console.env, g.console.exe_dir.as_deref(), g.console.facts).data_root;
+                let old = s.prune_for(net.id);
+                if let Err(refusal) = plan_prune_change(&root, net, old, new, confirm_wipe, &mut prune) {
+                    return refusal;
+                }
+                match new {
+                    Some(k) => s.prune_by_network.insert(net.id.to_string(), k),
+                    None => s.prune_by_network.remove(net.id),
+                };
+                wipe_root = Some(root);
+            }
             if let Some(list) = obj.get("modules").and_then(Value::as_array) {
                 s.modules_selected = list
                     .iter()
@@ -1260,16 +1829,51 @@ pub async fn setup(state: &Shared, body: &Value) -> (u16, Value) {
         }
     }
 
+    // A quiet agent in another container (see `patch_settings`): another network, folder or program, or a
+    // wipe, has to wait until it answers.
+    if mode == Mode::Managed
+        && (s.network != before.network || s.data_root != before.data_root || s.node_bin != before.node_bin || !prune.wipe.is_empty())
+    {
+        if let Some(msg) = g.console.agent.as_ref().and_then(Agent::quiet_refusal) {
+            return err(409, msg);
+        }
+    }
     // The wizard decides what runs now: a pending automatic restart after a crash must not start a node
     // the user just said not to start (or on another network). Starting is done below, on request.
     if let Some(a) = &g.console.agent {
         a.abandon_restart();
+    }
+    if let (false, Some(root)) = (prune.wipe.is_empty(), &wipe_root) {
+        // Same order as in `patch_settings`: look again that no node exists, delete without the lock.
+        if let Err(refusal) = begin_wipe(&mut g.console, &prune.wipe) {
+            return refusal;
+        }
+        let guard = WipeGuard::new(state, root, &prune.wipe);
+        drop(g);
+        let result = wipe_all(root, &prune.wipe).await;
+        g = state.write().await;
+        #[cfg(test)]
+        if PANIC_AFTER_WIPE.lock().unwrap().contains(root) {
+            panic!("test: the wipe section unwinds");
+        }
+        guard.finish(&mut g);
+        if let Err(refusal) = result {
+            return refusal;
+        }
+        s = merge_after_wipe(&g.console.settings, &before, s);
     }
     g.console.settings = s;
     if let Err(e) = g.console.save() {
         return err(500, format!("Could not save settings: {e}"));
     }
     g.console.reresolve();
+    // A setup that does not start the node still has to reach an agent in another container (see
+    // `patch_settings`); a start writes `desired.json` itself.
+    if !start {
+        if let Some(a) = &g.console.agent {
+            a.sync_desired();
+        }
+    }
     let after_rpc = g.console.initial_rpc();
     if after_rpc != before_rpc {
         g.switch_rpc(after_rpc);
@@ -1292,10 +1896,12 @@ pub async fn setup(state: &Shared, body: &Value) -> (u16, Value) {
     let mut g = state.write().await;
     stamp_power(&mut g);
     let status = serde_json::to_value(&g.snapshot).unwrap_or(Value::Null);
-    match start_error {
-        None => (200, json!({ "ok": true, "status": status })),
-        Some(e) => (200, json!({ "ok": false, "error": e, "status": status })),
-    }
+    let mut body = match start_error {
+        None => json!({ "ok": true, "status": status }),
+        Some(e) => json!({ "ok": false, "error": e, "status": status }),
+    };
+    prune.add_to(&mut body);
+    (200, body)
 }
 
 // ---- POST /api/setup/test -------------------------------------------------------------------
@@ -1351,9 +1957,9 @@ pub async fn remember_wanted(state: &Shared, wanted: bool) {
 /// `start | stop | restart | toggle` (and the legacy `on | off`). Returns at once; the process state
 /// in the status shows `starting` / `stopping` until it settles.
 pub async fn node_action(state: &Shared, action: &str) -> NodeOutcome {
-    let (agent, has_network, switching) = {
+    let (agent, has_network, switching, wiping) = {
         let g = state.read().await;
-        (g.console.agent.clone(), g.console.network().is_some(), g.console.switch_active())
+        (g.console.agent.clone(), g.console.network().is_some(), g.console.switch_active(), !g.console.wiping.is_empty())
     };
     let fail = |m: &str| NodeOutcome { ok: false, message: String::new(), error: Some(m.to_string()) };
     let Some(agent) = agent else {
@@ -1361,6 +1967,9 @@ pub async fn node_action(state: &Shared, action: &str) -> NodeOutcome {
     };
     if switching {
         return fail("A network switch is running. Wait for it to finish.");
+    }
+    if wiping && action != "stop" && action != "off" {
+        return fail(crate::agent::WIPING_MSG);
     }
     if state.read().await.console.job_active() {
         return fail("The node is being installed or updated. Wait for that to finish.");
@@ -1439,7 +2048,7 @@ pub async fn node_action(state: &Shared, action: &str) -> NodeOutcome {
 
 /// What GitHub says is newest, what is installed, and whether this console may install (design F).
 pub async fn releases_json(state: &Shared, force: bool) -> Value {
-    let (cache, channel, platform, record, pinned, managed, has_program) = {
+    let (cache, channel, platform, record, pinned, managed, has_program, facts) = {
         let g = state.read().await;
         let c = &g.console;
         // Is there a node program at all (here, or in the node container)? "Custom" is a program the installer
@@ -1454,10 +2063,11 @@ pub async fn releases_json(state: &Shared, force: bool) -> Value {
             c.env.node_bin.is_some(),
             c.is_managed(),
             has_program,
+            c.node_facts(),
         )
     };
     let fetched = cache.get(force).await;
-    releases::info_json(&releases::InfoInputs {
+    let mut v = releases::info_json(&releases::InfoInputs {
         managed,
         channel: &channel,
         platform: &platform,
@@ -1465,7 +2075,15 @@ pub async fn releases_json(state: &Shared, force: bool) -> Value {
         custom: record.is_none() && has_program,
         bin_pinned_by_env: pinned,
         fetched: &fetched,
-    })
+    });
+    // Whether the official release can start on the computer that would run the node (16 KB memory pages: no).
+    // `can_install` stays as it is: the page shows the warning and holds the download back.
+    if let Some(o) = v.as_object_mut() {
+        o.insert("runs_here".into(), json!(facts.runs_here));
+        o.insert("runs_here_reason".into(), json!(facts.reason));
+        o.insert("page_size".into(), json!(facts.page_size));
+    }
+    v
 }
 
 // ---- GET /api/node/logs ---------------------------------------------------------------------
@@ -1701,6 +2319,443 @@ mod tests {
             crate::agent::testkit::rpc_of(&f.state, "signet").await,
             "polling follows the network"
         );
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn assume_valid_is_set_per_network_validated_and_resolved_into_the_agent_config() {
+        let f = fixture("avmap", managed_env(), true);
+        let (code, v) = patch_settings(&f.state, &json!({"network":"regtest"})).await;
+        assert_eq!(code, 200, "{v}");
+
+        // The three read-only fields of the settings.
+        assert_eq!(v["assume_valid_by_network"], json!({}));
+        assert_eq!(v["assume_valid_defaults"]["mainnet"], json!({"height": 912683, "forced_off": false}));
+        assert_eq!(v["assume_valid_defaults"]["testnet"], json!({"height": 4550000, "forced_off": false}));
+        assert_eq!(v["assume_valid_defaults"]["signet"], json!({"height": 267665, "forced_off": false}));
+        assert_eq!(v["assume_valid_defaults"]["testnet4"], json!({"height": 0, "forced_off": true}));
+        assert_eq!(v["assume_valid_defaults"]["regtest"], json!({"height": 0, "forced_off": true}));
+        assert_eq!(v["assume_valid_effective"], json!({"network":"regtest","value":null,"argv":["--noassumevalid"]}));
+
+        // Refused: not an object, an unknown network, a bad value. The message names the culprit; nothing is saved.
+        let before = settings::load_console(&f.dir.join("state"));
+        for (bad, names) in [
+            (json!({"assume_valid_by_network":"800000"}), "assume_valid_by_network"),
+            (json!({"assume_valid_by_network":{"narnia":"800000"}}), "narnia"),
+            (json!({"assume_valid_by_network":{"mainnet":"maybe"}}), "mainnet"),
+            (json!({"assume_valid_by_network":{"mainnet":"1234567890"}}), "mainnet"),
+            (json!({"assume_valid_by_network":{"mainnet":800000}}), "mainnet"),
+            (json!({"assume_valid_by_network":{"signet":"1","mainnet":"x"}}), "mainnet"),
+            // A block hash is only read from older files and the older global key: the node's hash form skips nothing.
+            (json!({"assume_valid_by_network":{"mainnet":"ab".repeat(32)}}), "mainnet"),
+            (json!({"assume_valid_by_network":{"signet":"1","mainnet":"AB".repeat(32)}}), "mainnet"),
+        ] {
+            let (code, v) = patch_settings(&f.state, &bad).await;
+            assert_eq!(code, 400, "{bad} -> {v}");
+            assert!(v["error"].as_str().unwrap().contains(names), "{bad} -> {v}");
+        }
+        assert_eq!(settings::load_console(&f.dir.join("state")), before, "a rejected patch changed nothing");
+        // The older global key still takes a hash (files and scripts from before), and the card reads it back.
+        let hash = "ab".repeat(32);
+        let (code, v) = patch_settings(&f.state, &json!({"assume_valid": hash})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["assume_valid"], json!(hash));
+        let (code, v) = patch_settings(&f.state, &json!({"assume_valid": null})).await;
+        assert_eq!(code, 200, "{v}");
+        let before = settings::load_console(&f.dir.join("state"));
+
+        // The node reads BLVM_ASSUME_VALID_HEIGHT after the command line: the effective block says so.
+        assert!(v["assume_valid_effective"].get("overridden_by_env").is_none(), "{v}");
+        let (code, v) = patch_settings(&f.state, &json!({"child_env":{"BLVM_ASSUME_VALID_HEIGHT":"5"}})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["assume_valid_effective"]["overridden_by_env"], json!(true), "{v}");
+        assert!(v["assume_valid_effective"]["note"].as_str().unwrap().contains("BLVM_ASSUME_VALID_HEIGHT"), "{v}");
+        assert_eq!(v["assume_valid_effective"]["argv"], json!(["--noassumevalid"]), "the argv is still what the console passes");
+        let (code, v) = patch_settings(&f.state, &json!({"child_env":{}})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v["assume_valid_effective"].get("overridden_by_env").is_none(), "{v}");
+        assert_eq!(settings::load_console(&f.dir.join("state")), before);
+
+        // Saved, resolved into the agent's config for that network only, and no node needs to be stopped.
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        agent.start().await.unwrap();
+        let (code, v) = patch_settings(&f.state, &json!({"assume_valid_by_network":{"mainnet":"800000","regtest":"off"}})).await;
+        assert_eq!(code, 200, "a running node does not block this setting: {v}");
+        assert_eq!(v["assume_valid_by_network"], json!({"mainnet":"800000","regtest":"off"}));
+        assert_eq!(v["assume_valid_effective"], json!({"network":"regtest","value":"off","argv":["--noassumevalid"]}));
+        let saved = settings::load_console(&f.dir.join("state"));
+        assert_eq!(saved.assume_valid_by_network.get("mainnet").map(String::as_str), Some("800000"));
+        {
+            let g = f.state.read().await;
+            let cfg = |id| g.console.agent_config_for(networks::by_id(id));
+            assert_eq!(cfg("mainnet").assume_valid.as_deref(), Some("800000"));
+            assert_eq!(cfg("regtest").assume_valid.as_deref(), Some("off"));
+            assert_eq!(cfg("signet").assume_valid, None, "no entry and no global: the network's default");
+            assert_eq!(g.console.agent_config().assume_valid.as_deref(), Some("off"), "the current network's own value");
+        }
+        assert_eq!(agent.config().assume_valid.as_deref(), Some("off"), "the agent has it for its next start");
+
+        // A patch only touches the networks it names; `null` removes an entry; the global one is the fallback.
+        let (code, v) = patch_settings(&f.state, &json!({"assume_valid_by_network":{"mainnet":null,"signet":"270000"},"assume_valid":"700000"})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["assume_valid_by_network"], json!({"regtest":"off","signet":"270000"}));
+        {
+            let g = f.state.read().await;
+            let cfg = |id| g.console.agent_config_for(networks::by_id(id));
+            assert_eq!(cfg("mainnet").assume_valid.as_deref(), Some("700000"), "removed entry: the global value");
+            assert_eq!(cfg("regtest").assume_valid.as_deref(), Some("off"), "an entry beats the global value");
+        }
+        let (code, v) = patch_settings(&f.state, &json!({"assume_valid_by_network":{"regtest":null}})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["assume_valid_effective"], json!({"network":"regtest","value":"700000","argv":["--assumevalid","700000"]}));
+        agent.stop_and_wait().await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The Network and Settings pages print the port the node listens on. With the agent in another container
+    /// that is the one the Umbrel app gave it through `BLVM_AGENT_P2P_PORT_<NET>`; everywhere else the network's own.
+    #[tokio::test]
+    async fn settings_and_network_rows_carry_the_p2p_port() {
+        let _lock = networks::P2P_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for n in networks::ALL.iter() {
+            std::env::remove_var(networks::p2p_env_name(n));
+        }
+        let defaults = json!({"mainnet":8333,"testnet4":48333,"testnet":18333,"signet":38333,"regtest":18444});
+        let external = || Console::load(None, EnvOverrides { mode: Some("managed".into()), agent_external: true, ..Default::default() }, None);
+        let in_process = || Console::load(None, managed_env(), None);
+        let rows = |c: &Console| {
+            let agent = c.agent.clone().unwrap();
+            let v = serde_json::to_value(managed_view(c, agent.view(), &agent, None)).unwrap();
+            v["networks"].as_array().unwrap().iter().map(|r| (r["id"].as_str().unwrap().to_string(), r["p2p_port"].clone())).collect::<Vec<_>>()
+        };
+        let default_rows: Vec<(String, Value)> = defaults.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let sorted = |mut r: Vec<(String, Value)>| {
+            r.sort_by(|a, b| a.0.cmp(&b.0));
+            r
+        };
+
+        // Nothing set: the networks' own ports, in the settings and in every row.
+        assert_eq!(settings_json(&external())["p2p_ports"], defaults);
+        assert_eq!(sorted(rows(&external())), sorted(default_rows.clone()));
+        assert_eq!(rows(&external())[0], ("mainnet".to_string(), json!(8333)), "rows keep the table's order");
+
+        // The Umbrel app moves mainnet (and only what it names); garbage is ignored.
+        std::env::set_var("BLVM_AGENT_P2P_PORT_MAINNET", "8334");
+        std::env::set_var("BLVM_AGENT_P2P_PORT_SIGNET", "nope");
+        let mut moved = defaults.clone();
+        moved["mainnet"] = json!(8334);
+        let c = external();
+        assert_eq!(settings_json(&c)["p2p_ports"], moved);
+        let mut want = default_rows.clone();
+        want[0].1 = json!(8334);
+        assert_eq!(sorted(rows(&c)), sorted(want));
+        // A console that starts its node itself does not move it: the variable is the agent's.
+        let c = in_process();
+        assert_eq!(settings_json(&c)["p2p_ports"], defaults);
+        assert_eq!(sorted(rows(&c)), sorted(default_rows));
+        std::env::remove_var("BLVM_AGENT_P2P_PORT_MAINNET");
+        std::env::remove_var("BLVM_AGENT_P2P_PORT_SIGNET");
+    }
+
+    #[tokio::test]
+    async fn setup_stores_assume_valid_under_the_chosen_network() {
+        let f = fixture("avsetup", managed_env(), true);
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","assume_valid":"800000"})).await;
+        assert_eq!(code, 200, "{v}");
+        let saved = settings::load_console(&f.dir.join("state"));
+        assert_eq!(saved.assume_valid_by_network.get("regtest").map(String::as_str), Some("800000"));
+        assert_eq!(saved.assume_valid, None, "the global setting is not touched");
+        {
+            let g = f.state.read().await;
+            assert_eq!(g.console.agent_config().assume_valid.as_deref(), Some("800000"));
+        }
+
+        // A bad value is refused and saves nothing.
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","assume_valid":"maybe"})).await;
+        assert_eq!(code, 400, "{v}");
+        assert_eq!(settings::load_console(&f.dir.join("state")), saved);
+        // A block hash is refused here as well (only the older global key takes one).
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","assume_valid":"ab".repeat(32)})).await;
+        assert_eq!(code, 400, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("assume_valid"), "{v}");
+        assert_eq!(settings::load_console(&f.dir.join("state")), saved);
+
+        // Another network gets its own entry; "default" is stored (it beats a global setting); null clears.
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"signet","assume_valid":"default"})).await;
+        assert_eq!(code, 200, "{v}");
+        let now = settings::load_console(&f.dir.join("state"));
+        assert_eq!(now.assume_valid_by_network.get("regtest").map(String::as_str), Some("800000"));
+        assert_eq!(now.assume_valid_by_network.get("signet").map(String::as_str), Some("default"));
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"signet","assume_valid":null})).await;
+        assert_eq!(code, 200, "{v}");
+        let now = settings::load_console(&f.dir.join("state"));
+        assert!(!now.assume_valid_by_network.contains_key("signet"));
+        assert!(now.assume_valid_by_network.contains_key("regtest"));
+        // Left out: unchanged.
+        let (code, _) = setup(&f.state, &json!({"mode":"managed","network":"regtest"})).await;
+        assert_eq!(code, 200);
+        assert_eq!(settings::load_console(&f.dir.join("state")).assume_valid_by_network, now.assume_valid_by_network);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Put fake chain data and a `meta.json` under the regtest folder of `f`, as a node that has run pruned would.
+    fn chain_data_on_disk(f: &Fix) -> PathBuf {
+        chain_data_on_disk_ran(f, Some(true))
+    }
+
+    /// The same, with `ran_pruned` as given (`None`: a full store that no pruning node has ever touched).
+    fn chain_data_on_disk_ran(f: &Fix, ran_pruned: Option<bool>) -> PathBuf {
+        let net = networks::by_id("regtest").unwrap();
+        let root = f.dir.join("root");
+        let dir = networks::dir(&root, net);
+        std::fs::create_dir_all(dir.join("data/heed3")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(dir.join("data/heed3/data.mdb"), vec![7u8; 4096]).unwrap();
+        std::fs::write(dir.join("blvm.toml"), "keep me").unwrap();
+        std::fs::write(dir.join("logs/node.log"), "keep me too").unwrap();
+        networks::write_meta(&root, net, &networks::Meta { created: Some(5), last_used: Some(6), last_height: Some(900), last_header: Some(901), ran_pruned }).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn pruning_is_set_per_network_validated_and_resolved_into_the_agent_config() {
+        let f = fixture("prunemap", managed_env(), true);
+        let (code, v) = patch_settings(&f.state, &json!({"network":"regtest"})).await;
+        assert_eq!(code, 200, "{v}");
+
+        // The read-only fields of the settings.
+        assert_eq!(v["prune_by_network"], json!({}));
+        assert_eq!(v["prune_min_blocks"], json!(288));
+        assert_eq!(v["prune_effective"], json!({"network":"regtest","keep_blocks":null,"has_data":false,"has_pruned_data":false}));
+
+        // Refused: not an object, an unknown network, below the minimum, above the maximum, not a whole number.
+        // Nothing is saved, and the message names the culprit.
+        let before = settings::load_console(&f.dir.join("state"));
+        for (bad, names) in [
+            (json!({"prune_by_network":"5000"}), "prune_by_network"),
+            (json!({"prune_by_network":{"narnia":5000}}), "narnia"),
+            (json!({"prune_by_network":{"mainnet":100}}), "mainnet"),
+            (json!({"prune_by_network":{"mainnet":287}}), "mainnet"),
+            (json!({"prune_by_network":{"mainnet":0}}), "mainnet"),
+            (json!({"prune_by_network":{"mainnet":100_000_001u64}}), "mainnet"),
+            (json!({"prune_by_network":{"mainnet":300.5}}), "mainnet"),
+            (json!({"prune_by_network":{"mainnet":"5000"}}), "mainnet"),
+            (json!({"prune_by_network":{"mainnet":-5}}), "mainnet"),
+            (json!({"prune_by_network":{"signet":5000,"mainnet":287}}), "mainnet"),
+        ] {
+            let (code, v) = patch_settings(&f.state, &bad).await;
+            assert_eq!(code, 400, "{bad} -> {v}");
+            assert!(v["error"].as_str().unwrap().contains(names), "{bad} -> {v}");
+        }
+        assert_eq!(settings::load_console(&f.dir.join("state")), before, "a rejected patch changed nothing");
+
+        // 288 and 100 million are the edges that work. No node needs to be stopped for it.
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        agent.start().await.unwrap();
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"mainnet":100_000_000u64,"regtest":288}})).await;
+        assert_eq!(code, 200, "a running node does not block this setting: {v}");
+        assert_eq!(v["prune_by_network"], json!({"mainnet":100_000_000u64,"regtest":288}));
+        assert_eq!(v["prune_effective"], json!({"network":"regtest","keep_blocks":288,"has_data":false,"has_pruned_data":false}));
+        assert!(v.get("warning").is_none(), "no chain data, nothing to convert: {v}");
+        let saved = settings::load_console(&f.dir.join("state"));
+        assert_eq!(saved.prune_by_network.get("regtest"), Some(&288));
+        {
+            let g = f.state.read().await;
+            let cfg = |id| g.console.agent_config_for(networks::by_id(id));
+            assert_eq!(cfg("regtest").prune_keep_blocks, Some(288));
+            assert_eq!(cfg("mainnet").prune_keep_blocks, Some(100_000_000));
+            assert_eq!(cfg("signet").prune_keep_blocks, None, "no entry: every block");
+            assert_eq!(g.console.agent_config().prune_keep_blocks, Some(288), "the current network's own value");
+            assert_eq!(g.console.agent_config_for(None).prune_keep_blocks, None);
+        }
+        assert_eq!(agent.config().prune_keep_blocks, Some(288), "the agent has it for its next start");
+
+        // The status carries the per-network setting too (the Settings page's Storage list).
+        {
+            let mut g = f.state.write().await;
+            stamp_power(&mut g);
+            let rows = &g.snapshot.managed.as_ref().unwrap().networks;
+            assert_eq!(rows.iter().find(|r| r.id == "regtest").unwrap().prune_keep_blocks, Some(288));
+            assert_eq!(rows.iter().find(|r| r.id == "signet").unwrap().prune_keep_blocks, None);
+            assert!(g.snapshot.pruning.enabled && g.snapshot.pruning.keep_blocks == Some(288));
+        }
+
+        // A patch only touches the networks it names; null removes an entry (no chain data: no questions).
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"mainnet":null,"signet":1000}})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["prune_by_network"], json!({"regtest":288,"signet":1000}));
+        agent.stop_and_wait().await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn going_from_pruned_back_to_a_full_node_with_chain_data_needs_a_confirmed_wipe() {
+        let f = fixture("prunewipe", managed_env(), true);
+        let (code, v) = patch_settings(&f.state, &json!({"network":"regtest","prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200, "{v}");
+        let net_dir = chain_data_on_disk(&f);
+        // The live folder decides, not the cached sizes.
+        let (_, v) = patch_settings(&f.state, &json!({})).await;
+        assert_eq!(v["prune_effective"]["has_data"], json!(true), "{v}");
+
+        // Refused without the confirmation, with the machine-readable reason, and nothing changes.
+        let before = settings::load_console(&f.dir.join("state"));
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null}})).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(v["needs"], json!("wipe"), "{v}");
+        assert!(v["error"].as_str().unwrap().contains("Regtest"), "{v}");
+        assert_eq!(settings::load_console(&f.dir.join("state")), before);
+        assert!(net_dir.join("data/heed3/data.mdb").is_file(), "nothing was deleted");
+        // Confirming without a removal does nothing.
+        let (code, v) = patch_settings(&f.state, &json!({"confirm_wipe":true,"show_logs":true})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(net_dir.join("data/heed3/data.mdb").is_file());
+
+        // Confirmed, but the node runs: stop it first. Still nothing deleted, nothing saved.
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        agent.start().await.unwrap();
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await;
+        assert_eq!(code, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("Stop the node first"), "{v}");
+        assert!(net_dir.join("data/heed3/data.mdb").is_file(), "a running node's data is never deleted");
+        assert_eq!(settings::load_console(&f.dir.join("state")).prune_for("regtest"), Some(300));
+        agent.stop_and_wait().await;
+
+        // Stopped and confirmed: the chain data goes, and only the chain data. Heights are forgotten, the setting is saved.
+        // (The start above wrote `blvm.toml` and the log; whatever they hold now must survive.)
+        let toml_before = std::fs::read_to_string(net_dir.join("blvm.toml")).unwrap();
+        let log_before = std::fs::read_to_string(net_dir.join("logs/node.log")).unwrap();
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists(), "the data folder is gone");
+        assert_eq!(std::fs::read_to_string(net_dir.join("blvm.toml")).unwrap(), toml_before);
+        assert_eq!(std::fs::read_to_string(net_dir.join("logs/node.log")).unwrap(), log_before);
+        let meta = networks::read_meta(&f.dir.join("root"), networks::by_id("regtest").unwrap()).unwrap();
+        // `created` and `last_used` stay (the node ran in between and refreshed the latter); the heights are forgotten.
+        assert_eq!((meta.created, meta.last_height, meta.last_header), (Some(5), None, None));
+        assert!(meta.last_used.is_some());
+        assert_eq!(v["prune_by_network"], json!({}));
+        assert_eq!(v["prune_effective"], json!({"network":"regtest","keep_blocks":null,"has_data":false,"has_pruned_data":false}));
+        assert_eq!(settings::load_console(&f.dir.join("state")).prune_for("regtest"), None);
+        {
+            let g = f.state.read().await;
+            assert_eq!(g.console.agent_config().prune_keep_blocks, None);
+        }
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn adding_or_lowering_pruning_over_chain_data_warns_and_raising_it_only_notes() {
+        let f = fixture("prunewarn", managed_env(), true);
+        let (code, _) = patch_settings(&f.state, &json!({"network":"regtest"})).await;
+        assert_eq!(code, 200);
+        chain_data_on_disk(&f);
+
+        // Switching pruning on over an existing store: allowed, with the warning about the slow conversion.
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":10_000}})).await;
+        assert_eq!(code, 200, "{v}");
+        let w = v["warning"].as_str().unwrap();
+        assert!(w.starts_with("The node converts the existing store on its next start"), "{w}");
+        assert!(w.contains("does not answer meanwhile") && w.contains("Minutes on Testnet4, possibly hours on mainnet."), "{w}");
+        assert!(v.get("note").is_none());
+        assert_eq!(settings::load_console(&f.dir.join("state")).prune_for("regtest"), Some(10_000), "saved all the same");
+
+        // Lowering it: the same warning.
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":2_000}})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v["warning"].as_str().unwrap().contains("converts the existing store"), "{v}");
+
+        // Raising it: no warning, a note that deleted blocks stay deleted.
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":5_000}})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v.get("warning").is_none(), "{v}");
+        assert!(v["note"].as_str().unwrap().contains("do not come back"), "{v}");
+
+        // The same value again, or any other setting: neither.
+        let (_, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":5_000}})).await;
+        assert!(v.get("warning").is_none() && v.get("note").is_none(), "{v}");
+        let (_, v) = patch_settings(&f.state, &json!({"show_logs":true})).await;
+        assert!(v.get("warning").is_none() && v.get("note").is_none(), "{v}");
+
+        // Without chain data there is nothing to convert: no warning for a network that has none.
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"signet":1_000}})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v.get("warning").is_none(), "{v}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn setup_stores_the_pruning_choice_under_the_chosen_network_with_the_same_guards() {
+        let f = fixture("prunesetup", managed_env(), true);
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","prune_keep_blocks":5000})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v.get("warning").is_none(), "{v}");
+        let saved = settings::load_console(&f.dir.join("state"));
+        assert_eq!(saved.prune_by_network.get("regtest"), Some(&5000));
+        {
+            let g = f.state.read().await;
+            assert_eq!(g.console.agent_config().prune_keep_blocks, Some(5000));
+        }
+
+        // Bad values are refused and save nothing (including a missing network entry for a network that has none).
+        for bad in [json!(100), json!(287), json!("5000"), json!(1.5), json!(100_000_001u64)] {
+            let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"signet","prune_keep_blocks":bad})).await;
+            assert_eq!(code, 400, "{bad} -> {v}");
+            assert!(v["error"].as_str().unwrap().contains("prune_keep_blocks"), "{v}");
+        }
+        assert_eq!(settings::load_console(&f.dir.join("state")).prune_by_network, saved.prune_by_network);
+
+        // Left out: unchanged. Another network gets its own entry. null removes the entry (no data: allowed).
+        let (code, _) = setup(&f.state, &json!({"mode":"managed","network":"regtest"})).await;
+        assert_eq!(code, 200);
+        assert_eq!(settings::load_console(&f.dir.join("state")).prune_by_network, saved.prune_by_network);
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"signet","prune_keep_blocks":288})).await;
+        assert_eq!(code, 200, "{v}");
+        let now = settings::load_console(&f.dir.join("state"));
+        assert_eq!(now.prune_by_network.get("signet"), Some(&288));
+        assert_eq!(now.prune_by_network.get("regtest"), Some(&5000));
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"signet","prune_keep_blocks":null})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!settings::load_console(&f.dir.join("state")).prune_by_network.contains_key("signet"));
+
+        // A re-run over chain data: switching pruning on warns; back to a full node is refused until confirmed.
+        let net_dir = chain_data_on_disk(&f);
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","prune_keep_blocks":1000})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v["warning"].as_str().unwrap().contains("converts the existing store"), "{v}");
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","prune_keep_blocks":null})).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(v["needs"], json!("wipe"));
+        assert_eq!(settings::load_console(&f.dir.join("state")).prune_for("regtest"), Some(1000));
+        assert!(net_dir.join("data/heed3/data.mdb").is_file());
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","prune_keep_blocks":null,"confirm_wipe":true})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists());
+        assert_eq!(settings::load_console(&f.dir.join("state")).prune_for("regtest"), None);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn a_node_started_through_the_console_gets_the_pruning_block_in_its_config() {
+        let f = fixture("prune-start", managed_env(), true);
+        let (code, v) = patch_settings(&f.state, &json!({"network":"regtest","prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200, "{v}");
+        let out = node_action(&f.state, "start").await;
+        assert!(out.ok, "{out:?}");
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        for _ in 0..200 {
+            if agent.logs(None, 50).iter().any(|l| l.text.starts_with("up")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let file = f.dir.join("root/networks/regtest/blvm.toml");
+        let toml = std::fs::read_to_string(&file).unwrap();
+        assert!(toml.contains("[storage.pruning]\nauto_prune = true\n") && toml.contains("min_recent_blocks = 300\n"), "{toml}");
+        assert!(toml.contains("[rpc_auth]\nrequired = true"), "the generated login is there too: {toml}");
+        let log: String = agent.logs(None, 200).into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("--config ./blvm.toml"), "{log}");
+        agent.stop_and_wait().await;
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
@@ -1964,9 +3019,17 @@ mod tests {
     const CRASHER: &str = "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'blvm 9.9.9'; exit 0; fi\necho \"up in $(pwd)\"\nsleep 0.3\nexit 3\n";
 
     async fn crash_once_on_regtest(tag: &str) -> Fix {
+        crash_once_on_regtest_pruned(tag, None).await
+    }
+
+    /// The same, with block pruning set for regtest before the node starts (so the start records `ran_pruned`).
+    async fn crash_once_on_regtest_pruned(tag: &str, prune: Option<u64>) -> Fix {
         let f = fixture(tag, managed_env(), true);
         std::fs::write(f.dir.join("fake-blvm.sh"), CRASHER).unwrap();
-        let (code, _) = patch_settings(&f.state, &json!({"network":"regtest"})).await;
+        let (code, _) = match prune {
+            Some(k) => patch_settings(&f.state, &json!({"network":"regtest","prune_by_network":{"regtest":k}})).await,
+            None => patch_settings(&f.state, &json!({"network":"regtest"})).await,
+        };
         assert_eq!(code, 200);
         assert!(node_action(&f.state, "start").await.ok);
         let agent = f.state.read().await.console.agent.clone().unwrap();
@@ -2701,9 +3764,11 @@ mod tests {
             network: Some(regtest),
             rpc_addr: Some(rpc.clone()),
             assume_valid: None,
+            prune_keep_blocks: None,
             child_env: stub_env,
             rpc_auth: None,
             p2p_port: Some(p2p),
+            p2p_listen_port: None,
         };
         let old_agent = Agent::new(old_cfg.clone(), Timings::default());
         old_agent.start().await.unwrap();
@@ -2947,5 +4012,864 @@ mod tests {
         assert!(m.agent.alive);
         assert_eq!(m.process.state, ProcState::Running);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- fixes for the pruning review (S1, S2, N2, N3, N7, N10) ----
+
+    fn regtest() -> &'static Network {
+        networks::by_id("regtest").unwrap()
+    }
+
+    /// A pending automatic restart after a crash must not survive a wipe: the wipe cancels it first, deletes, and
+    /// the node never comes back on the deleted data. The start that recorded `ran_pruned` is what makes the
+    /// removal of the setting a wipe at all.
+    #[tokio::test]
+    async fn s1_a_pending_crash_restart_is_cancelled_before_the_chain_data_is_deleted() {
+        let f = crash_once_on_regtest_pruned("f-s1-timer", Some(300)).await;
+        let root = f.dir.join("root");
+        let net_dir = networks::dir(&root, regtest());
+        assert_eq!(networks::read_meta(&root, regtest()).unwrap().ran_pruned, Some(true), "the start recorded it");
+        std::fs::create_dir_all(net_dir.join("data/heed3")).unwrap();
+        std::fs::write(net_dir.join("data/heed3/data.mdb"), vec![7u8; 4096]).unwrap();
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        assert_eq!(agent.state(), ProcState::Crashed);
+        let starts = || std::fs::read_to_string(net_dir.join("logs/node.log")).unwrap_or_default().matches("[console] starting").count();
+        assert_eq!(starts(), 1);
+
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists());
+        // Past the 5 s backoff: the cancelled restart did not run, so nothing was started on (or created in) the folder.
+        tokio::time::sleep(Duration::from_millis(6500)).await;
+        assert!(!agent.state().is_active(), "{:?}", agent.view());
+        assert_eq!(starts(), 1, "no second start");
+        assert!(!net_dir.join("data").exists(), "the data folder was not recreated by a node");
+        assert_eq!(networks::read_meta(&root, regtest()).unwrap().ran_pruned, None, "the wipe clears it");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// While chain data is being deleted nothing may start a node, not even a restart that is already queued.
+    #[tokio::test]
+    async fn s1_no_start_of_any_kind_while_the_hold_is_on_and_a_queued_restart_stays_down() {
+        let f = crash_once_on_regtest("f-s1-hold").await;
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        agent.hold_starts(true);
+        assert_eq!(agent.start().await.unwrap_err(), crate::agent::WIPING_MSG);
+        assert_eq!(agent.restart().await.unwrap_err(), crate::agent::WIPING_MSG);
+        let out = {
+            f.state.write().await.console.wiping.insert("regtest");
+            node_action(&f.state, "start").await
+        };
+        assert_eq!(out.error.as_deref(), Some(crate::agent::WIPING_MSG));
+        // The timer fires (5 s) and finds the hold: still crashed, nothing running.
+        tokio::time::sleep(Duration::from_millis(6500)).await;
+        assert_eq!(agent.state(), ProcState::Crashed, "{:?}", agent.view());
+        // A status poll and the settings page are not blocked, and say what is going on.
+        {
+            let mut g = f.state.write().await;
+            stamp_power(&mut g);
+            let row = g.snapshot.managed.as_ref().unwrap().networks.iter().find(|r| r.id == "regtest").unwrap().clone();
+            assert!(row.wiping);
+        }
+        let (code, v) = patch_settings(&f.state, &json!({"show_logs":true})).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(v["error"], json!(crate::agent::WIPING_MSG));
+        let (code, _) = setup(&f.state, &json!({"mode":"managed","network":"regtest"})).await;
+        assert_eq!(code, 409);
+        // Let go: the node can be started again.
+        f.state.write().await.console.wiping.clear();
+        agent.hold_starts(false);
+        assert!(node_action(&f.state, "start").await.ok);
+        agent.stop_and_wait().await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The delete runs without the console's lock: between the two halves of a wipe the state can be read and
+    /// written, and the row says `wiping`.
+    #[tokio::test]
+    async fn n7_the_console_is_not_locked_while_the_chain_data_is_deleted() {
+        let f = fixture("f-n7", managed_env(), true);
+        let (code, _) = patch_settings(&f.state, &json!({"network":"regtest","prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200);
+        let net_dir = chain_data_on_disk(&f);
+        let root = f.dir.join("root");
+        {
+            let mut g = f.state.write().await;
+            begin_wipe(&mut g.console, &[regtest()]).unwrap();
+            assert!(g.console.wiping.contains("regtest"));
+        } // lock released, as the delete runs
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut g = f.state.write().await;
+            stamp_power(&mut g);
+            g.snapshot.managed.clone().unwrap()
+        })
+        .await
+        .expect("a status poll does not wait for the delete");
+        assert!(status.networks.iter().find(|r| r.id == "regtest").unwrap().wiping);
+        wipe_all(&root, &[regtest()]).await.unwrap();
+        assert!(!net_dir.join("data").exists());
+        {
+            let mut g = f.state.write().await;
+            end_wipe(&mut g, &root, &[regtest()]);
+            assert!(g.console.wiping.is_empty());
+            stamp_power(&mut g);
+            assert!(!g.snapshot.managed.as_ref().unwrap().networks.iter().find(|r| r.id == "regtest").unwrap().wiping);
+        }
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// With the agent in another container the console cannot see the process: it needs a fresh heartbeat and a
+    /// `state.json` that has caught up with its last request.
+    #[tokio::test]
+    async fn s1_in_external_mode_a_wipe_needs_a_live_agent_that_has_confirmed_the_stop() {
+        let dir = std::env::temp_dir().join(format!("blvm-f-s1-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        let env = EnvOverrides { mode: Some("managed".into()), agent_external: true, data_root: Some(root.display().to_string()), ..Default::default() };
+        let state = shared(load_in(&dir, env));
+        let (code, v) = patch_settings(&state, &json!({"network":"regtest","prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200, "{v}");
+        let net_dir = networks::dir(&root, regtest());
+        std::fs::create_dir_all(net_dir.join("data/heed3")).unwrap();
+        std::fs::write(net_dir.join("data/heed3/data.mdb"), vec![7u8; 4096]).unwrap();
+        networks::write_meta(&root, regtest(), &networks::Meta { ran_pruned: Some(true), ..Default::default() }).unwrap();
+        let wipe = json!({"prune_by_network":{"regtest":null},"confirm_wipe":true});
+        let state_file = |heartbeat: u64, generation: u64, st: &str| {
+            let f = control::StateFile { heartbeat, generation, state: st.into(), ..Default::default() };
+            control::write_state(&root, &f).unwrap();
+        };
+        let settle = || tokio::time::sleep(Duration::from_millis(300)); // (state.json is cached for 200 ms)
+        let now = || crate::persist::unix_now();
+
+        // No agent has ever written: the console cannot tell whether a node runs.
+        let (code, v) = patch_settings(&state, &wipe).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(v["error"], json!("The node agent is not answering; try again when it is back."));
+        assert!(net_dir.join("data/heed3/data.mdb").is_file());
+
+        // A heartbeat that went stale says "stopped" too, but nobody vouches for it: the node may be running.
+        state_file(now() - 120, 0, "stopped");
+        settle().await;
+        let (code, v) = patch_settings(&state, &wipe).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(v["error"], json!("The node agent is not answering; try again when it is back."));
+        assert!(net_dir.join("data/heed3/data.mdb").is_file());
+        assert_eq!(settings::load_console(&dir.join("state")).prune_for("regtest"), Some(300), "nothing saved");
+        // The refusal asked the node for nothing: for a silent agent "crashed" is only a guess, and a request to
+        // stay off would stop a running node when the agent comes back.
+        assert!(control::read_desired(&root).is_none(), "desired.json was not written");
+
+        // Alive, but the agent has not dealt with the console's last request (start, then stop: generation 2).
+        let agent = state.read().await.console.agent.clone().unwrap();
+        agent.start().await.unwrap();
+        agent.request_stop();
+        state_file(now(), 0, "stopped");
+        settle().await;
+        let (code, v) = patch_settings(&state, &wipe).await;
+        assert_eq!(code, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("Stop the node first"), "{v}");
+        assert!(net_dir.join("data/heed3/data.mdb").is_file());
+
+        // The agent runs the node: refused as before.
+        state_file(now(), 2, "running");
+        settle().await;
+        let (code, _) = patch_settings(&state, &wipe).await;
+        assert_eq!(code, 409);
+
+        // Alive, caught up, stopped: the chain data goes.
+        state_file(now(), 2, "stopped");
+        settle().await;
+        let (code, v) = patch_settings(&state, &wipe).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists());
+        assert_eq!(settings::load_console(&dir.join("state")).prune_for("regtest"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pruning setting that was saved and never used leaves a full store untouched: taking it back is a plain
+    /// save. Once a node has been started pruned on the folder, going back to a full node needs the wipe.
+    #[tokio::test]
+    async fn s2_taking_back_a_pruning_setting_that_never_ran_is_a_plain_save() {
+        let f = fixture("f-s2", managed_env(), true);
+        let (code, v) = patch_settings(&f.state, &json!({"network":"regtest","prune_by_network":{"regtest":5_000}})).await;
+        assert_eq!(code, 200, "{v}");
+        let net_dir = chain_data_on_disk_ran(&f, None); // a full store: no pruning node ever ran on it
+        let (_, v) = patch_settings(&f.state, &json!({})).await;
+        assert_eq!(v["prune_effective"]["has_data"], json!(true), "{v}");
+        assert_eq!(v["prune_effective"]["has_pruned_data"], json!(false), "{v}");
+
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null}})).await;
+        assert_eq!(code, 200, "no question asked: {v}");
+        assert!(v.get("needs").is_none() && v.get("warning").is_none(), "{v}");
+        assert!(net_dir.join("data/heed3/data.mdb").is_file(), "the full store is untouched");
+        assert_eq!(settings::load_console(&f.dir.join("state")).prune_for("regtest"), None);
+        assert_eq!(v["prune_effective"]["has_pruned_data"], json!(false));
+
+        // The same through the wizard.
+        let (code, _) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":5_000}})).await;
+        assert_eq!(code, 200);
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","prune_keep_blocks":null})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(net_dir.join("data/heed3/data.mdb").is_file());
+
+        // Now a node is started with pruning on: the folder records it, and the way back needs the wipe.
+        let (code, _) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200);
+        assert!(node_action(&f.state, "start").await.ok);
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        agent.stop_and_wait().await;
+        let root = f.dir.join("root");
+        assert_eq!(networks::read_meta(&root, regtest()).unwrap().ran_pruned, Some(true));
+        let (_, v) = patch_settings(&f.state, &json!({})).await;
+        assert_eq!(v["prune_effective"]["has_pruned_data"], json!(true), "{v}");
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null}})).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(v["needs"], json!("wipe"));
+        let (code, v) = setup(&f.state, &json!({"mode":"managed","network":"regtest","prune_keep_blocks":null})).await;
+        assert_eq!(code, 409, "{v}");
+        assert!(net_dir.join("data/heed3/data.mdb").is_file());
+
+        // A node started without pruning does not clear it; only the wipe does.
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists());
+        assert_eq!(networks::read_meta(&root, regtest()).unwrap().ran_pruned, None);
+        assert_eq!(v["prune_effective"]["has_pruned_data"], json!(false));
+        assert!(node_action(&f.state, "start").await.ok);
+        agent.stop_and_wait().await;
+        assert_eq!(networks::read_meta(&root, regtest()).unwrap().ran_pruned, None, "an unpruned start leaves it unset");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// After the wipe the console forgets what it knew of that chain: the table row, the heights of the status.
+    #[tokio::test]
+    async fn n3_after_a_wipe_no_old_heights_are_shown() {
+        let f = fixture("f-n3", managed_env(), true);
+        let (code, _) = patch_settings(&f.state, &json!({"network":"regtest","prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200);
+        let root = f.dir.join("root");
+        chain_data_on_disk(&f); // meta.json says last_height 900 / last_header 901
+        {
+            let mut g = f.state.write().await;
+            let job = g.console.disk_job().expect("a measurement is due");
+            run_disk_job(job.0, job.1);
+            g.snapshot.local_height = 863;
+            g.snapshot.network_height = 863;
+            g.snapshot.feed = vec![crate::feed::FeedItem::block(863)];
+            stamp_power(&mut g);
+            let row = g.snapshot.managed.as_ref().unwrap().networks.iter().find(|r| r.id == "regtest").unwrap().clone();
+            assert_eq!((row.last_height, row.has_data), (Some(900), true));
+        }
+        let (code, v) = patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await;
+        assert_eq!(code, 200, "{v}");
+        let mut g = f.state.write().await;
+        stamp_power(&mut g);
+        let row = g.snapshot.managed.as_ref().unwrap().networks.iter().find(|r| r.id == "regtest").unwrap().clone();
+        assert_eq!((row.last_height, row.has_data), (None, false), "the table row is fresh at once");
+        assert_eq!((g.snapshot.local_height, g.snapshot.network_height), (0, 0));
+        assert!(g.snapshot.feed.is_empty());
+        let meta = networks::read_meta(&root, regtest()).unwrap();
+        assert_eq!((meta.last_height, meta.last_header), (None, None));
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The node's own answer about pruning counts only while it answers.
+    #[tokio::test]
+    async fn n2_nothing_the_node_said_about_pruning_survives_its_stop() {
+        let f = fixture("f-n2", managed_env(), true);
+        let (code, _) = patch_settings(&f.state, &json!({"network":"regtest","prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200);
+        {
+            let mut g = f.state.write().await;
+            // A parked answer from when the node ran: pruned, keeping 300.
+            g.snapshot.connected = true;
+            g.snapshot.pruning.node_reports_pruned = Some(true);
+            g.snapshot.pruning.node_enabled = Some(true);
+            g.snapshot.pruning.node_keep_blocks = Some(300);
+            g.snapshot.pruning.pending_restart = true;
+            // The node is not running (no process, nothing answers): the next status has no memory of it.
+            g.snapshot.connected = false;
+            stamp_power(&mut g);
+            let p = &g.snapshot.pruning;
+            assert_eq!((p.node_reports_pruned, p.node_enabled, p.node_keep_blocks, p.pending_restart), (None, None, None, false));
+            assert_eq!((p.enabled, p.keep_blocks), (true, Some(300)));
+        }
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// One patch that moves the data folder and removes pruning is judged against the NEW folder.
+    #[tokio::test]
+    async fn n10_a_patch_that_moves_the_data_folder_is_judged_on_the_new_one() {
+        let dir = std::env::temp_dir().join(format!("blvm-f-n10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("fake-blvm.sh");
+        std::fs::write(&bin, FAKE).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (a, b) = (dir.join("rootA"), dir.join("rootB"));
+        let env = EnvOverrides { mode: Some("managed".into()), node_bin: Some(bin.display().to_string()), ..Default::default() };
+        let state = shared(load_in(&dir, env));
+        let (code, v) = patch_settings(&state, &json!({"data_root": a.display().to_string(), "network":"regtest","prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200, "{v}");
+        let put = |root: &Path, ran: Option<bool>| {
+            let d = networks::dir(root, regtest());
+            std::fs::create_dir_all(d.join("data/heed3")).unwrap();
+            std::fs::write(d.join("data/heed3/data.mdb"), vec![7u8; 4096]).unwrap();
+            networks::write_meta(root, regtest(), &networks::Meta { ran_pruned: ran, ..Default::default() }).unwrap();
+            d
+        };
+        // Old folder: pruned data. New folder: empty. The setting is saved, and the old folder is left alone.
+        let a_dir = put(&a, Some(true));
+        let (code, v) = patch_settings(&state, &json!({"data_root": b.display().to_string(), "prune_by_network":{"regtest":null}})).await;
+        assert_eq!(code, 200, "nothing to wipe in the new folder: {v}");
+        assert!(a_dir.join("data/heed3/data.mdb").is_file(), "the old folder was not touched");
+        assert_eq!(settings::load_console(&dir.join("state")).prune_for("regtest"), None);
+        assert_eq!(state.read().await.console.eff.data_root, b);
+
+        // The other way round: the folder moved to has pruned data, the one left has none. Refused until confirmed.
+        let (code, _) = patch_settings(&state, &json!({"prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200);
+        let b_dir = put(&b, Some(true));
+        std::fs::remove_dir_all(a_dir.join("data")).unwrap();
+        let (code, _) = patch_settings(&state, &json!({"data_root": a.display().to_string()})).await;
+        assert_eq!(code, 200);
+        let (code, _) = patch_settings(&state, &json!({"prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200);
+        let (code, v) = patch_settings(&state, &json!({"data_root": b.display().to_string(), "prune_by_network":{"regtest":null}})).await;
+        assert_eq!(code, 409, "the new folder holds pruned data: {v}");
+        assert_eq!(v["needs"], json!("wipe"));
+        assert!(b_dir.join("data/heed3/data.mdb").is_file());
+        assert_eq!(state.read().await.console.eff.data_root, a, "nothing changed");
+        let (code, v) = patch_settings(&state, &json!({"data_root": b.display().to_string(), "prune_by_network":{"regtest":null},"confirm_wipe":true})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!b_dir.join("data").exists(), "the NEW folder's data was wiped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- memory page size: the official release does not start on 16 KB kernels (Raspberry Pi 5) ----
+
+    fn offline_releases() -> Arc<releases::Cache> {
+        releases::Cache::new(releases::Source { api_url: "http://127.0.0.1:1/api".into(), https_only: false, ..Default::default() })
+    }
+
+    #[tokio::test]
+    async fn in_process_a_16k_kernel_is_reported_by_the_releases_route_and_refuses_the_install_with_409() {
+        let dir = std::env::temp_dir().join(format!("blvm-pagesize-inproc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let env = EnvOverrides { mode: Some("managed".into()), data_root: Some(dir.join("root").display().to_string()), ..Default::default() };
+        let mut c = load_in(&dir, env);
+        c.platform_override = Some("linux-aarch64".into());
+        c.page_size_override = Some(16384);
+        c.releases = offline_releases();
+        let state = shared(c);
+
+        let v = releases_json(&state, false).await;
+        assert_eq!((v["runs_here"].clone(), v["page_size"].clone()), (json!(false), json!(16384)), "{v}");
+        let why = v["runs_here_reason"].as_str().unwrap();
+        assert_eq!(why, sysinfo::page_size_message(Some(16384)));
+        assert!(why.starts_with("This device uses 16 KB memory pages.") && why.contains("kernel=kernel8.img"), "{why}");
+
+        // The install is refused before any release is looked up (the release server here is unreachable).
+        let (code, v) = installer::begin(&state, installer::Kind::Install, None).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!((v["ok"].clone(), v["code"].as_str()), (json!(false), Some("page_size")));
+        assert_eq!(v["error"].as_str().unwrap(), why);
+        let (code, v) = installer::begin(&state, installer::Kind::Update, Some("v0.1.61")).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(state.read().await.console.job.lock().unwrap().phase, "idle", "no job was started");
+
+        // The status carries the page size, labelled.
+        {
+            let mut g = state.write().await;
+            stamp_power(&mut g);
+        }
+        let st = serde_json::to_value(&state.read().await.snapshot).unwrap();
+        let p = &st["managed"]["platform"];
+        assert_eq!((p["page_size"].clone(), p["node_page_size"].clone(), p["runs_here"].clone()), (json!(16384), json!(16384), json!(false)), "{p}");
+        assert_eq!(p["agent"], Value::Null, "the node runs in this process");
+
+        // 4 KB pages (any other platform too): nothing in the way. A pretended 16 KB on x86_64 or macOS is no problem either.
+        for (platform, page) in [("linux-aarch64", 4096u64), ("linux-x86_64", 16384), ("unsupported", 16384)] {
+            let mut g = state.write().await;
+            g.console.platform_override = Some(platform.into());
+            g.console.page_size_override = Some(page);
+            drop(g);
+            let v = releases_json(&state, false).await;
+            assert_eq!((v["runs_here"].clone(), v["runs_here_reason"].clone()), (json!(true), Value::Null), "{platform} {page}");
+            assert_eq!(v["page_size"], json!(page));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn on_umbrel_the_agents_page_size_from_state_json_decides() {
+        let dir = std::env::temp_dir().join(format!("blvm-pagesize-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        let env = EnvOverrides { mode: Some("managed".into()), agent_external: true, data_root: Some(root.display().to_string()), ..Default::default() };
+        let mut c = load_in(&dir, env);
+        // This container sees 4 KB (or nothing); the node container says 16 KB: the node's computer decides.
+        c.platform_override = Some("linux-aarch64".into());
+        c.page_size_override = Some(4096);
+        c.releases = offline_releases();
+        let state = shared(c);
+        let write = |platform: Option<sysinfo::Facts>| {
+            control::write_state(&root, &control::StateFile { heartbeat: crate::persist::unix_now(), binary_found: false, platform, ..Default::default() }).unwrap();
+        };
+
+        // An agent from before this check wrote nothing: this process's own facts are used.
+        write(None);
+        let v = releases_json(&state, false).await;
+        assert_eq!((v["runs_here"].clone(), v["page_size"].clone()), (json!(true), json!(4096)), "{v}");
+
+        write(Some(sysinfo::Facts::for_page("linux-aarch64", Some(16384))));
+        tokio::time::sleep(Duration::from_millis(300)).await; // (state.json is cached for 200 ms)
+        let v = releases_json(&state, false).await;
+        assert_eq!((v["runs_here"].clone(), v["page_size"].clone()), (json!(false), json!(16384)), "{v}");
+        assert_eq!(v["runs_here_reason"].as_str().unwrap(), sysinfo::page_size_message(Some(16384)));
+        let (code, v) = installer::begin(&state, installer::Kind::Install, None).await;
+        assert_eq!((code, v["code"].as_str()), (409, Some("page_size")), "{v}");
+        assert!(v["error"].as_str().unwrap().contains("16 KB memory pages"));
+
+        {
+            let mut g = state.write().await;
+            stamp_power(&mut g);
+        }
+        let st = serde_json::to_value(&state.read().await.snapshot).unwrap();
+        let p = &st["managed"]["platform"];
+        assert_eq!(p["page_size"], json!(4096), "the console's own page size is labelled separately");
+        assert_eq!((p["node_page_size"].clone(), p["runs_here"].clone()), (json!(16384), json!(false)), "{p}");
+        assert_eq!((p["agent"]["page_size"].clone(), p["agent"]["runs_here"].clone()), (json!(16384), json!(false)), "{p}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ---- fix pass 3 (re-review: B1, S1-S3, N1-N4, N7) ----
+
+    /// A pruned store with a node that is not running, ready for a confirmed wipe.
+    async fn pruned_regtest_store(tag: &str) -> (Fix, PathBuf) {
+        let f = fixture(tag, managed_env(), true);
+        let (code, _) = patch_settings(&f.state, &json!({"network":"regtest","prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200);
+        let net_dir = chain_data_on_disk(&f);
+        (f, net_dir)
+    }
+
+    async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+        let end = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < end {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// B1: hyper drops the handler's future when the client goes away. A wipe request dropped while the data is
+    /// being deleted must still end the wipe: starts allowed again, the setting saved, `ran_pruned` cleared.
+    /// (Without the spawned task the console refused everything with "being deleted" until it was restarted.)
+    #[tokio::test]
+    async fn b1_a_wipe_request_that_is_dropped_mid_delete_still_finishes() {
+        let (f, net_dir) = pruned_regtest_store("f3-b1").await;
+        let root = f.dir.join("root");
+        SLOW_WIPE.lock().unwrap().insert(root.clone(), Duration::from_millis(1200));
+        let st = f.state.clone();
+        let r = tokio::time::timeout(Duration::from_millis(300), async move {
+            patch_settings(&st, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await
+        })
+        .await;
+        assert!(r.is_err(), "the request future was dropped mid-delete (the client went away)");
+        assert!(!f.state.read().await.console.wiping.is_empty(), "the delete is still running");
+        // The request is gone; the work is not.
+        let state = f.state.clone();
+        let mut done = false;
+        let end = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < end && !done {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            done = state.read().await.console.wiping.is_empty();
+        }
+        SLOW_WIPE.lock().unwrap().remove(&root);
+        assert!(done, "WEDGE: wiping is still set after the request went away");
+        assert!(!net_dir.join("data").exists(), "the delete finished");
+        // The setting is saved (it needs the lock the task takes last: look until it is there).
+        wait_until("the full-node choice is saved", || settings::load_console(&f.dir.join("state")).prune_for("regtest").is_none()).await;
+        assert_eq!(networks::read_meta(&root, regtest()).unwrap().ran_pruned, None, "ran_pruned cleared");
+        assert_eq!(f.state.read().await.console.settings.prune_for("regtest"), None);
+        // Starts are allowed again, and so is everything else.
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        assert!(agent.start().await.is_ok(), "hold_starts released");
+        agent.stop_and_wait().await;
+        let (code, v) = patch_settings(&f.state, &json!({"show_logs":true})).await;
+        assert_eq!(code, 200, "{v}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// N2: a Stop during the delete (allowed while wiping) writes `node_wanted`; the save after the delete must
+    /// not put the old value back.
+    #[tokio::test]
+    async fn n2_a_stop_during_the_delete_survives_the_save_after_it() {
+        let (f, net_dir) = pruned_regtest_store("f3-n2").await;
+        let root = f.dir.join("root");
+        remember_wanted(&f.state, true).await;
+        SLOW_WIPE.lock().unwrap().insert(root.clone(), Duration::from_millis(1000));
+        let st = f.state.clone();
+        let task = tokio::spawn(async move {
+            patch_settings(&st, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await
+        });
+        wait_until("the wipe has begun", || f.state.try_read().map(|g| !g.console.wiping.is_empty()).unwrap_or(false)).await;
+        let out = node_action(&f.state, "stop").await;
+        assert!(out.ok, "{out:?}");
+        let (code, v) = task.await.unwrap();
+        SLOW_WIPE.lock().unwrap().remove(&root);
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists());
+        assert_eq!(f.state.read().await.console.settings.prune_for("regtest"), None, "this request's change is in");
+        assert_eq!(f.state.read().await.console.settings.node_wanted, Some(false), "the Stop is not undone");
+        assert_eq!(settings::load_console(&f.dir.join("state")).node_wanted, Some(false), "and it is on disk");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[test]
+    fn merging_after_a_wipe_applies_only_the_keys_the_request_changed() {
+        let before = ConsoleSettings { network: Some("regtest".into()), node_wanted: Some(true), show_logs: false, ..Default::default() };
+        let mut patched = before.clone();
+        patched.show_logs = true;
+        patched.prune_by_network.insert("regtest".into(), 300);
+        let now = ConsoleSettings { node_wanted: Some(false), ..before.clone() };
+        let merged = merge_after_wipe(&now, &before, patched);
+        assert_eq!(merged.node_wanted, Some(false), "what changed meanwhile stays");
+        assert!(merged.show_logs && merged.prune_by_network.get("regtest") == Some(&300), "what the request changed is applied");
+    }
+
+    /// A: no start of any kind while the hold is on: the log of the node shows exactly one start. (The 5 s
+    /// restart timer goes through `claim`; a claim that ignores the hold starts the node again.)
+    #[tokio::test]
+    async fn a_claim_under_the_hold_takes_no_slot_so_the_log_shows_one_start() {
+        let f = crash_once_on_regtest("f3-a-claim").await;
+        let root = f.dir.join("root");
+        let net_dir = networks::dir(&root, regtest());
+        let starts = || std::fs::read_to_string(net_dir.join("logs/node.log")).unwrap_or_default().matches("[console] starting").count();
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        assert_eq!(agent.state(), ProcState::Crashed);
+        let before = starts();
+        agent.hold_starts(true);
+        tokio::time::sleep(Duration::from_millis(6500)).await;
+        assert_eq!(starts(), before, "the restart timer fired into the hold and started nothing");
+        assert_eq!(agent.state(), ProcState::Crashed);
+        agent.hold_starts(false);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// An external-mode console over a data folder without an agent; the test plays the agent by writing
+    /// `state.json`.
+    struct ExtFix {
+        dir: PathBuf,
+        root: PathBuf,
+        state: Shared,
+    }
+
+    impl ExtFix {
+        async fn new(tag: &str) -> ExtFix {
+            let dir = std::env::temp_dir().join(format!("blvm-f3-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let root = dir.join("root");
+            let env = EnvOverrides { mode: Some("managed".into()), agent_external: true, data_root: Some(root.display().to_string()), ..Default::default() };
+            let state = shared(load_in(&dir, env));
+            let (code, v) = patch_settings(&state, &json!({"network":"regtest"})).await;
+            assert_eq!(code, 200, "{v}");
+            ExtFix { dir, root, state }
+        }
+
+        fn agent_wrote(&self, heartbeat: u64, generation: u64, st: &str) {
+            let f = control::StateFile { heartbeat, generation, state: st.into(), ..Default::default() };
+            control::write_state(&self.root, &f).unwrap();
+        }
+
+        fn desired(&self) -> control::Desired {
+            control::read_desired(&self.root).unwrap()
+        }
+
+        async fn agent(&self) -> Agent {
+            self.state.read().await.console.agent.clone().unwrap()
+        }
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(300)).await; // (state.json is cached for 200 ms)
+    }
+
+    /// N (managed level): a settings patch in external mode puts the new values into `desired.json`, with the
+    /// node's `running`, `restart_id` and `start_id` as they were. (Without `sync_desired` in `patch_settings`
+    /// the agent's own restart would use the old values.)
+    #[tokio::test]
+    async fn n_a_settings_patch_in_external_mode_rewrites_desired_json_with_the_new_values() {
+        let x = ExtFix::new("n").await;
+        let agent = x.agent().await;
+        agent.start().await.unwrap();
+        x.agent_wrote(crate::persist::unix_now(), 1, "running");
+        let d = x.desired();
+        assert_eq!((d.generation, d.running, d.assume_valid.clone(), d.prune_keep_blocks), (1, true, None, None));
+        let (code, v) = patch_settings(&x.state, &json!({"assume_valid_by_network":{"regtest":"800000"},"prune_by_network":{"regtest":1000}})).await;
+        assert_eq!(code, 200, "{v}");
+        let d2 = x.desired();
+        assert_eq!(d2.assume_valid.as_deref(), Some("800000"));
+        assert_eq!(d2.prune_keep_blocks, Some(1000));
+        assert_eq!((d2.generation, d2.running, d2.restart_id, d2.start_id), (2, true, d.restart_id, d.start_id), "settings only, node untouched");
+        let _ = std::fs::remove_dir_all(&x.dir);
+    }
+
+    /// J: a Save while the node is stopped must not ask for it to run.
+    #[tokio::test]
+    async fn j_a_save_while_the_node_is_stopped_leaves_running_false() {
+        let x = ExtFix::new("j").await;
+        let agent = x.agent().await;
+        agent.start().await.unwrap();
+        agent.request_stop();
+        x.agent_wrote(crate::persist::unix_now(), 2, "stopped");
+        let d = x.desired();
+        assert_eq!((d.generation, d.running), (2, false));
+        let (code, v) = patch_settings(&x.state, &json!({"assume_valid_by_network":{"regtest":"800000"}})).await;
+        assert_eq!(code, 200, "{v}");
+        let d2 = x.desired();
+        assert_eq!(d2.assume_valid.as_deref(), Some("800000"), "the value travels");
+        assert!(!d2.running, "but the node is not asked to run");
+        assert_eq!(d2.start_id, d.start_id);
+        let _ = std::fs::remove_dir_all(&x.dir);
+    }
+
+    /// S2: with the agent quiet (stale heartbeat) nobody can say whether a node runs, and a request written now
+    /// would be carried out when the agent returns: changes that need a stopped node wait. A plain Stop does not.
+    #[tokio::test]
+    async fn s2_a_quiet_agent_holds_back_every_change_that_needs_a_stopped_node() {
+        const MSG: &str = "The node agent is not answering; try again when it is back.";
+        let x = ExtFix::new("s2").await;
+        x.agent_wrote(crate::persist::unix_now() - 120, 0, "stopped");
+        settle().await;
+        for patch in [json!({"network":"signet"}), json!({"rpc_overrides":{"regtest":"127.0.0.1:19999"}})] {
+            let (code, v) = patch_settings(&x.state, &patch).await;
+            assert_eq!((code, v["error"].clone()), (409, json!(MSG)), "{patch}");
+        }
+        let (code, v) = setup(&x.state, &json!({"mode":"managed","network":"signet"})).await;
+        assert_eq!((code, v["error"].clone()), (409, json!(MSG)), "setup with another network");
+        assert!(control::read_desired(&x.root).is_none(), "nothing was written for the agent");
+        assert_eq!(settings::load_console(&x.dir.join("state")).network.as_deref(), Some("regtest"), "nothing saved");
+        // A change that needs no stopped node is a plain save.
+        let (code, v) = patch_settings(&x.state, &json!({"show_logs":true})).await;
+        assert_eq!(code, 200, "{v}");
+        // The same setup for the network it already has is not a move.
+        let (code, v) = setup(&x.state, &json!({"mode":"managed","network":"regtest"})).await;
+        assert_eq!(code, 200, "{v}");
+        // A plain Stop is still delivered.
+        let agent = x.agent().await;
+        agent.start().await.unwrap();
+        assert!(x.desired().running);
+        agent.request_stop();
+        assert!(!x.desired().running, "Stop reaches desired.json whatever the agent is doing");
+        // And the agent back: the change goes through.
+        x.agent_wrote(crate::persist::unix_now(), 2, "stopped");
+        settle().await;
+        let (code, v) = patch_settings(&x.state, &json!({"network":"signet"})).await;
+        assert_eq!(code, 200, "{v}");
+        let _ = std::fs::remove_dir_all(&x.dir);
+    }
+
+    /// N4: `state.json` says stopped and caught up, but `desired.json` still asks for the node (it exited by
+    /// itself): an agent that restarts would start it on the data being deleted. Refused until Stop.
+    #[tokio::test]
+    async fn n4_a_wipe_needs_desired_json_to_stop_asking_for_the_node() {
+        let x = ExtFix::new("n4").await;
+        let (code, v) = patch_settings(&x.state, &json!({"prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200, "{v}");
+        let net_dir = networks::dir(&x.root, regtest());
+        std::fs::create_dir_all(net_dir.join("data/heed3")).unwrap();
+        std::fs::write(net_dir.join("data/heed3/data.mdb"), vec![7u8; 4096]).unwrap();
+        networks::write_meta(&x.root, regtest(), &networks::Meta { ran_pruned: Some(true), ..Default::default() }).unwrap();
+        let wipe = json!({"prune_by_network":{"regtest":null},"confirm_wipe":true});
+        let agent = x.agent().await;
+        agent.start().await.unwrap();
+        x.agent_wrote(crate::persist::unix_now(), 1, "stopped"); // exited by itself; the file still says run
+        settle().await;
+        let (code, v) = patch_settings(&x.state, &wipe).await;
+        assert_eq!(code, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("Stop the node first"), "{v}");
+        assert!(net_dir.join("data/heed3/data.mdb").is_file());
+        // Stop, the agent deals with it: the wipe goes.
+        agent.request_stop();
+        x.agent_wrote(crate::persist::unix_now(), 2, "stopped");
+        settle().await;
+        let (code, v) = patch_settings(&x.state, &wipe).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists());
+        let _ = std::fs::remove_dir_all(&x.dir);
+    }
+
+    /// N7: a Save right before a wipe bumps the generation; the agent has not read it yet but has dealt with
+    /// the Stop before it, and a settings-only generation cannot start anything: the wipe does not have to wait.
+    #[tokio::test]
+    async fn n7_a_save_after_the_stop_does_not_hold_up_a_wipe() {
+        let x = ExtFix::new("n7").await;
+        let (code, _) = patch_settings(&x.state, &json!({"prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200);
+        let net_dir = networks::dir(&x.root, regtest());
+        std::fs::create_dir_all(net_dir.join("data/heed3")).unwrap();
+        std::fs::write(net_dir.join("data/heed3/data.mdb"), vec![7u8; 4096]).unwrap();
+        networks::write_meta(&x.root, regtest(), &networks::Meta { ran_pruned: Some(true), ..Default::default() }).unwrap();
+        let agent = x.agent().await;
+        agent.start().await.unwrap();
+        agent.request_stop();
+        x.agent_wrote(crate::persist::unix_now(), 2, "stopped");
+        let (code, v) = patch_settings(&x.state, &json!({"assume_valid_by_network":{"regtest":"800000"}})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(x.desired().generation, 3, "the save is a generation the agent has not read");
+        settle().await;
+        let (code, v) = patch_settings(&x.state, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists());
+        let _ = std::fs::remove_dir_all(&x.dir);
+    }
+
+    /// SF1a: the setup half of B1. A `/api/setup` request with `confirm_wipe` that is dropped in the middle of the
+    /// delete still finishes it (the page does not send `confirm_wipe` here today; the API takes it).
+    #[tokio::test]
+    async fn sf1a_a_setup_with_confirm_wipe_that_is_dropped_mid_delete_still_finishes() {
+        let (f, net_dir) = pruned_regtest_store("f4-sf1a").await;
+        let root = f.dir.join("root");
+        SLOW_WIPE.lock().unwrap().insert(root.clone(), Duration::from_millis(1200));
+        let st = f.state.clone();
+        let r = tokio::time::timeout(Duration::from_millis(300), async move {
+            setup(&st, &json!({"mode":"managed","network":"regtest","prune_keep_blocks":null,"confirm_wipe":true})).await
+        })
+        .await;
+        assert!(r.is_err(), "the request future was dropped mid-delete (the client went away)");
+        assert!(!f.state.read().await.console.wiping.is_empty(), "the delete is still running");
+        let state = f.state.clone();
+        let mut done = false;
+        let end = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < end && !done {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            done = state.read().await.console.wiping.is_empty();
+        }
+        SLOW_WIPE.lock().unwrap().remove(&root);
+        assert!(done, "WEDGE: wiping is still set after the setup request went away");
+        assert!(!net_dir.join("data").exists(), "the delete finished");
+        wait_until("the full-node choice is saved", || settings::load_console(&f.dir.join("state")).prune_for("regtest").is_none()).await;
+        assert_eq!(networks::read_meta(&root, regtest()).unwrap().ran_pruned, None, "ran_pruned cleared");
+        let agent = f.state.read().await.console.agent.clone().unwrap();
+        assert!(agent.start().await.is_ok(), "hold_starts released");
+        agent.stop_and_wait().await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// SF1b: the console asked for something (`desired.json` exists) and no agent ever wrote `state.json`: that is
+    /// "quiet" too, and a network change waits.
+    #[tokio::test]
+    async fn sf1b_an_agent_that_never_answered_holds_back_a_network_change() {
+        const MSG: &str = "The node agent is not answering; try again when it is back.";
+        let x = ExtFix::new("sf1b").await;
+        let agent = x.agent().await;
+        agent.start().await.unwrap();
+        agent.request_stop(); // (a node that is starting would answer "Stop the node first" before the agent check)
+        settle().await;
+        assert!(control::read_state(&x.root).is_none(), "no agent ever wrote state.json");
+        assert!(x.desired().generation > 0);
+        let (code, v) = patch_settings(&x.state, &json!({"network":"signet"})).await;
+        assert_eq!((code, v["error"].clone()), (409, json!(MSG)), "{v}");
+        let (code, v) = setup(&x.state, &json!({"mode":"managed","network":"signet"})).await;
+        assert_eq!((code, v["error"].clone()), (409, json!(MSG)), "{v}");
+        assert_eq!(settings::load_console(&x.dir.join("state")).network.as_deref(), Some("regtest"), "nothing saved");
+        // The very first setup (nothing asked of any agent yet) is not held back: see the first run.
+        let y = ExtFix::new("sf1b-first").await;
+        assert!(control::read_desired(&y.root).is_none());
+        let (code, v) = patch_settings(&y.state, &json!({"network":"signet"})).await;
+        assert_eq!(code, 200, "{v}");
+        let _ = std::fs::remove_dir_all(&x.dir);
+        let _ = std::fs::remove_dir_all(&y.dir);
+    }
+
+    /// SF1c: a console that starts over a folder where a Stop was written but the agent has not dealt with it
+    /// (`desired.generation` > `state.generation`) cannot know which generations were requests: a wipe waits. (A
+    /// `request_gen` of 0 after a restart of the console would let it through. With the agent in a crash backoff
+    /// the wipe waits anyway: `abandon_restart` in `begin_wipe` writes a new request first.)
+    #[tokio::test]
+    async fn sf1c_a_fresh_console_over_an_undealt_stop_does_not_wipe() {
+        let x = ExtFix::new("sf1c").await;
+        let (code, v) = patch_settings(&x.state, &json!({"prune_by_network":{"regtest":300}})).await;
+        assert_eq!(code, 200, "{v}");
+        let net_dir = networks::dir(&x.root, regtest());
+        std::fs::create_dir_all(net_dir.join("data/heed3")).unwrap();
+        std::fs::write(net_dir.join("data/heed3/data.mdb"), vec![7u8; 4096]).unwrap();
+        networks::write_meta(&x.root, regtest(), &networks::Meta { ran_pruned: Some(true), ..Default::default() }).unwrap();
+        let agent = x.agent().await;
+        agent.start().await.unwrap();
+        x.agent_wrote(crate::persist::unix_now(), 1, "stopped"); // the node exited by itself; desired.json still said run
+        agent.request_stop(); // generation 2, written; the agent has not read it yet
+        assert_eq!((x.desired().generation, x.desired().running), (2, false));
+        // The console restarts: a new `Ext` over the same folder.
+        let env = EnvOverrides { mode: Some("managed".into()), agent_external: true, data_root: Some(x.root.display().to_string()), ..Default::default() };
+        let fresh = shared(load_in(&x.dir, env));
+        settle().await;
+        let wipe = json!({"prune_by_network":{"regtest":null},"confirm_wipe":true});
+        let (code, v) = patch_settings(&fresh, &wipe).await;
+        assert_eq!(code, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("Stop the node first"), "{v}");
+        assert!(net_dir.join("data/heed3/data.mdb").is_file(), "nothing was deleted");
+        // The agent deals with the Stop: the wipe goes.
+        x.agent_wrote(crate::persist::unix_now(), 2, "stopped");
+        settle().await;
+        let (code, v) = patch_settings(&fresh, &wipe).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(!net_dir.join("data").exists());
+        let _ = std::fs::remove_dir_all(&x.dir);
+    }
+
+    /// N10: the network switch waits for a quiet agent, like every other change that needs a stopped node. (It
+    /// used to write Stop and Start, save the new network and show a failed switch at once.)
+    #[tokio::test]
+    async fn n10_a_network_switch_waits_for_a_quiet_agent() {
+        const MSG: &str = "The node agent is not answering; try again when it is back.";
+        let x = ExtFix::new("n10").await;
+        x.agent_wrote(crate::persist::unix_now() - 120, 0, "stopped");
+        settle().await;
+        let (code, v) = crate::switch::begin(&x.state, "signet").await;
+        assert_eq!((code, v["error"].clone()), (409, json!(MSG)), "{v}");
+        assert!(control::read_desired(&x.root).is_none(), "nothing was written for the agent");
+        assert!(x.state.read().await.console.switch.is_none(), "no switch was started");
+        assert_eq!(x.state.read().await.console.settings.network.as_deref(), Some("regtest"));
+        let _ = std::fs::remove_dir_all(&x.dir);
+    }
+
+    /// N6: if the section between `begin_wipe` and `end_wipe` unwinds, `wiping` is cleared and starts are allowed
+    /// again, with the request answered 500 and the setting not saved. (The test hook panics right after the delete.)
+    #[tokio::test]
+    async fn n6_a_wipe_section_that_unwinds_releases_the_hold() {
+        for via_setup in [false, true] {
+            let (f, net_dir) = pruned_regtest_store(if via_setup { "f4-n6-setup" } else { "f4-n6" }).await;
+            let root = f.dir.join("root");
+            PANIC_AFTER_WIPE.lock().unwrap().insert(root.clone());
+            let (code, v) = if via_setup {
+                setup(&f.state, &json!({"mode":"managed","network":"regtest","prune_keep_blocks":null,"confirm_wipe":true})).await
+            } else {
+                patch_settings(&f.state, &json!({"prune_by_network":{"regtest":null},"confirm_wipe":true})).await
+            };
+            PANIC_AFTER_WIPE.lock().unwrap().remove(&root);
+            assert_eq!(code, 500, "{v}");
+            assert!(v["error"].as_str().unwrap().starts_with("The request could not be completed"), "{v}");
+            // The release happens in a task of its own: look until it is there.
+            let state = f.state.clone();
+            let mut done = false;
+            let end = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < end && !done {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                done = state.read().await.console.wiping.is_empty();
+            }
+            assert!(done, "WEDGE: wiping is still set after the wipe section unwound (setup: {via_setup})");
+            assert!(!net_dir.join("data").exists(), "the delete itself had run");
+            assert_eq!(f.state.read().await.console.settings.prune_for("regtest"), Some(300), "the setting was not saved");
+            let agent = f.state.read().await.console.agent.clone().unwrap();
+            assert!(agent.start().await.is_ok(), "hold_starts released");
+            agent.stop_and_wait().await;
+            let (code, v) = patch_settings(&f.state, &json!({"show_logs":true})).await;
+            assert_eq!(code, 200, "{v}");
+            let _ = std::fs::remove_dir_all(&f.dir);
+        }
     }
 }

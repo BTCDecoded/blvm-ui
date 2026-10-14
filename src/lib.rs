@@ -17,3 +17,4 @@ pub mod settings;
 pub mod signals;
 pub mod state;
 pub mod switch;
+pub mod sysinfo;

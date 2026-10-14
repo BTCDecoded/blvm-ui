@@ -8,6 +8,7 @@
     empty = false,
     leaving = false,
     flow = false,
+    jump = 0,
   }: {
     item?: FeedItem | null;
     newest?: boolean;
@@ -15,6 +16,8 @@
     empty?: boolean;
     leaving?: boolean;
     flow?: boolean;
+    /** Blocks the tip moved since the previous tile (first sync): a small "+N" on the tile when more than 1. */
+    jump?: number;
   } = $props();
 
   const chunk = $derived(!!item && item.kind === "chunk" && item.start !== item.end);
@@ -38,6 +41,7 @@
         {:else}
           <span>{item.label}</span>
         {/if}
+        {#if jump > 1}<small class="iso-jump" title="The tip moved by {jump} blocks since the last tile">+{jump}</small>{/if}
       {/if}
     </div>
     {#if flow}
@@ -58,3 +62,24 @@
     {/if}
   </div>
 </div>
+
+<style>
+  /* "+N": the tip moved by N blocks between two polls (shown during the first sync, one tile per poll). */
+  .iso-jump {
+    margin-top: 0.3em;
+    border: 1px solid rgb(247 147 26 / 0.45);
+    border-radius: 999px;
+    padding: 0.05em 0.55em;
+    font-size: 0.62em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    line-height: 1.35;
+    color: var(--color-orange);
+    background: rgb(247 147 26 / 0.1);
+  }
+  :global(.iso.is-new) .iso-jump {
+    border-color: rgb(255 255 255 / 0.55);
+    color: #fff;
+    background: rgb(0 0 0 / 0.18);
+  }
+</style>

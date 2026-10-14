@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { getReleases, installNode, isMissing, jobRunning, normalizeJob, updateNode } from "./api";
   import { agoLabel, withV } from "./format";
   import Icon from "./Icon.svelte";
@@ -43,16 +43,22 @@
     return () => clearInterval(id);
   });
 
+  // `job` is a new object on every status poll; only a real phase change (a string) re-runs this, so a job
+  // that lingers as done/failed does not re-fetch the releases on every poll.
+  const jobPhase = $derived(job.phase);
   $effect(() => {
-    const j = job;
-    if (jobRunning(j)) {
-      sawRunning = true;
-      outcome = null;
-    } else if (j.phase === "done" || j.phase === "failed") {
-      if (sawRunning || !outcome) outcome = j;
-      sawRunning = false;
-      void load();
-    }
+    const phase = jobPhase;
+    untrack(() => {
+      const j = job;
+      if (jobRunning(j)) {
+        sawRunning = true;
+        outcome = null;
+      } else if (phase === "done" || phase === "failed") {
+        if (sawRunning || !outcome) outcome = j;
+        sawRunning = false;
+        void load();
+      }
+    });
   });
 
   const channel = $derived(rel?.channel ?? m.update.channel);
@@ -65,6 +71,9 @@
   const latestTag = $derived(rel?.latest?.tag ?? null);
   const noBinary = $derived(!installedTag && !m.node_version);
   const blocked = $derived(!!rel && !rel.can_install && !unsupported);
+  // The official release cannot start on this computer (16 KB memory pages, Raspberry Pi 5). Absent: yes.
+  const runsHere = $derived(rel?.runs_here !== false);
+  const noRunText = $derived(rel?.runs_here_reason || "The current official node release does not run on this computer.");
   const canAct = $derived(!!rel && rel.can_install && !!latestTag && !running && (rel.available || custom || noBinary));
 
   const chip = $derived.by(() => {
@@ -79,14 +88,15 @@
     return { health: "good", text: "Up to date" };
   });
 
-  async function go() {
+  // `force`: the "Try anyway" button on a device the official release is not built for (16 KB memory pages).
+  async function go(force = false) {
     if (!latestTag || sending || !rel) return;
     sending = true;
     err = "";
     outcome = null;
     try {
       // Nothing from a release installed yet (or a custom build): install. Otherwise: update.
-      const d = installedTag ? await updateNode(latestTag) : await installNode(latestTag);
+      const d = installedTag ? await updateNode(latestTag, force) : await installNode(latestTag, force);
       if (d.ok === false) err = d.error || "The update could not start.";
     } catch (e) {
       err = e instanceof Error ? e.message : "The update could not start.";
@@ -135,7 +145,11 @@
     {:else if outcome?.phase === "failed"}
       <p class="ui-note mt-4 {outcome.rolled_back ? 'ui-warn' : 'ui-bad'}">
         {outcome.error || "The update failed."}
-        {outcome.rolled_back ? " Rolled back: your previous version is still in place." : " Nothing was changed."}
+        {outcome.rolled_back
+          ? " Rolled back: your previous version is still in place."
+          : outcome.error?.includes("Nothing was installed")
+            ? ""
+            : " Nothing was changed."}
       </p>
     {/if}
 
@@ -148,6 +162,9 @@
         {/if}
       </p>
     {:else}
+      {#if canAct && !runsHere}
+        <p id="upd-norun" class="ui-warn mt-4 text-[0.95rem]" role="alert">{noRunText}</p>
+      {/if}
       <div class="act">
         <p class="ui-note min-w-0">
           {#if canAct}
@@ -162,10 +179,24 @@
           {/if}
         </p>
         {#if canAct}
-          <button type="button" class="ui-btn" disabled={sending || m.switch !== null} onclick={go}>{buttonText}</button>
+          <div class="flex flex-wrap gap-2">
+            <button
+              type="button"
+              class="ui-btn"
+              disabled={sending || m.switch !== null || !runsHere}
+              aria-describedby={runsHere ? undefined : "upd-norun"}
+              title={runsHere ? undefined : noRunText}
+              onclick={() => go()}>{buttonText}</button
+            >
+            {#if !runsHere}
+              <button type="button" class="ui-btn-ghost" disabled={sending || m.switch !== null} onclick={() => go(true)}>
+                Try anyway (a newer release may support this device)
+              </button>
+            {/if}
+          </div>
         {/if}
       </div>
-      {#if canAct && (m.process.state === "running" || m.process.state === "starting")}
+      {#if canAct && runsHere && (m.process.state === "running" || m.process.state === "starting")}
         <p class="ui-note mt-2">Updating restarts the node. A syncing node can take a few minutes to save and stop first.</p>
       {/if}
     {/if}

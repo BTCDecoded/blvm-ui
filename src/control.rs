@@ -38,12 +38,19 @@ pub struct Desired {
     /// Extra environment for the node; an empty value unsets the variable.
     pub env: BTreeMap<String, String>,
     pub assume_valid: Option<String>,
+    /// Block pruning: the number of newest blocks the node keeps (`None`: every block). The agent writes
+    /// the node's `[storage.pruning]` config from it, so it has to travel in this file.
+    pub prune_keep_blocks: Option<u64>,
     /// SIGTERM to SIGKILL, in seconds.
     pub stop_grace_secs: u64,
     /// Port for `--rpc-addr` when not the network's default. The agent supplies the bind address.
     pub rpc_port: Option<u16>,
     /// Goes up when the console wants a restart of a node that is already running.
     pub restart_id: u64,
+    /// Goes up with every Start the console asks for. A new generation that only carries saved settings keeps
+    /// it, and the agent starts a node that is not running (crashed, or exited by itself) only for a new
+    /// `start_id`, a `restart_id` that went up, or a `running` that just turned on.
+    pub start_id: u64,
     /// Unix seconds of the write (informational).
     pub updated: u64,
 }
@@ -57,9 +64,11 @@ impl Default for Desired {
             binary: DEFAULT_BINARY.into(),
             env: BTreeMap::new(),
             assume_valid: None,
+            prune_keep_blocks: None,
             stop_grace_secs: 200,
             rpc_port: None,
             restart_id: 0,
+            start_id: 0,
             updated: 0,
         }
     }
@@ -100,6 +109,9 @@ pub struct StateFile {
     pub binary_found: bool,
     /// The [`Desired::restart_id`] the running node was started under.
     pub restart_id: u64,
+    /// Facts about the computer the agent (and so the node) runs on: memory page size, and whether the official
+    /// release can start there. Older agents write nothing here.
+    pub platform: Option<crate::sysinfo::Facts>,
 }
 
 impl Default for StateFile {
@@ -124,6 +136,7 @@ impl Default for StateFile {
             binary: None,
             binary_found: false,
             restart_id: 0,
+            platform: None,
         }
     }
 }
@@ -186,13 +199,34 @@ mod tests {
             running: true,
             binary: "bin/blvm".into(),
             assume_valid: Some("off".into()),
+            prune_keep_blocks: Some(5000),
             ..Default::default()
         };
         write_desired(&root, &d).unwrap();
         assert_eq!(read_desired(&root), Some(d));
+        // `null` and a missing key both read as "keep every block"; a number survives the round trip.
+        std::fs::write(dir(&root).join(DESIRED_FILE), r#"{"generation":1,"prune_keep_blocks":null}"#).unwrap();
+        assert_eq!(read_desired(&root).unwrap().prune_keep_blocks, None);
+        std::fs::write(dir(&root).join(DESIRED_FILE), r#"{"generation":1,"prune_keep_blocks":288}"#).unwrap();
+        assert_eq!(read_desired(&root).unwrap().prune_keep_blocks, Some(288));
         let s = StateFile { generation: 3, state: "running".into(), pid: Some(7), heartbeat: 100, ..Default::default() };
         write_state(&root, &s).unwrap();
         assert_eq!(read_state(&root), Some(s));
+        // The agent's platform facts (page size) travel in the file; a file without them reads as "unknown".
+        let s = StateFile {
+            heartbeat: 100,
+            platform: Some(crate::sysinfo::Facts::for_page("linux-aarch64", Some(16384))),
+            ..Default::default()
+        };
+        write_state(&root, &s).unwrap();
+        let back = read_state(&root).unwrap();
+        assert_eq!(back, s);
+        let p = back.platform.unwrap();
+        assert_eq!((p.page_size, p.runs_here), (Some(16384), false));
+        assert!(p.reason.unwrap().contains("16 KB memory pages"));
+        std::fs::write(dir(&root).join(STATE_FILE), r#"{"heartbeat":5,"state":"running"}"#).unwrap();
+        assert_eq!(read_state(&root).unwrap().platform, None);
+        write_state(&root, &StateFile { generation: 3, state: "running".into(), pid: Some(7), heartbeat: 100, ..Default::default() }).unwrap();
         assert!(
             std::fs::read_dir(dir(&root)).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("tmp")),
             "temp files are renamed away"

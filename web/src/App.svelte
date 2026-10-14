@@ -68,7 +68,7 @@
   });
 </script>
 
-<div class="relative flex h-dvh flex-col overflow-hidden">
+<div class="relative flex h-dvh flex-col overflow-clip">
   <Terrain />
 
   <header class="relative z-10 grid grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-line px-4 py-3 sm:px-6">
