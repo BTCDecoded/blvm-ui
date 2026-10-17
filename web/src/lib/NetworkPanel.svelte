@@ -2,6 +2,7 @@
   import { callSetting } from "./api";
   import Icon from "./Icon.svelte";
   import Light from "./Light.svelte";
+  import { chainLabel, examplePeerAddr } from "./networks";
   import Ring from "./Ring.svelte";
   import { ui } from "./status.svelte";
 
@@ -108,7 +109,7 @@
     <article class="panel ui-card">
       <div class="ui-head">
         <h2 class="ui-title"><Icon name="network" class="h-5 w-5 text-muted" /> P2P Overview</h2>
-        <span class="ui-chip"><Light health={s.health} /> {s.network && s.network !== "—" ? s.network : "offline"}</span>
+        <span class="ui-chip"><Light health={s.health} /> {chainLabel(s.network) || "offline"}</span>
       </div>
       <div class="overview">
         <Ring
@@ -161,7 +162,7 @@
             id="add-peer-addr"
             class="ui-input"
             bind:value={addPeer}
-            placeholder="1.2.3.4:48333"
+            placeholder={examplePeerAddr(s.network)}
             spellcheck="false"
             autocomplete="off"
           />
@@ -186,7 +187,7 @@
             id="ban-addr"
             class="ui-input"
             bind:value={banAddr}
-            placeholder="1.2.3.4:48333"
+            placeholder={examplePeerAddr(s.network)}
             spellcheck="false"
             autocomplete="off"
           />

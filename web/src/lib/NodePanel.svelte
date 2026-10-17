@@ -2,6 +2,7 @@
   import { toggleNode } from "./api";
   import { nodeVersion } from "./format";
   import Light from "./Light.svelte";
+  import { chainLabel } from "./networks";
   import Ring from "./Ring.svelte";
   import { ui } from "./status.svelte";
 
@@ -50,7 +51,7 @@
       </div>
       <div class="flex items-center justify-between py-2.5">
         <dt class="text-muted">Network</dt>
-        <dd>{s.network}</dd>
+        <dd>{chainLabel(s.network) || "—"}</dd>
       </div>
       <div class="flex items-center justify-between py-2.5">
         <dt class="text-muted">RPC</dt>
