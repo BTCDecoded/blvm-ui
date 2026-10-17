@@ -2,6 +2,7 @@
   import { fmt, nodeVersion } from "./format";
   import Icon from "./Icon.svelte";
   import Light from "./Light.svelte";
+  import { chainLabel } from "./networks";
   import Ring from "./Ring.svelte";
   import { storageView } from "./pruning";
   import { ui } from "./status.svelte";
@@ -65,7 +66,7 @@
         <div>
           <dt>Network</dt>
           <dd>
-            <span class="rounded-full border border-line px-2.5 py-0.5 text-[0.85rem]">{s.network}</span>
+            <span class="rounded-full border border-line px-2.5 py-0.5 text-[0.85rem]">{chainLabel(s.network) || "—"}</span>
           </dd>
         </div>
         <div>
