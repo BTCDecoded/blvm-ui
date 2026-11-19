@@ -12,6 +12,7 @@
   import LogsGate from "./lib/LogsGate.svelte";
   import ModuleGate from "./lib/ModuleGate.svelte";
   import { MODULE_PAGES } from "./lib/modules";
+  import { chainLabel } from "./lib/networks";
   import Setup from "./lib/Setup.svelte";
   import Terrain from "./lib/Terrain.svelte";
   import ViewSwitch from "./lib/ViewSwitch.svelte";
@@ -48,6 +49,10 @@
   // False until the first /api/status has answered (or failed): the dashboard and the wizard both depend on
   // `setup_done`, so neither is drawn before that, and a finished setup never flashes the wizard.
   let settled = $state(false);
+  // "Console Live" only once /api/status has really answered (ui.live starts true before any check).
+  const consoleLive = $derived(settled && ui.live);
+  // The chain the node reports, on every page (Home had none): "Mainnet", "Testnet3", ...
+  const chain = $derived(consoleLive ? chainLabel(ui.snap.network) : "");
 
   async function tick() {
     try {
@@ -82,9 +87,13 @@
       {#if agentDown}
         <Light health="dead" />
         <span role="status">Node agent offline</span>
-      {:else}
-        <Light health={ui.live ? "good" : "dead"} />
-        Console Live
+      {:else if consoleLive}
+        {#if chain}<span class="ui-chip" aria-label="Chain: {chain}">{chain}</span>{/if}
+        <Light health="good" />
+        <span role="status">Console Live</span>
+      {:else if settled}
+        <Light health="dead" />
+        <span role="status">Console offline, retrying…</span>
       {/if}
     </div>
   </header>

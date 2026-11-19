@@ -105,6 +105,20 @@ export const NETWORKS: NetworkInfo[] = [
 export const networkById = (id: string | null | undefined): NetworkInfo | undefined =>
   NETWORKS.find((n) => n.id === id);
 
+export const networkByChain = (chain: string | null | undefined): NetworkInfo | undefined =>
+  NETWORKS.find((n) => n.chain === chain);
+
+/**
+ * Label for the chain the node's RPC reports (`/api/status` `network`): "main" → "Mainnet", "test" → "Testnet3".
+ * "" when there is no chain yet ("—" / empty), and the raw value for a chain this page does not know.
+ */
+export const chainLabel = (chain: string | null | undefined): string =>
+  !chain || chain === "—" ? "" : (networkByChain(chain)?.label ?? chain);
+
+/** Example peer address for the chain the node is on, with that chain's P2P port (mainnet port when unknown). */
+export const examplePeerAddr = (chain: string | null | undefined): string =>
+  `1.2.3.4:${networkByChain(chain)?.p2pPort ?? 8333}`;
+
 /** Default local RPC address of a network, the key the console history uses. */
 export const rpcAddrOf = (n: NetworkInfo): string => `127.0.0.1:${n.rpcPort}`;
 

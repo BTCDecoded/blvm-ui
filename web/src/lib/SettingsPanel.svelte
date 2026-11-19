@@ -8,7 +8,7 @@
   import NetCarousel from "./NetCarousel.svelte";
   import NetworkCard from "./NetworkCard.svelte";
   import NodeCard from "./NodeCard.svelte";
-  import { fmtBytes, networkById, networkLabel } from "./networks";
+  import { chainLabel, fmtBytes, networkById, networkLabel } from "./networks";
   import { isManaged, setPage, setSub, ui, type Sub } from "./status.svelte";
   import TabSwitch from "./TabSwitch.svelte";
   import PruningCard from "./PruningCard.svelte";
@@ -81,7 +81,7 @@
     if (s.connected || s.node_running) return `Using ${s.rpc_addr}.`;
     if (s.frozen) {
       return s.network && s.network !== "—"
-        ? `${s.network} node is running at ${s.rpc_addr}, but RPC is not answering. IBD may be stuck.`
+        ? `${chainLabel(s.network)} node is running at ${s.rpc_addr}, but RPC is not answering. IBD may be stuck.`
         : `Something is listening at ${s.rpc_addr}, but RPC is not answering.`;
     }
     if (s.show_manual) {
@@ -269,7 +269,7 @@
             <h2 class="ui-title"><Icon name="info" class="h-5 w-5 text-muted" /> About</h2>
           </div>
           <dl class="about">
-            <div><dt>Chain</dt><dd>{s.network && s.network !== "—" ? s.network : "—"}</dd></div>
+            <div><dt>Chain</dt><dd>{chainLabel(s.network) || "—"}</dd></div>
             <div><dt>Node RPC</dt><dd class="font-mono text-[0.9rem]">{s.rpc_addr}</dd></div>
             <div>
               <dt>BLVM Version</dt>
